@@ -4484,7 +4484,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--translation-api-base-url",
-        default="http://192.168.1.31:8001",
+        default="http://127.0.0.1:8001",
         help="OpenAI-compatible translation API base URL",
     )
     p.add_argument(
