@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voxbridge"
+version = "0.1.0"
+description = "Real-time speech recognition and bilingual subtitle streaming service"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "hellcatjack", email = "hellcatjack@gmail.com" }]
+license = { text = "Apache-2.0" }
+dependencies = [
+  "qwen-asr[vllm]==0.0.6",
+  "fastapi",
+  "uvicorn",
+  "numpy",
+  "websockets",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+voxbridge-streaming-ws = "voxbridge.cli.demo_streaming_ws:main"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["voxbridge*"] } }
+include-package-data = true
