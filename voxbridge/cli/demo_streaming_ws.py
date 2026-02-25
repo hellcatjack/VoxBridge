@@ -597,6 +597,33 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       height: 16px;
     }
 
+    .source-toggle{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border:1px solid var(--line);
+      border-radius: 10px;
+      background:#272c34;
+      padding: 6px 10px;
+      font-size: 12px;
+      color:#d8dde6;
+    }
+
+    .source-toggle select{
+      border:1px solid #3e4651;
+      border-radius: 8px;
+      background:#1f242c;
+      color:#eef2f7;
+      padding: 4px 8px;
+      font-size: 12px;
+      outline: none;
+    }
+
+    .source-toggle select:focus{
+      border-color:#4f8adf;
+      box-shadow: 0 0 0 1px rgba(79, 138, 223, 0.35);
+    }
+
     .subtitle-stage{
       position: relative;
       border:1px solid rgba(255,255,255,0.1);
@@ -716,6 +743,13 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         <button id="btnStart" class="primary">Start</button>
         <button id="btnStop" class="danger" disabled>Stop</button>
         <span id="status" class="badge warn">Idle</span>
+        <label class="source-toggle" for="inputSourceSelect">
+          <span id="inputSourceLabel">输入源</span>
+          <select id="inputSourceSelect">
+            <option value="mic">麦克风</option>
+            <option value="system">系统声音</option>
+          </select>
+        </label>
         <label class="direction-toggle" for="translationDirectionToggle">
           <input id="translationDirectionToggle" type="checkbox" />
           <span id="translationDirectionLabel">中文->英文</span>
@@ -756,6 +790,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const langEl = $("lang");
   const textEl = $("text");
   const translationEl = $("translation");
+  const inputSourceSelect = $("inputSourceSelect");
+  const inputSourceLabel = $("inputSourceLabel");
   const translationDirectionToggle = $("translationDirectionToggle");
   const translationDirectionLabel = $("translationDirectionLabel");
   const rawTextEl = $("rawText");
@@ -799,6 +835,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let subtitleTraceSeq = 0;
   let subtitleTraceEvents = [];
   let lastPartialTraceSeq = -1;
+  let inputSource = "mic";
   let translationDirection = "zh2en";
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -815,6 +852,15 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       if (["0", "false", "off", "no"].includes(saved)) enabled = false;
     } catch (err) {}
     subtitleTraceEnabled = enabled;
+  })();
+
+  (() => {
+    let initial = "mic";
+    try {
+      const saved = String(localStorage.getItem("subtitle_input_source") || "").trim().toLowerCase();
+      if (saved) initial = saved;
+    } catch (err) {}
+    applyInputSource(initial, { silent: true });
   })();
 
   applyTranslationDirection("zh2en", { silent: true });
@@ -905,6 +951,36 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     return "zh2en";
   }
 
+  function normalizeInputSource(raw){
+    const text = String(raw || "").trim().toLowerCase();
+    return text === "system" ? "system" : "mic";
+  }
+
+  function selectedInputSource(){
+    if (!inputSourceSelect) return inputSource;
+    return normalizeInputSource(inputSourceSelect.value);
+  }
+
+  function applyInputSource(source, options = {}){
+    const normalized = normalizeInputSource(source);
+    const prev = inputSource;
+    inputSource = normalized;
+    if (inputSourceSelect) {
+      inputSourceSelect.value = normalized;
+    }
+    if (inputSourceLabel) {
+      inputSourceLabel.textContent = normalized === "system" ? "系统声音" : "麦克风";
+    }
+    try {
+      localStorage.setItem("subtitle_input_source", normalized);
+    } catch (err) {}
+    const silent = !!(options && options.silent);
+    if (!silent && prev !== normalized) {
+      traceSubtitle("input_source_ui_set", { prev, next: normalized });
+    }
+    return normalized;
+  }
+
   function selectedTranslationDirection(){
     if (!translationDirectionToggle) return "zh2en";
     return translationDirectionToggle.checked ? "en2zh" : "zh2en";
@@ -941,6 +1017,13 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   function lockUI(active){
     btnStart.disabled = active;
     btnStop.disabled = !active;
+    if (inputSourceSelect) inputSourceSelect.disabled = active;
+  }
+
+  function lockUIFinishing(){
+    btnStart.disabled = true;
+    btnStop.disabled = true;
+    if (inputSourceSelect) inputSourceSelect.disabled = true;
   }
 
   function setRawAsrText(text, options = {}){
@@ -1363,19 +1446,22 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     const name = (err && err.name) ? err.name : "Error";
     const msg = (err && err.message) ? err.message : String(err || "unknown");
     if (name === "NotAllowedError" || name === "SecurityError") {
-      return "麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问。";
+      return "音频采集权限被拒绝，请允许麦克风或屏幕共享音频。";
     }
     if (name === "NotFoundError") {
-      return "未检测到可用麦克风设备，请检查系统输入设备。";
+      return "未检测到可用音频源，请检查麦克风或共享源是否包含音频。";
     }
     if (name === "NotReadableError") {
-      return "麦克风不可读，可能被其他应用占用。";
+      return "音频输入不可读，可能被其他应用占用或共享被系统阻止。";
     }
     if (name === "OverconstrainedError") {
-      return "麦克风参数不兼容，已建议改用默认音频配置。";
+      return "音频参数不兼容，已建议改用默认采集配置。";
     }
     if (name === "AbortError") {
-      return "麦克风初始化被中断，请重试。";
+      return "音频采集初始化被中断，请重试。";
+    }
+    if (name === "InvalidStateError") {
+      return "请通过用户手势启动采集（点击 Start），然后重新选择输入源。";
     }
     return `${name}: ${msg}`;
   }
@@ -1438,6 +1524,65 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       }
       throw err;
     }
+  }
+
+  async function openSystemAudio(){
+    if (!window.isSecureContext && !isLocalhost()) {
+      throw new Error("远程访问系统声音需要 HTTPS。请确认通过 Caddy 的 https 地址访问。");
+    }
+
+    const getDisplayMedia =
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getDisplayMedia === "function"
+        ? navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices)
+        : null;
+    if (!getDisplayMedia) {
+      throw new Error("当前浏览器不支持系统声音采集，请使用最新版 Chrome/Edge。");
+    }
+
+    const preferredConstraints = {
+      video: {
+        displaySurface: "monitor",
+      },
+      audio: {
+        suppressLocalAudioPlayback: false,
+      },
+      systemAudio: "include",
+      preferCurrentTab: false,
+      selfBrowserSurface: "exclude",
+      surfaceSwitching: "include",
+      monitorTypeSurfaces: "include",
+    };
+
+    let stream = null;
+    try {
+      stream = await getDisplayMedia(preferredConstraints);
+    } catch (err) {
+      if (err && (err.name === "OverconstrainedError" || err.name === "TypeError")) {
+        stream = await getDisplayMedia({ video: true, audio: true });
+      } else {
+        throw err;
+      }
+    }
+
+    const audioTracks = stream ? stream.getAudioTracks() : [];
+    if (!audioTracks || audioTracks.length === 0) {
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          try { track.stop(); } catch (err) {}
+        }
+      }
+      throw new Error("未检测到共享音频。请选择整屏共享并勾选系统音频后重试。");
+    }
+
+    const audioTrack = audioTracks[0];
+    audioTrack.addEventListener("ended", () => {
+      traceSubtitle("system_audio_track_ended", {});
+      if (running && btnStop && !btnStop.disabled) {
+        btnStop.click();
+      }
+    }, { once: true });
+    return stream;
   }
 
   async function stopPipeline(resetPending = true){
@@ -1752,6 +1897,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       renderTranscript();
       renderTranslation();
       awaitingFinal = false;
+      lockUI(false);
       setStatus("Stopped / 已停止", "");
       if (resolve) resolve(msg);
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1857,8 +2003,15 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     });
   }
 
+  if (inputSourceSelect) {
+    inputSourceSelect.addEventListener("change", () => {
+      const next = selectedInputSource();
+      applyInputSource(next);
+    });
+  }
+
   btnStart.onclick = async () => {
-    if (running) return;
+    if (running || awaitingFinal) return;
     subtitleSentencePairs = [];
     setCurrentSegmentText("");
     clearSubtitleDom();
@@ -1881,7 +2034,12 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     setStatus("Starting / 启动中", "warn");
 
     try {
-      mediaStream = await openMicrophone();
+      const sourceMode = selectedInputSource();
+      traceSubtitle("capture_source_starting", { source: sourceMode });
+      if (sourceMode === "system") {
+        setStatus("Share full screen + system audio / 请选择整屏共享并勾选系统音频", "warn");
+      }
+      mediaStream = sourceMode === "system" ? await openSystemAudio() : await openMicrophone();
       await openSocket();
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
@@ -1899,7 +2057,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       sessionStartedAt = Date.now();
       startWatchdog();
       if (!processor) {
-        setStatus("Listening / 识别中", "ok");
+        if (sourceMode === "system") {
+          setStatus("Listening (system audio) / 识别中(系统声音)", "ok");
+        } else {
+          setStatus("Listening / 识别中", "ok");
+        }
       }
     } catch (err) {
       console.error(err);
@@ -1919,7 +2081,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     // Stop microphone first, then flush queued PCM before sending finish.
     running = false;
     awaitingFinal = true;
-    lockUI(false);
+    lockUIFinishing();
     setStatus("Finishing / 收尾中", "warn");
     await stopPipeline(false);
 
@@ -1937,12 +2099,14 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         await sendFinishAndAwaitFinal("stop", 45000);
       } else {
         awaitingFinal = false;
+        lockUI(false);
         setStatus("Stopped / 已停止", "");
       }
     } catch (err) {
       console.error(err);
       rejectPendingFinal(err instanceof Error ? err : new Error(String(err)));
       awaitingFinal = false;
+      lockUI(false);
       if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.close(); } catch (closeErr) {}
       }

@@ -287,6 +287,14 @@ def test_index_template_uses_stop_only_finish_mode():
     assert 'sock.send(JSON.stringify({type: "finish", mode: "stop"}));' in INDEX_HTML_TEMPLATE
 
 
+def test_index_template_blocks_start_reentry_while_awaiting_final():
+    assert "if (running || awaitingFinal) return;" in INDEX_HTML_TEMPLATE
+    assert "awaitingFinal = true;" in INDEX_HTML_TEMPLATE
+    assert 'setStatus("Finishing / 收尾中", "warn");' in INDEX_HTML_TEMPLATE
+    assert 'setStatus("Stopped / 已停止", "");' in INDEX_HTML_TEMPLATE
+    assert "lockUI(false);" in INDEX_HTML_TEMPLATE
+
+
 def test_index_template_single_stream_state_no_frontend_slice_reopen():
     assert "async function rotateSliceSession(reason = \"time\"){" not in INDEX_HTML_TEMPLATE
     assert "await openSocket();" in INDEX_HTML_TEMPLATE
@@ -449,6 +457,25 @@ def test_index_template_has_translation_direction_toggle_and_ws_control():
     assert "function selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
     assert 'type: "set_translation_direction"' in INDEX_HTML_TEMPLATE
     assert "translation_direction: selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_has_audio_input_source_selector():
+    assert 'id="inputSourceSelect"' in INDEX_HTML_TEMPLATE
+    assert 'id="inputSourceLabel"' in INDEX_HTML_TEMPLATE
+    assert 'value="mic"' in INDEX_HTML_TEMPLATE
+    assert 'value="system"' in INDEX_HTML_TEMPLATE
+    assert "function selectedInputSource()" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_supports_system_audio_capture_via_display_media():
+    assert "function openSystemAudio()" in INDEX_HTML_TEMPLATE
+    assert "navigator.mediaDevices.getDisplayMedia" in INDEX_HTML_TEMPLATE
+    assert "displaySurface: \"monitor\"" in INDEX_HTML_TEMPLATE
+    assert "systemAudio: \"include\"" in INDEX_HTML_TEMPLATE
+    assert "preferCurrentTab: false" in INDEX_HTML_TEMPLATE
+    assert "selfBrowserSurface: \"exclude\"" in INDEX_HTML_TEMPLATE
+    assert "if (!audioTracks || audioTracks.length === 0)" in INDEX_HTML_TEMPLATE
+    assert "请选择整屏共享并勾选系统音频" in INDEX_HTML_TEMPLATE
 
 
 def test_port_precheck_rejects_occupied_port():
