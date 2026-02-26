@@ -278,6 +278,33 @@ def _join_segments(segments: List[str]) -> str:
     return out
 
 
+def _should_skip_stream_decode(
+    *,
+    in_speech: bool,
+    silence_ms: float,
+    segment_elapsed_ms: float,
+    snr_db: float,
+    vad_silence_ms: float,
+    vad_exit_snr_db: float,
+    has_pending_text: bool,
+) -> bool:
+    if bool(in_speech):
+        return False
+    if bool(has_pending_text):
+        return False
+    silence_gate_ms = max(80.0, float(vad_silence_ms))
+    quiet_window_ms = max(float(silence_ms), float(segment_elapsed_ms))
+    if quiet_window_ms < silence_gate_ms:
+        return False
+    return float(snr_db) <= float(vad_exit_snr_db)
+
+
+def _should_use_high_batch_merge(*, queue_depth: int, audio_queue_size: int, under_pressure: bool) -> bool:
+    if bool(under_pressure):
+        return True
+    return int(queue_depth) >= max(4, int(audio_queue_size) // 2)
+
+
 class LocalTranslator:
     """
     Lightweight local translation wrapper for zh->en real-time subtitles.
@@ -776,6 +803,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const MAX_WS_BUFFERED_BYTES = 1024 * 1024;
   const MAX_SEND_QUEUE_BYTES = 2 * 1024 * 1024;
   const WEBSOCKET_DRAIN_TIMEOUT_MS = 4000;
+  const STOP_FINAL_TIMEOUT_MS = 120000;
   const TAIL_STABILIZE_MS = 700;
   const SUBTITLE_KEEP_MS = 20000;
   const MAX_VISIBLE_ROWS = 4;
@@ -2096,13 +2124,20 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         if (!drained) {
           setStatus("Finishing (network backlog) / 收尾中(网络积压)", "warn");
         }
-        await sendFinishAndAwaitFinal("stop", 45000);
+        await sendFinishAndAwaitFinal("stop", STOP_FINAL_TIMEOUT_MS);
       } else {
         awaitingFinal = false;
         lockUI(false);
         setStatus("Stopped / 已停止", "");
       }
     } catch (err) {
+      const msg = String((err && err.message) ? err.message : (err || ""));
+      if (msg.includes("final timeout")) {
+        traceSubtitle("stop_wait_final_timeout", { timeoutMs: STOP_FINAL_TIMEOUT_MS });
+        // Backend final flush can be slow after long meetings; keep waiting on the same WS.
+        setStatus("Finishing (slow backend) / 收尾中(后端较慢)", "warn");
+        return;
+      }
       console.error(err);
       rejectPendingFinal(err instanceof Error ? err : new Error(String(err)));
       awaitingFinal = false;
@@ -2499,6 +2534,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             int(max(0.1, float(getattr(args, "consumer_batch_sec", 1.0))) * SAMPLE_RATE),
         )
         consumer_high_batch_samples = max(consumer_max_batch_samples, int(3.0 * SAMPLE_RATE))
+        hard_overflow_relief_sec = max(2.0, float(getattr(args, "backpressure_hard_relief_sec", 6.0)))
         final_redecode_on_stop = bool(getattr(args, "final_redecode_on_stop", True))
         final_redecode_max_samples = int(max(0.0, float(getattr(args, "final_redecode_max_sec", 180.0))) * SAMPLE_RATE)
         rollover_sec = max(0.0, float(getattr(args, "state_rollover_sec", 30.0)))
@@ -2549,6 +2585,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         backpressure_runtime = SimpleNamespace(
             under_pressure=False,
             reason="normal",
+            hard_overflow_since=0.0,
+            last_relief_at=0.0,
         )
         backend_vad = SimpleNamespace(
             noise_db=-55.0,
@@ -2570,6 +2608,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             queue_dropped=0,
             queue_depth_peak=0,
             last_error="",
+            silent_decode_skipped=0,
         )
         subtitle_state = SimpleNamespace(
             stream_uid=f"{int(time.time() * 1000)}-{int(time.monotonic_ns() % 1000000)}",
@@ -3850,6 +3889,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         def _enqueue_audio(gen: int, wav: np.ndarray) -> None:
             nonlocal queue_samples
             dropped_now = 0
+            now_mono = time.monotonic()
             try:
                 audio_queue.put_nowait((gen, wav))
                 queue_samples += int(wav.size)
@@ -3868,6 +3908,27 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     if not _drop_oldest_audio():
                         break
                     dropped_now += 1
+            if pressure.reason == "hard_overflow":
+                if float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0) <= 0.0:
+                    backpressure_runtime.hard_overflow_since = now_mono
+                    _trace_event(
+                        "audio_backpressure_hard_start",
+                        queue_sec=round(float(pressure.queue_sec), 3),
+                        queue_samples=int(queue_samples),
+                        queue_depth=int(audio_queue.qsize()),
+                    )
+            else:
+                hard_since = float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0)
+                if hard_since > 0.0:
+                    _trace_event(
+                        "audio_backpressure_hard_end",
+                        reason=str(backpressure_runtime.reason),
+                        duration_ms=int(max(0.0, (now_mono - hard_since) * 1000.0)),
+                        queue_sec=round(float(pressure.queue_sec), 3),
+                        queue_samples=int(queue_samples),
+                        queue_depth=int(audio_queue.qsize()),
+                    )
+                backpressure_runtime.hard_overflow_since = 0.0
             if bool(pressure.under_pressure) != bool(backpressure_runtime.under_pressure):
                 if pressure.under_pressure:
                     _trace_event(
@@ -3905,8 +3966,13 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             depth_before = int(audio_queue.qsize())
             pressure = backpressure.evaluate(int(queue_samples))
             target_samples = int(max(1, int(consumer_max_batch_samples * float(pressure.suggested_batch_scale))))
-            if depth_before >= max(4, audio_queue_size // 2):
-                target_samples = max(target_samples, int(consumer_high_batch_samples))
+            if _should_use_high_batch_merge(
+                queue_depth=depth_before,
+                audio_queue_size=audio_queue_size,
+                under_pressure=bool(pressure.under_pressure),
+            ):
+                high_scale = float(pressure.suggested_batch_scale) if bool(pressure.under_pressure) else 1.0
+                target_samples = max(target_samples, int(max(1.0, high_scale) * float(consumer_high_batch_samples)))
             if wav.size >= target_samples:
                 return wav
             chunks = [wav]
@@ -3940,13 +4006,51 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             nonlocal seq, finished, state
             nonlocal total_consumed_samples, queue_samples
             nonlocal last_text_snapshot, last_text_advance_at, last_idle_commit_at, last_partial_emit_at
+            nonlocal backpressure_runtime
+
+            def _relieve_hard_overflow_if_needed() -> None:
+                hard_since = float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0)
+                if hard_since <= 0.0:
+                    return
+                now_mono = time.monotonic()
+                if (now_mono - hard_since) < float(hard_overflow_relief_sec):
+                    return
+                last_relief = float(getattr(backpressure_runtime, "last_relief_at", 0.0) or 0.0)
+                if last_relief > 0.0 and (now_mono - last_relief) < float(hard_overflow_relief_sec):
+                    return
+
+                target_samples = int(max(0.0, float(queue_target_sec)) * SAMPLE_RATE)
+                trimmed = 0
+                while int(queue_samples) > int(target_samples):
+                    if not _drop_oldest_audio():
+                        break
+                    trimmed += 1
+
+                backpressure_runtime.last_relief_at = now_mono
+                pressure = backpressure.evaluate(int(queue_samples))
+                if bool(pressure.drop_oldest):
+                    backpressure_runtime.hard_overflow_since = now_mono
+                else:
+                    backpressure_runtime.hard_overflow_since = 0.0
+
+                if trimmed > 0:
+                    _trace_event(
+                        "audio_backpressure_relief",
+                        reason="sustained_hard_overflow",
+                        trimmed_frames=int(trimmed),
+                        queue_sec=round(float(pressure.queue_sec), 3),
+                        queue_samples=int(queue_samples),
+                        queue_depth=int(audio_queue.qsize()),
+                    )
 
             while not stop_consumer.is_set():
                 if finish_requested and audio_queue.empty():
                     break
+                _relieve_hard_overflow_if_needed()
                 try:
                     gen, wav = await asyncio.wait_for(audio_queue.get(), timeout=0.2)
                 except asyncio.TimeoutError:
+                    _relieve_hard_overflow_if_needed()
                     await _maybe_idle_tail_commit()
                     await _maybe_vad_silence_cut(
                         {
@@ -3970,6 +4074,44 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 wav = _coalesce_audio_frames(gen, wav)
                 total_consumed_samples += int(wav.size)
                 vad_signal = _update_backend_vad(wav)
+                pending_text_snapshot = str(last_text_snapshot or "").strip()
+                language_hint = str(getattr(local_state, "language", "") or "")
+                should_skip_decode = _should_skip_stream_decode(
+                    in_speech=bool(getattr(backend_vad, "in_speech", False)),
+                    silence_ms=float(vad_signal.get("silence_ms", 0.0) or 0.0),
+                    segment_elapsed_ms=float(vad_signal.get("segment_elapsed_ms", 0.0) or 0.0),
+                    snr_db=float(vad_signal.get("snr_db", 0.0) or 0.0),
+                    vad_silence_ms=float(vad_silence_trigger_ms),
+                    vad_exit_snr_db=float(vad_exit_snr_db),
+                    has_pending_text=bool(pending_text_snapshot),
+                )
+                if should_skip_decode:
+                    stats.silent_decode_skipped += 1
+                    if stats.silent_decode_skipped <= 3 or stats.silent_decode_skipped % 40 == 0:
+                        _trace_event(
+                            "silent_decode_skipped",
+                            skipped=int(stats.silent_decode_skipped),
+                            silence_ms=int(float(vad_signal.get("silence_ms", 0.0) or 0.0)),
+                            snr_db=round(float(vad_signal.get("snr_db", 0.0) or 0.0), 2),
+                            queue_depth=int(audio_queue.qsize()),
+                            queue_sec=round(float(backpressure.evaluate(int(queue_samples)).queue_sec), 3),
+                        )
+                    await _maybe_vad_silence_cut(
+                        vad_signal,
+                        pending_text_snapshot,
+                        language_hint,
+                        int(seq or 0),
+                    )
+                    await _maybe_idle_tail_commit()
+                    continue
+                if stats.silent_decode_skipped > 0:
+                    _trace_event(
+                        "silent_decode_resumed",
+                        skipped=int(stats.silent_decode_skipped),
+                        queue_depth=int(audio_queue.qsize()),
+                        queue_sec=round(float(backpressure.evaluate(int(queue_samples)).queue_sec), 3),
+                    )
+                stats.silent_decode_skipped = 0
 
                 if use_vllm_streaming:
                     async with infer_lock:
@@ -4772,6 +4914,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Hard queue cap in seconds before oldest frames are dropped.",
+    )
+    p.add_argument(
+        "--backpressure-hard-relief-sec",
+        type=float,
+        default=6.0,
+        help="If hard overflow persists beyond this duration, trim queue down to target seconds.",
     )
     p.add_argument(
         "--backend-vad-enter-snr-db",

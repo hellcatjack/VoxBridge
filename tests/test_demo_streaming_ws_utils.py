@@ -10,6 +10,8 @@ from voxbridge.cli.demo_streaming_ws import (
     _decode_pcm16le,
     _list_orphan_enginecore_pids,
     _parse_json_message,
+    _should_skip_stream_decode,
+    _should_use_high_batch_merge,
     _split_sentences_and_tail,
     parse_args,
 )
@@ -31,6 +33,62 @@ def test_decode_pcm16le_known_samples():
 def test_decode_pcm16le_odd_length_raises():
     with pytest.raises(ValueError, match="even"):
         _decode_pcm16le(b"\x00")
+
+
+def test_should_skip_stream_decode_for_clean_silence_without_pending_text():
+    assert _should_skip_stream_decode(
+        in_speech=False,
+        silence_ms=1200.0,
+        segment_elapsed_ms=1200.0,
+        snr_db=2.0,
+        vad_silence_ms=900.0,
+        vad_exit_snr_db=4.0,
+        has_pending_text=False,
+    )
+
+
+def test_should_skip_stream_decode_when_pure_silence_has_no_speech_phase_yet():
+    assert _should_skip_stream_decode(
+        in_speech=False,
+        silence_ms=0.0,
+        segment_elapsed_ms=1500.0,
+        snr_db=1.0,
+        vad_silence_ms=900.0,
+        vad_exit_snr_db=4.0,
+        has_pending_text=False,
+    )
+
+
+def test_should_not_skip_stream_decode_when_pending_text_exists():
+    assert not _should_skip_stream_decode(
+        in_speech=False,
+        silence_ms=1500.0,
+        segment_elapsed_ms=1500.0,
+        snr_db=2.0,
+        vad_silence_ms=900.0,
+        vad_exit_snr_db=4.0,
+        has_pending_text=True,
+    )
+
+
+def test_should_not_skip_stream_decode_when_snr_is_high():
+    assert not _should_skip_stream_decode(
+        in_speech=False,
+        silence_ms=1500.0,
+        segment_elapsed_ms=1500.0,
+        snr_db=7.5,
+        vad_silence_ms=900.0,
+        vad_exit_snr_db=4.0,
+        has_pending_text=False,
+    )
+
+
+def test_should_use_high_batch_merge_under_backpressure_even_with_shallow_depth():
+    assert _should_use_high_batch_merge(queue_depth=12, audio_queue_size=64, under_pressure=True)
+
+
+def test_should_not_use_high_batch_merge_when_queue_is_light_and_no_pressure():
+    assert not _should_use_high_batch_merge(queue_depth=6, audio_queue_size=64, under_pressure=False)
 
 
 def test_parse_json_message_accepts_object():
@@ -90,6 +148,8 @@ def test_parse_args_accepts_segment_and_backpressure_controls(monkeypatch):
             "3.2",
             "--backpressure-max-queue-sec",
             "5.7",
+            "--backpressure-hard-relief-sec",
+            "7.2",
         ],
     )
     args = parse_args()
@@ -97,6 +157,7 @@ def test_parse_args_accepts_segment_and_backpressure_controls(monkeypatch):
     assert args.segment_overlap_sec == 0.9
     assert args.backpressure_target_queue_sec == 3.2
     assert args.backpressure_max_queue_sec == 5.7
+    assert args.backpressure_hard_relief_sec == 7.2
 
 
 def test_parse_args_accepts_backend_vad_thresholds(monkeypatch):
@@ -280,10 +341,11 @@ def test_index_template_stabilizes_tentative_tail_to_avoid_flash_drop():
 
 
 def test_index_template_uses_stop_only_finish_mode():
+    assert "const STOP_FINAL_TIMEOUT_MS = 120000;" in INDEX_HTML_TEMPLATE
     assert "const payload = {type: \"finish\", mode};" in INDEX_HTML_TEMPLATE
     assert "if (reason) payload.reason = String(reason);" in INDEX_HTML_TEMPLATE
     assert "ws.send(JSON.stringify(payload));" in INDEX_HTML_TEMPLATE
-    assert 'await sendFinishAndAwaitFinal("stop", 45000);' in INDEX_HTML_TEMPLATE
+    assert 'await sendFinishAndAwaitFinal("stop", STOP_FINAL_TIMEOUT_MS);' in INDEX_HTML_TEMPLATE
     assert 'sock.send(JSON.stringify({type: "finish", mode: "stop"}));' in INDEX_HTML_TEMPLATE
 
 
@@ -293,6 +355,12 @@ def test_index_template_blocks_start_reentry_while_awaiting_final():
     assert 'setStatus("Finishing / 收尾中", "warn");' in INDEX_HTML_TEMPLATE
     assert 'setStatus("Stopped / 已停止", "");' in INDEX_HTML_TEMPLATE
     assert "lockUI(false);" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_keeps_finishing_on_stop_final_timeout():
+    assert "if (msg.includes(\"final timeout\")) {" in INDEX_HTML_TEMPLATE
+    assert 'setStatus("Finishing (slow backend) / 收尾中(后端较慢)", "warn");' in INDEX_HTML_TEMPLATE
+    assert "return;" in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_single_stream_state_no_frontend_slice_reopen():
