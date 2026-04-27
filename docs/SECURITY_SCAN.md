@@ -1,6 +1,6 @@
 # Security Scan Report
 
-Date: 2026-02-25
+Date: 2026-04-27
 Scope: `VoxBridge/` source and docs (excluding `.git` and binary audio/image artifacts)
 
 ## Scan Commands
@@ -26,8 +26,10 @@ rg -n --hidden --glob '!.git' -i \
 1. No leaked API keys, private keys, or credential files were detected.
 2. One hardcoded private network default endpoint was found and fixed:
    - `voxbridge/cli/demo_streaming_ws.py`
-   - changed from `http://192.168.1.31:8001` to `http://127.0.0.1:8001`
+   - changed from a LAN-only host to `http://127.0.0.1:8001`
 3. Author email exists in package metadata (`pyproject.toml`) and is treated as intentional public maintainer info.
+4. Internal agent planning notes under `docs/superpowers/` are ignored and not part of the public documentation set.
+5. Broad secret-pattern matches in source are CLI option names, variable names, or documentation placeholders; no concrete credential value was detected.
 
 ## Hardening Checklist
 

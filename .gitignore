@@ -9,3 +9,4 @@ env/
 logs/
 *.log
 *.pid
+docs/superpowers/

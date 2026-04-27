@@ -18,6 +18,7 @@ Browser microphone streaming demo over WebSocket (vLLM backend).
 """
 import argparse
 import asyncio
+import difflib
 import fcntl
 import hashlib
 import json
@@ -46,6 +47,15 @@ from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overla
 SAMPLE_RATE = 16000
 logger = logging.getLogger(__name__)
 SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？!?…]+[\"'”’)\]）】》]*|\.+(?=\s|$)[\"'”’)\]）】》]*")
+SENTENCE_CLOSER_CHARS = "\"'”’)]）】》"
+INITIALS_ABBREVIATION_PATTERN = re.compile(r"(?:\b[A-Za-z]\.){2,}$")
+COMMON_ABBREVIATION_PATTERN = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|No|etc|vs|e\.g|i\.e)\.$",
+    re.IGNORECASE,
+)
+SENTENCE_START_HINT_PATTERN = re.compile(
+    r"^(?:[\"'“”‘’(\[]\s*)?(?:I|We|You|He|She|They|It|This|That|There|Here)\b",
+)
 MIN_CJK_SENTENCE_CHARS = 10
 _INSTANCE_LOCK_HANDLE: Optional[Any] = None
 
@@ -236,8 +246,7 @@ def _split_sentences_and_tail(text: str) -> Tuple[List[str], str]:
 
     raw_sentences: List[str] = []
     last = 0
-    for match in SENTENCE_BOUNDARY_PATTERN.finditer(src):
-        end = match.end()
+    for _, end, _ in _iter_sentence_boundaries(src, SENTENCE_BOUNDARY_PATTERN):
         seg = src[last:end].strip()
         if seg:
             raw_sentences.append(seg)
@@ -264,6 +273,425 @@ def _split_sentences_and_tail(text: str) -> Tuple[List[str], str]:
     return sentences, tail
 
 
+def _is_abbreviation_period_boundary(text: str, start: int, end: int) -> bool:
+    src = str(text or "")
+    if not src:
+        return False
+    if start < 0 or end <= start or end > len(src):
+        return False
+    token = src[start:end]
+    if "." not in token:
+        return False
+
+    trimmed_end = int(end)
+    while trimmed_end > start and src[trimmed_end - 1] in SENTENCE_CLOSER_CHARS:
+        trimmed_end -= 1
+    if trimmed_end <= start or src[trimmed_end - 1] != ".":
+        return False
+
+    suffix = src[end:].lstrip()
+    if not suffix:
+        return False
+
+    left_tail = src[max(0, trimmed_end - 40):trimmed_end]
+    is_abbreviation = bool(
+        INITIALS_ABBREVIATION_PATTERN.search(left_tail)
+        or COMMON_ABBREVIATION_PATTERN.search(left_tail)
+    )
+    if not is_abbreviation:
+        return False
+
+    # If suffix strongly looks like a new sentence start, keep the split.
+    if SENTENCE_START_HINT_PATTERN.match(suffix):
+        return False
+    return True
+
+
+def _iter_sentence_boundaries(text: str, boundary_pattern: Any):
+    src = str(text or "")
+    if not src:
+        return
+    for match in boundary_pattern.finditer(src):
+        start = int(match.start())
+        end = int(match.end())
+        token = str(match.group(0) or "")
+        if boundary_pattern is SENTENCE_BOUNDARY_PATTERN and _is_abbreviation_period_boundary(src, start, end):
+            continue
+        yield start, end, token
+
+
+def _find_first_boundary_after(
+    text: str,
+    start_chars: int,
+    boundary_pattern: Any,
+) -> Optional[Tuple[int, str]]:
+    src = str(text or "")
+    if not src:
+        return None
+    start = max(0, min(len(src), int(start_chars)))
+    latest: Optional[Tuple[int, str]] = None
+    for _, end, token in _iter_sentence_boundaries(src, boundary_pattern):
+        if end <= start:
+            continue
+        latest = (int(end), str(token or ""))
+    return latest
+
+
+def _resolve_boundary_for_anchor(
+    text: str,
+    anchor_end_chars: int,
+    boundary_pattern: Any,
+) -> Optional[Tuple[int, str]]:
+    src = str(text or "")
+    if not src:
+        return None
+    target = max(1, min(len(src), int(anchor_end_chars)))
+    before: Optional[Tuple[int, str]] = None
+    for _, end, token in _iter_sentence_boundaries(src, boundary_pattern):
+        if end >= target:
+            return end, token
+        before = (end, token)
+    return before
+
+
+def _split_text_at_boundary(text: str, boundary_end_chars: int) -> Tuple[str, str]:
+    src = str(text or "")
+    if not src:
+        return "", ""
+    cut = max(0, min(len(src), int(boundary_end_chars)))
+    if cut <= 0:
+        return "", src.strip()
+    left = src[:cut].strip()
+    right = src[cut:].strip()
+    return left, right
+
+
+def _normalize_sentence_for_duplicate_compare(text: str) -> str:
+    src = str(text or "").strip()
+    if not src:
+        return ""
+    return re.sub(r"\s+", " ", src)
+
+
+def _sentence_text_quality_score(text: str) -> int:
+    src = str(text or "").strip()
+    if not src:
+        return 0
+    score = 0
+    if bool(re.search(r"[。！？!?…]+[\"'”’)\]）】》]*$", src)):
+        score += 2
+    mid_punct = re.findall(r"(?<=[\u3400-\u9fffA-Za-z0-9])[。！？!?…](?=[\u3400-\u9fffA-Za-z0-9])", src)
+    if mid_punct:
+        score -= 2 * int(len(mid_punct))
+    if bool(re.search(r"[。！？!?…]{2,}", src)):
+        score -= 1
+    return int(score)
+
+
+def _canonical_sentence_for_upgrade_compare(text: str) -> str:
+    src = _normalize_sentence_for_duplicate_compare(text)
+    if not src:
+        return ""
+    src = re.sub(r"(?<=[\u3400-\u9fffA-Za-z0-9])[。！？!?…]+(?=[\u3400-\u9fffA-Za-z0-9])", "", src)
+    src = re.sub(r"[\"'“”‘’`]", "", src)
+    src = re.sub(r"\s+", "", src)
+    return src.strip()
+
+
+def _should_accept_sentence_upgrade(old_text: str, new_text: str) -> bool:
+    old = str(old_text or "").strip()
+    new = str(new_text or "").strip()
+    if not old or not new or old == new:
+        return False
+
+    # Primary path: confidence growth from streaming partial -> more complete sentence.
+    if len(new) >= len(old) + 8:
+        if new.startswith(old):
+            return True
+        if old in new and len(new) >= len(old) + 12:
+            return True
+        # Normalize common terminal punctuation so sentence growth like
+        # "...as well." -> "...as well, and ..." is treated as an upgrade.
+        old_base = re.sub(r"[。！？!?….,，;；:：]+[\"'”’)\]）】》]*$", "", old).strip()
+        new_base = re.sub(r"[。！？!?….,，;；:：]+[\"'”’)\]）】》]*$", "", new).strip()
+        if old_base and new_base and len(new_base) >= len(old_base) + 6:
+            if new_base.startswith(old_base):
+                return True
+            if old_base in new_base and len(new_base) >= len(old_base) + 10:
+                return True
+
+    # Secondary path: allow minor corrections if text quality improves
+    # (for example removing hallucinated terminal punctuation inside a word).
+    old_quality = _sentence_text_quality_score(old)
+    new_quality = _sentence_text_quality_score(new)
+    old_canon = _canonical_sentence_for_upgrade_compare(old)
+    new_canon = _canonical_sentence_for_upgrade_compare(new)
+    if old_canon and new_canon and old_canon == new_canon:
+        if new_quality > old_quality:
+            return True
+        if new_quality == old_quality and len(new) >= len(old) + 3:
+            return True
+        return False
+
+    length_delta = abs(len(new) - len(old))
+    if length_delta <= 12:
+        ratio = difflib.SequenceMatcher(None, old, new).ratio()
+        if ratio >= 0.88 and new_quality > old_quality:
+            return True
+
+    return False
+
+
+def _trace_preview(text: str, max_chars: int = 72) -> str:
+    src = str(text or "").strip()
+    if not src or max_chars <= 0:
+        return ""
+    if len(src) <= max_chars:
+        return src
+    if max_chars <= 12:
+        return src[:max_chars]
+    head = max(4, max_chars // 2 - 2)
+    tail = max(4, max_chars - head - 3)
+    return f"{src[:head]}...{src[-tail:]}"
+
+
+def _is_probable_pending_prefix_duplicate(
+    prev_sentence: str,
+    candidate_sentence: str,
+    raw_full_text: str,
+    pending_prefix_text: str,
+) -> bool:
+    prev = _normalize_sentence_for_duplicate_compare(prev_sentence)
+    candidate = _normalize_sentence_for_duplicate_compare(candidate_sentence)
+    raw = _normalize_sentence_for_duplicate_compare(raw_full_text)
+    pending = _normalize_sentence_for_duplicate_compare(pending_prefix_text)
+    if not prev or not candidate or not pending:
+        return False
+    if prev != candidate:
+        return False
+    # Be conservative: prefer keeping possible real repetitions.
+    # Only treat as carry-over duplicate when pending has clear extra tail
+    # after candidate, and current raw text is only a tiny prefix.
+    if len(candidate) < 4:
+        return False
+    if not pending.startswith(candidate):
+        return False
+    pending_tail = pending[len(candidate):].strip()
+    if len(pending_tail) < 2:
+        return False
+    raw_limit = max(6, int(len(candidate) * 0.35))
+    if len(raw) > raw_limit:
+        return False
+    if raw and not pending.startswith(raw):
+        return False
+    return bool(raw)
+
+
+def _should_apply_carry_overlap_skip(*, overlap_count: int, overlap_chars: int, raw_chars: int) -> bool:
+    count = max(0, int(overlap_count))
+    chars = max(0, int(overlap_chars))
+    raw = max(0, int(raw_chars))
+    if count < 2 or chars <= 0:
+        return False
+    # Require strong evidence to skip commit; single-sentence overlap is often
+    # a legitimate repetition in fast speech scenarios.
+    raw_limit = max(12, int(float(chars) * 0.35))
+    raw_limit = min(raw_limit, 24)
+    return raw <= raw_limit
+
+
+def _trim_pending_prefix_leading_sentence(
+    pending_prefix_text: str,
+    sentence_text: str,
+) -> Tuple[str, bool]:
+    pending = str(pending_prefix_text or "").strip()
+    sentence = str(sentence_text or "").strip()
+    if not pending or not sentence:
+        return pending, False
+    completed, tail = _split_sentences_and_tail(pending)
+    if not completed:
+        return pending, False
+    first = str(completed[0] or "").strip()
+    if _normalize_sentence_for_duplicate_compare(first) != _normalize_sentence_for_duplicate_compare(sentence):
+        return pending, False
+    rest = [str(seg or "").strip() for seg in completed[1:]]
+    if tail:
+        rest.append(str(tail or "").strip())
+    return _join_segments(rest), True
+
+
+def _alignment_sentence_key(text: str) -> str:
+    return _normalize_sentence_for_duplicate_compare(text)
+
+
+def _alignment_registry_touch(
+    registry: Dict[str, Dict[str, Any]],
+    sentence_text: str,
+    seq_hint: int,
+    source: str,
+) -> Tuple[str, bool, Dict[str, Any]]:
+    text = str(sentence_text or "").strip()
+    key = _alignment_sentence_key(text)
+    if not key:
+        return "", False, {}
+
+    seq_no = int(seq_hint or 0)
+    src = str(source or "")
+    entry = registry.get(key)
+    if entry is None:
+        entry = {
+            "text": text,
+            "hits": 1,
+            "first_seq": int(seq_no),
+            "last_seq": int(seq_no),
+            "sources": [src] if src else [],
+        }
+        registry[key] = entry
+        return key, True, entry
+
+    entry["hits"] = int(entry.get("hits", 0) or 0) + 1
+    entry["last_seq"] = max(int(entry.get("last_seq", seq_no) or seq_no), int(seq_no))
+    if len(text) > len(str(entry.get("text", "") or "")):
+        entry["text"] = text
+    sources = entry.get("sources")
+    if not isinstance(sources, list):
+        sources = []
+        entry["sources"] = sources
+    if src and src not in sources and len(sources) < 8:
+        sources.append(src)
+    return key, False, entry
+
+
+def _alignment_registry_touch_model(
+    registry: Dict[str, Dict[str, Any]],
+    sentence_text: str,
+    seq_hint: int,
+    source: str,
+) -> Tuple[str, bool, Dict[str, Any]]:
+    def _base(src: str) -> str:
+        return re.sub(r"[。！？!?…]+[\"'”’)\]）】》]*$", "", str(src or "").strip()).strip()
+
+    key, created, entry = _alignment_registry_touch(registry, sentence_text, seq_hint, source)
+    if not key:
+        return "", False, {}
+    if not created:
+        return key, False, entry
+
+    seq_no = int(seq_hint or 0)
+    src = str(source or "")
+    key_base = _base(key)
+    # Collapse incremental growth into the same logical sentence key.
+    best_prefix_key = ""
+    for old_key in list(registry.keys()):
+        if old_key == key:
+            continue
+        old_base = _base(old_key)
+        if key_base.startswith(old_base) and len(key_base) >= len(old_base) + 4:
+            if len(old_key) > len(best_prefix_key):
+                best_prefix_key = old_key
+    if best_prefix_key:
+        old_entry = registry.pop(best_prefix_key, {})
+        merged_hits = int(old_entry.get("hits", 0) or 0) + int(entry.get("hits", 0) or 0)
+        sources = list(old_entry.get("sources", []) or [])
+        if src and src not in sources and len(sources) < 8:
+            sources.append(src)
+        first_seq = int(old_entry.get("first_seq", seq_no) or seq_no)
+        registry[key] = {
+            "text": str(sentence_text or "").strip(),
+            "hits": int(merged_hits),
+            "first_seq": int(min(first_seq, seq_no)),
+            "last_seq": int(max(int(old_entry.get("last_seq", seq_no) or seq_no), seq_no)),
+            "sources": sources,
+        }
+        return key, False, registry[key]
+
+    # Short regression variant: attach hit to the longer existing sentence.
+    best_longer_key = ""
+    for old_key in list(registry.keys()):
+        if old_key == key:
+            continue
+        old_base = _base(old_key)
+        if old_base.startswith(key_base) and len(old_base) >= len(key_base) + 4:
+            if len(old_key) > len(best_longer_key):
+                best_longer_key = old_key
+    if best_longer_key:
+        old_entry = registry.get(best_longer_key, {})
+        old_entry["hits"] = int(old_entry.get("hits", 0) or 0) + int(entry.get("hits", 0) or 0)
+        old_entry["last_seq"] = int(max(int(old_entry.get("last_seq", seq_no) or seq_no), seq_no))
+        sources = old_entry.get("sources")
+        if not isinstance(sources, list):
+            sources = []
+            old_entry["sources"] = sources
+        if src and src not in sources and len(sources) < 8:
+            sources.append(src)
+        registry.pop(key, None)
+        return best_longer_key, False, old_entry
+
+    return key, True, entry
+
+
+def _summarize_alignment_gap(
+    model_seen: Dict[str, Dict[str, Any]],
+    committed_seen: Dict[str, Dict[str, Any]],
+    *,
+    min_model_hits: int = 2,
+    max_samples: int = 6,
+) -> Dict[str, Any]:
+    model_stable_keys: List[str] = []
+    model_final_keys: List[str] = []
+    for key, row in model_seen.items():
+        hits = int(row.get("hits", 0) or 0)
+        sources = row.get("sources")
+        has_final_source = isinstance(sources, list) and ("final_raw" in sources)
+        if bool(has_final_source):
+            model_final_keys.append(key)
+        if hits >= int(max(1, min_model_hits)) or bool(has_final_source):
+            model_stable_keys.append(key)
+
+    committed_keys = set(committed_seen.keys())
+    missing_keys = [k for k in model_stable_keys if k not in committed_keys]
+    missing_keys.sort(key=lambda k: int(model_seen.get(k, {}).get("first_seq", 0) or 0))
+    final_missing_keys = [k for k in model_final_keys if k not in committed_keys]
+    final_missing_keys.sort(key=lambda k: int(model_seen.get(k, {}).get("first_seq", 0) or 0))
+
+    samples: List[Dict[str, Any]] = []
+    for key in missing_keys[: max(1, int(max_samples))]:
+        row = model_seen.get(key, {})
+        samples.append(
+            {
+                "text": str(row.get("text", "") or ""),
+                "hits": int(row.get("hits", 0) or 0),
+                "first_seq": int(row.get("first_seq", 0) or 0),
+                "last_seq": int(row.get("last_seq", 0) or 0),
+                "sources": list(row.get("sources", []) or []),
+            }
+        )
+
+    final_samples: List[Dict[str, Any]] = []
+    for key in final_missing_keys[: max(1, int(max_samples))]:
+        row = model_seen.get(key, {})
+        final_samples.append(
+            {
+                "text": str(row.get("text", "") or ""),
+                "hits": int(row.get("hits", 0) or 0),
+                "first_seq": int(row.get("first_seq", 0) or 0),
+                "last_seq": int(row.get("last_seq", 0) or 0),
+                "sources": list(row.get("sources", []) or []),
+            }
+        )
+
+    return {
+        "model_all_unique": int(len(model_seen)),
+        "model_stable_unique": int(len(model_stable_keys)),
+        "model_final_unique": int(len(model_final_keys)),
+        "committed_unique": int(len(committed_seen)),
+        "missing_unique": int(len(missing_keys)),
+        "missing_samples": samples,
+        "final_missing_unique": int(len(final_missing_keys)),
+        "final_missing_samples": final_samples,
+    }
+
+
 def _join_segments(segments: List[str]) -> str:
     out = ""
     for seg in segments:
@@ -278,6 +706,54 @@ def _join_segments(segments: List[str]) -> str:
     return out
 
 
+def _stabilize_completed_prefix_with_committed(
+    completed: List[str],
+    committed_sentences: List[str],
+    *,
+    commit_base: int,
+    committed_count: int,
+) -> Tuple[List[str], int]:
+    merged = [str(seg or "").strip() for seg in list(completed or [])]
+    total_committed = len(committed_sentences)
+    base = max(0, min(int(commit_base), total_committed))
+    expected = max(0, min(int(committed_count), total_committed - base))
+    if expected <= len(merged):
+        return merged, 0
+    backfilled = 0
+    for idx in range(len(merged), expected):
+        global_idx = int(base + idx)
+        if global_idx < total_committed:
+            merged.append(str(committed_sentences[global_idx] or "").strip())
+            backfilled += 1
+    return merged, int(backfilled)
+
+
+def _count_leading_completed_committed_overlap(
+    completed: List[str],
+    committed_sentences: List[str],
+    *,
+    max_overlap: int = 6,
+) -> int:
+    if not completed or not committed_sentences:
+        return 0
+    total_completed = len(completed)
+    total_committed = len(committed_sentences)
+    limit = max(0, min(int(max_overlap), total_completed, total_committed))
+    if limit <= 0:
+        return 0
+    for width in range(limit, 0, -1):
+        ok = True
+        for i in range(width):
+            left = _normalize_sentence_for_duplicate_compare(str(completed[i] or ""))
+            right = _normalize_sentence_for_duplicate_compare(str(committed_sentences[total_committed - width + i] or ""))
+            if not left or not right or left != right:
+                ok = False
+                break
+        if ok:
+            return int(width)
+    return 0
+
+
 def _should_skip_stream_decode(
     *,
     in_speech: bool,
@@ -288,21 +764,63 @@ def _should_skip_stream_decode(
     vad_exit_snr_db: float,
     has_pending_text: bool,
 ) -> bool:
+    _ = has_pending_text  # Intentional: silence gating no longer depends on pending text.
+    if float(snr_db) > float(vad_exit_snr_db):
+        return False
+    # For active segments, skip decode quickly once trailing silence is observed.
     if bool(in_speech):
-        return False
-    if bool(has_pending_text):
-        return False
-    silence_gate_ms = max(80.0, float(vad_silence_ms))
+        return float(silence_ms) >= 80.0
+    # For not-yet-active speech, require a short quiet window to avoid overreacting
+    # to tiny startup jitter while still saving compute on silent input.
+    silence_gate_ms = max(80.0, min(float(vad_silence_ms), 200.0))
     quiet_window_ms = max(float(silence_ms), float(segment_elapsed_ms))
-    if quiet_window_ms < silence_gate_ms:
-        return False
-    return float(snr_db) <= float(vad_exit_snr_db)
+    return quiet_window_ms >= silence_gate_ms
 
 
 def _should_use_high_batch_merge(*, queue_depth: int, audio_queue_size: int, under_pressure: bool) -> bool:
     if bool(under_pressure):
         return True
     return int(queue_depth) >= max(4, int(audio_queue_size) // 2)
+
+
+def _should_hold_partial_reset(
+    *,
+    prev_text: str,
+    next_text: str,
+    min_prev_chars: int = 20,
+    max_next_ratio: float = 0.6,
+) -> bool:
+    prev = str(prev_text or "").strip()
+    nxt = str(next_text or "").strip()
+    if not prev or not nxt:
+        return False
+    if nxt.startswith(prev):
+        return False
+    if len(prev) < int(max(4, min_prev_chars)):
+        return False
+    next_cap = max(6, int(float(len(prev)) * float(max_next_ratio)))
+    if len(nxt) > next_cap:
+        return False
+    n = min(len(prev), len(nxt))
+    i = 0
+    while i < n and prev[i] == nxt[i]:
+        i += 1
+    # Keep genuinely incremental updates; hold abrupt rewrites only.
+    if i >= max(8, int(len(prev) * 0.65)):
+        return False
+    return True
+
+
+def _should_release_partial_reset_guard(
+    *,
+    candidate_hits: int,
+    hold_sec: float,
+    min_hits: int = 2,
+    max_hold_sec: float = 1.2,
+) -> bool:
+    if int(candidate_hits) >= int(max(1, min_hits)):
+        return True
+    return float(hold_sec) >= float(max(0.1, max_hold_sec))
 
 
 class LocalTranslator:
@@ -523,13 +1041,19 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   <title>语音识别与翻译</title>
   <style>
     :root{
-      --bg-a:#0f1114;
-      --bg-b:#23252a;
-      --ink:#f3f3f2;
-      --line:#3b4048;
-      --ok:#29b26b;
-      --warn:#cc8f28;
-      --err:#d75858;
+      --bg-a:#edf4ea;
+      --bg-b:#f6f0e6;
+      --ink:#243126;
+      --muted:#657267;
+      --line:#ccd8c7;
+      --surface:#f8fbf4;
+      --surface-soft:rgba(255, 255, 247, 0.76);
+      --surface-strong:#eef5ec;
+      --ok:#2f7d55;
+      --warn:#9b6b23;
+      --err:#b5564b;
+      --accent:#527e72;
+      --accent-strong:#426c61;
     }
 
     * { box-sizing: border-box; }
@@ -539,13 +1063,14 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       font-family: "Avenir Next", "Segoe UI", "Noto Sans SC", "PingFang SC", sans-serif;
       color:var(--ink);
       background:
-        radial-gradient(circle at 18% 16%, #3e4552 0%, transparent 36%),
-        radial-gradient(circle at 83% 82%, #2f2622 0%, transparent 34%),
+        radial-gradient(circle at 16% 14%, rgba(178, 204, 164, 0.36) 0%, transparent 34%),
+        radial-gradient(circle at 84% 82%, rgba(225, 203, 165, 0.38) 0%, transparent 36%),
         linear-gradient(160deg, var(--bg-a), var(--bg-b));
     }
 
     .wrap{
       height: 100%;
+      height: 100svh;
       padding: 0;
       display: grid;
       place-items: stretch;
@@ -553,17 +1078,31 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     }
 
     .card{
+      position: relative;
       width: 100vw;
       height: 100vh;
+      height: 100svh;
       border:0;
       border-radius: 0;
-      background: linear-gradient(180deg, rgba(24, 28, 35, 0.85), rgba(12, 14, 18, 0.94));
+      background:
+        linear-gradient(180deg, rgba(255, 255, 247, 0.84), rgba(240, 247, 235, 0.95)),
+        var(--surface);
       padding: 14px 14px 12px;
-      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 18px 46px rgba(75, 93, 70, 0.18);
       display: grid;
-      grid-template-rows: auto auto 1fr;
-      gap: 14px;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      gap: 12px;
       overflow: hidden;
+    }
+
+    @supports (height: 100dvh){
+      .wrap{ height: 100dvh; }
+      .card{ height: 100dvh; }
+    }
+
+    .card.controls-hidden{
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 10px;
     }
 
     h1{
@@ -571,57 +1110,62 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       font-size: 16px;
       letter-spacing: .8px;
       font-weight: 700;
-      color:#d8dde7;
+      color:#344239;
+      padding-right: 80px;
     }
 
     .row{ display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
 
+    .control-bar{
+      align-self: start;
+      min-height: 0;
+    }
+
+    .card.controls-hidden .control-bar{
+      display: none;
+    }
+
     button{
       border:1px solid var(--line);
       border-radius: 10px;
-      background: #2a2f36;
-      color: #f4f5f6;
+      background: #f7faf3;
+      color: #29372e;
       font-weight: 700;
       padding: 9px 15px;
       cursor: pointer;
-      transition: background .15s ease, transform .04s ease;
+      transition: background .15s ease, transform .04s ease, box-shadow .15s ease;
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.82);
     }
-    button:hover{ background:#353b44; }
+    button:hover{ background:#ffffff; box-shadow: 0 4px 14px rgba(82, 126, 114, 0.12); }
     button:active{ transform: translateY(1px); }
     button:disabled{ opacity:.55; cursor:not-allowed; }
-    button.primary{ border-color:#4f8adf; background:#2b5aa0; }
-    button.danger{ border-color:#a44a4a; background:#7d3030; }
+    button.primary{ border-color:#4f8173; background:var(--accent); color:#fffdf5; }
+    button.primary:hover{ background:var(--accent-strong); }
+    button.danger{ border-color:#bf806f; background:#a45f4f; color:#fff8f1; }
+    button.danger:hover{ background:#8f4f41; }
 
     .badge{
       border:1px solid var(--line);
       border-radius: 999px;
       padding: 5px 10px;
       font-size: 12px;
-      color: #d8dee6;
-      background:#272c34;
+      color: #556257;
+      background:#f3f7ee;
     }
-    .ok{ color: var(--ok); border-color: #3c7f5f; background:#203c31; }
-    .warn{ color: var(--warn); border-color: #8b6a35; background:#3c3020; }
-    .err{ color: var(--err); border-color: #8f3f3f; background:#3f2525; }
+    .ok{ color: var(--ok); border-color: #a8c8ae; background:#edf7ec; }
+    .warn{ color: var(--warn); border-color: #dac18c; background:#faf3de; }
+    .err{ color: var(--err); border-color: #e2aaa1; background:#fff0ec; }
 
-    .direction-toggle{
+    .direction-select{
       display: inline-flex;
       align-items: center;
       gap: 8px;
       border:1px solid var(--line);
       border-radius: 10px;
-      background:#272c34;
-      padding: 7px 10px;
+      background:var(--surface-soft);
+      padding: 6px 10px;
       font-size: 12px;
-      color:#d8dde6;
-      user-select: none;
-    }
-
-    .direction-toggle input{
-      margin: 0;
-      accent-color: #4f8adf;
-      width: 16px;
-      height: 16px;
+      color:var(--muted);
     }
 
     .source-toggle{
@@ -630,36 +1174,71 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       gap: 8px;
       border:1px solid var(--line);
       border-radius: 10px;
-      background:#272c34;
+      background:var(--surface-soft);
       padding: 6px 10px;
       font-size: 12px;
-      color:#d8dde6;
+      color:var(--muted);
     }
 
     .source-toggle select{
-      border:1px solid #3e4651;
+      border:1px solid #bdcbb7;
       border-radius: 8px;
-      background:#1f242c;
-      color:#eef2f7;
+      background:#fffdf7;
+      color:#2f3c33;
       padding: 4px 8px;
       font-size: 12px;
       outline: none;
     }
 
+    .direction-select select{
+      border:1px solid #bdcbb7;
+      border-radius: 8px;
+      background:#fffdf7;
+      color:#2f3c33;
+      padding: 4px 8px;
+      font-size: 12px;
+      outline: none;
+    }
+
+    .direction-select select:focus{
+      border-color:var(--accent);
+      box-shadow: 0 0 0 2px rgba(82, 126, 114, 0.16);
+    }
+
     .source-toggle select:focus{
-      border-color:#4f8adf;
-      box-shadow: 0 0 0 1px rgba(79, 138, 223, 0.35);
+      border-color:var(--accent);
+      box-shadow: 0 0 0 2px rgba(82, 126, 114, 0.16);
+    }
+
+    .control-reveal{
+      position: absolute;
+      top: 10px;
+      right: 14px;
+      z-index: 6;
+      display: none;
+      border-radius: 999px;
+      padding: 6px 11px;
+      background: rgba(255, 255, 247, 0.84);
+      color: #4f685b;
+      border-color: rgba(120, 145, 112, 0.36);
+      backdrop-filter: blur(10px);
+    }
+
+    .card.controls-hidden .control-reveal{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .subtitle-stage{
       position: relative;
-      border:1px solid rgba(255,255,255,0.1);
+      border:1px solid rgba(118, 139, 109, 0.24);
       border-radius: 14px;
       overflow: hidden;
       background:
-        linear-gradient(180deg, rgba(9, 10, 12, 0.02) 0%, rgba(9, 10, 12, 0.76) 68%, rgba(8, 8, 9, 0.96) 100%),
-        radial-gradient(circle at 50% -12%, rgba(255, 255, 255, 0.13), transparent 60%),
-        linear-gradient(180deg, #2b3139, #14171c 42%, #0b0d10);
+        linear-gradient(180deg, rgba(255, 255, 252, 0.54) 0%, rgba(238, 246, 233, 0.8) 62%, rgba(229, 239, 224, 0.92) 100%),
+        radial-gradient(circle at 50% -10%, rgba(255, 255, 255, 0.92), transparent 58%),
+        linear-gradient(180deg, #f4f8ef, #e8f0e4);
       min-height: 0;
       height: 100%;
       display: grid;
@@ -667,6 +1246,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       align-items: stretch;
       padding: 0;
       gap: 0;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
     }
 
     .subtitle-lane{
@@ -676,7 +1256,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     }
 
     .subtitle-lane + .subtitle-lane{
-      border-top: 1px solid rgba(255,255,255,0.08);
+      border-top: 1px solid rgba(118, 139, 109, 0.2);
     }
 
     .subtitle-stack{
@@ -691,20 +1271,58 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       user-select: text;
       overflow-y: auto;
       overflow-x: hidden;
-      scrollbar-width: none;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(93, 119, 101, 0.28) transparent;
       -ms-overflow-style: none;
       padding: 10px 10px 14px;
     }
 
     .subtitle-stack::-webkit-scrollbar{
-      display: none;
-      width: 0;
-      height: 0;
+      width: 8px;
+      height: 8px;
+    }
+
+    .subtitle-stack::-webkit-scrollbar-thumb{
+      background: rgba(93, 119, 101, 0.24);
+      border-radius: 999px;
+    }
+
+    .subtitle-stack::-webkit-scrollbar-track{
+      background: transparent;
     }
 
     .subtitle-line{
       display: block;
       min-height: 1.2em;
+    }
+
+    .jump-latest{
+      position: absolute;
+      right: 12px;
+      bottom: 14px;
+      z-index: 3;
+      border: 1px solid rgba(114, 138, 106, 0.34);
+      border-radius: 999px;
+      background: rgba(255, 255, 248, 0.88);
+      color: #4b6658;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(6px);
+      transition: opacity .16s ease, transform .16s ease, background .16s ease;
+      backdrop-filter: blur(8px);
+    }
+
+    .jump-latest.is-visible{
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
+    }
+
+    .jump-latest:hover{
+      background: rgba(255, 255, 255, 0.96);
     }
 
     .line-enter{
@@ -727,23 +1345,18 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
       font-size: clamp(28px, 3.3vw, 42px);
       font-weight: 750;
-      color: #fcfcf7;
+      color: #1f302b;
       letter-spacing: 0.02em;
-      text-shadow:
-        0 1px 0 rgba(0, 0, 0, 0.95),
-        0 3px 10px rgba(0, 0, 0, 0.75),
-        0 0 20px rgba(0, 0, 0, 0.45);
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.76);
     }
 
     #text{
       min-height: 34px;
       font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-      font-size: clamp(18px, 2.5vw, 28px);
+      font-size: clamp(16px, 2.25vw, 26px);
       font-weight: 560;
-      color: #f6d9a5;
-      text-shadow:
-        0 1px 0 rgba(0, 0, 0, 0.95),
-        0 2px 8px rgba(0, 0, 0, 0.75);
+      color: #526644;
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.78);
     }
 
     #lang{
@@ -752,21 +1365,73 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
     @media (max-width: 720px){
       .card{
-        min-height: 100vh;
+        height: 100svh;
+        min-height: 100svh;
+        padding: 10px;
+        gap: 10px;
+      }
+      h1{
+        font-size: 14px;
+        letter-spacing: .5px;
+        padding-right: 66px;
+      }
+      .control-bar{
+        align-items: stretch;
+        gap: 8px;
+      }
+      .control-bar button{
+        flex: 1 1 calc(50% - 8px);
+      }
+      .badge{
+        flex: 1 0 100%;
+      }
+      .source-toggle,
+      .direction-select{
+        flex: 1 1 100%;
+        justify-content: space-between;
+      }
+      .source-toggle select,
+      .direction-select select{
+        max-width: 62%;
       }
       .subtitle-stage{
         min-height: 0;
         height: 100%;
+      }
+      .subtitle-stack{
+        padding: 8px 7px 12px;
+        line-height: 2.05;
+      }
+      #translation{
+        font-size: clamp(22px, 7vw, 32px);
+      }
+      #text{
+        font-size: clamp(14px, 4.8vw, 20px);
+      }
+      .control-reveal{
+        top: 8px;
+        right: 10px;
+        padding: 5px 9px;
+      }
+    }
+
+    @supports (height: 100dvh){
+      @media (max-width: 720px){
+        .card{
+          height: 100dvh;
+          min-height: 100dvh;
+        }
       }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
+    <div id="appCard" class="card">
       <h1>语音识别与翻译</h1>
+      <button id="controlReveal" class="control-reveal" type="button" hidden aria-controls="controlBar" aria-expanded="false">控制</button>
 
-      <div class="row">
+      <div id="controlBar" class="row control-bar">
         <button id="btnStart" class="primary">Start</button>
         <button id="btnStop" class="danger" disabled>Stop</button>
         <span id="status" class="badge warn">Idle</span>
@@ -777,18 +1442,23 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             <option value="system">系统声音</option>
           </select>
         </label>
-        <label class="direction-toggle" for="translationDirectionToggle">
-          <input id="translationDirectionToggle" type="checkbox" />
-          <span id="translationDirectionLabel">中文->英文</span>
+        <label class="direction-select" for="translationDirectionSelect">
+          <span id="translationDirectionLabel">翻译方向</span>
+          <select id="translationDirectionSelect">
+            <option value="zh2en">中文 -> 英文</option>
+            <option value="en2zh">英文 -> 中文</option>
+          </select>
         </label>
       </div>
 
       <div class="subtitle-stage">
         <div class="subtitle-lane">
           <div id="translation" class="subtitle-stack"></div>
+          <button id="jumpLatestEn" class="jump-latest" type="button" hidden>最新</button>
         </div>
         <div class="subtitle-lane">
           <div id="text" class="subtitle-stack"></div>
+          <button id="jumpLatestZh" class="jump-latest" type="button" hidden>最新</button>
         </div>
       </div>
       <div id="lang">-</div>
@@ -805,22 +1475,29 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const WEBSOCKET_DRAIN_TIMEOUT_MS = 4000;
   const STOP_FINAL_TIMEOUT_MS = 120000;
   const TAIL_STABILIZE_MS = 700;
-  const SUBTITLE_KEEP_MS = 20000;
-  const MAX_VISIBLE_ROWS = 4;
+  const MAX_SUBTITLE_HISTORY = 100;
+  const MAX_VISIBLE_ROWS_ZH = 4;
+  const MAX_VISIBLE_ROWS_EN = MAX_VISIBLE_ROWS_ZH + 2;
+  const SUBTITLE_SCROLL_BOTTOM_EPSILON_PX = 24;
   const USE_COMMITTED_SENTENCE_EVENTS = true;
   const SUBTITLE_TRACE_DEFAULT = __SUBTITLE_TRACE__;
   const SUBTITLE_TRACE_MAX_EVENTS = __SUBTITLE_TRACE_MAX_EVENTS__;
 
   const $ = (id) => document.getElementById(id);
+  const appCard = $("appCard");
+  const controlBar = $("controlBar");
+  const controlReveal = $("controlReveal");
   const btnStart = $("btnStart");
   const btnStop = $("btnStop");
   const statusEl = $("status");
   const langEl = $("lang");
   const textEl = $("text");
   const translationEl = $("translation");
+  const jumpLatestEn = $("jumpLatestEn");
+  const jumpLatestZh = $("jumpLatestZh");
   const inputSourceSelect = $("inputSourceSelect");
   const inputSourceLabel = $("inputSourceLabel");
-  const translationDirectionToggle = $("translationDirectionToggle");
+  const translationDirectionSelect = $("translationDirectionSelect");
   const translationDirectionLabel = $("translationDirectionLabel");
   const rawTextEl = $("rawText");
   const languageSelect = $("languageSelect");
@@ -859,12 +1536,18 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let lastChunkSentAt = 0;
   let lastPartialAt = 0;
   let tailStabilizeTimer = null;
+  let controlAutoHideTimer = null;
   let subtitleTraceEnabled = false;
   let subtitleTraceSeq = 0;
   let subtitleTraceEvents = [];
   let lastPartialTraceSeq = -1;
   let inputSource = "mic";
   let translationDirection = "zh2en";
+  const autoScrollRaf = new WeakMap();
+  const scrollFollowState = {
+    zh: { follow: true, autoScrolling: false },
+    en: { follow: true, autoScrolling: false },
+  };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -891,7 +1574,14 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     applyInputSource(initial, { silent: true });
   })();
 
-  applyTranslationDirection("zh2en", { silent: true });
+  (() => {
+    let initial = "zh2en";
+    try {
+      const saved = String(localStorage.getItem("subtitle_translation_direction") || "").trim().toLowerCase();
+      if (saved) initial = saved;
+    } catch (err) {}
+    applyTranslationDirection(initial, { silent: true });
+  })();
 
   function traceSubtitle(event, payload = {}, force = false){
     if (!subtitleTraceEnabled && !force) return;
@@ -913,6 +1603,52 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         console.debug("[subtitle-trace]", row);
       } catch (err) {}
     }
+  }
+
+  function clearControlAutoHideTimer(){
+    if (controlAutoHideTimer) {
+      clearTimeout(controlAutoHideTimer);
+      controlAutoHideTimer = null;
+    }
+  }
+
+  function setControlBarHidden(hidden, reason = ""){
+    if (!appCard || !controlBar) return;
+    const next = !!hidden;
+    const prev = appCard.classList.contains("controls-hidden");
+    clearControlAutoHideTimer();
+    appCard.classList.toggle("controls-hidden", next);
+    controlBar.setAttribute("aria-hidden", next ? "true" : "false");
+    if (controlReveal) {
+      controlReveal.hidden = !next;
+      controlReveal.setAttribute("aria-expanded", next ? "false" : "true");
+      controlReveal.setAttribute("aria-hidden", next ? "false" : "true");
+    }
+    if (prev !== next) {
+      traceSubtitle("controls_hidden_changed", {
+        hidden: next,
+        reason: String(reason || ""),
+      });
+    }
+  }
+
+  function scheduleControlBarAutoHide(delayMs = 5200){
+    clearControlAutoHideTimer();
+    if (!running || awaitingFinal) return;
+    controlAutoHideTimer = setTimeout(() => {
+      controlAutoHideTimer = null;
+      if (!running || awaitingFinal) return;
+      if (controlBar && controlBar.contains(document.activeElement)) {
+        scheduleControlBarAutoHide(1800);
+        return;
+      }
+      setControlBarHidden(true, "auto_timeout");
+    }, Math.max(1200, Number(delayMs || 0)));
+  }
+
+  function revealControlBarTemporarily(reason = "manual_reveal"){
+    setControlBarHidden(false, reason);
+    scheduleControlBarAutoHide(6200);
   }
 
   function clearTailStabilizeTimer(){
@@ -1010,20 +1746,23 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   }
 
   function selectedTranslationDirection(){
-    if (!translationDirectionToggle) return "zh2en";
-    return translationDirectionToggle.checked ? "en2zh" : "zh2en";
+    if (!translationDirectionSelect) return translationDirection;
+    return normalizeTranslationDirection(translationDirectionSelect.value);
   }
 
   function applyTranslationDirection(direction, options = {}){
     const normalized = normalizeTranslationDirection(direction);
     const prev = translationDirection;
     translationDirection = normalized;
-    if (translationDirectionToggle) {
-      translationDirectionToggle.checked = normalized === "en2zh";
+    if (translationDirectionSelect) {
+      translationDirectionSelect.value = normalized;
     }
     if (translationDirectionLabel) {
-      translationDirectionLabel.textContent = normalized === "en2zh" ? "英文->中文" : "中文->英文";
+      translationDirectionLabel.textContent = "翻译方向";
     }
+    try {
+      localStorage.setItem("subtitle_translation_direction", normalized);
+    } catch (err) {}
     const silent = !!(options && options.silent);
     if (!silent && prev !== normalized) {
       traceSubtitle("translation_direction_ui_set", { prev, next: normalized });
@@ -1046,12 +1785,139 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     btnStart.disabled = active;
     btnStop.disabled = !active;
     if (inputSourceSelect) inputSourceSelect.disabled = active;
+    if (translationDirectionSelect) translationDirectionSelect.disabled = active;
   }
 
   function lockUIFinishing(){
     btnStart.disabled = true;
     btnStop.disabled = true;
     if (inputSourceSelect) inputSourceSelect.disabled = true;
+    if (translationDirectionSelect) translationDirectionSelect.disabled = true;
+  }
+
+  function laneForContainer(container){
+    if (container === textEl) return "zh";
+    if (container === translationEl) return "en";
+    return "unknown";
+  }
+
+  function containerForLane(lane){
+    if (lane === "zh") return textEl;
+    if (lane === "en") return translationEl;
+    return null;
+  }
+
+  function buttonForLane(lane){
+    if (lane === "zh") return jumpLatestZh;
+    if (lane === "en") return jumpLatestEn;
+    return null;
+  }
+
+  function isNearSubtitleBottom(container){
+    if (!container) return true;
+    const remaining = Math.max(
+      0,
+      Number(container.scrollHeight || 0) - Number(container.clientHeight || 0) - Number(container.scrollTop || 0)
+    );
+    return remaining <= SUBTITLE_SCROLL_BOTTOM_EPSILON_PX;
+  }
+
+  function updateJumpLatestButtons(){
+    for (const lane of ["en", "zh"]) {
+      const button = buttonForLane(lane);
+      const container = containerForLane(lane);
+      const state = scrollFollowState[lane];
+      if (!button || !container || !state) continue;
+      const hasOverflow = Number(container.scrollHeight || 0) > (Number(container.clientHeight || 0) + SUBTITLE_SCROLL_BOTTOM_EPSILON_PX);
+      const visible = !state.follow && hasOverflow;
+      button.hidden = !visible;
+      button.classList.toggle("is-visible", visible);
+      button.setAttribute("aria-hidden", visible ? "false" : "true");
+      button.disabled = !visible;
+      button.title = lane === "en" ? "滚动到最新英文字幕" : "滚动到最新中文字幕";
+    }
+  }
+
+  function pauseSubtitleAutoFollow(lane, options = {}){
+    const state = scrollFollowState[lane];
+    if (!state || !state.follow) return false;
+    state.follow = false;
+    traceSubtitle("scroll_follow_paused", {
+      lane,
+      reason: String(options.reason || "user_scroll"),
+      scrollTop: Math.round(Number(options.scrollTop || 0)),
+    });
+    updateJumpLatestButtons();
+    return true;
+  }
+
+  function resumeSubtitleAutoFollow(lane, options = {}){
+    const state = scrollFollowState[lane];
+    if (!state) return false;
+    const wasFollowing = !!state.follow;
+    state.follow = true;
+    if (!wasFollowing) {
+      traceSubtitle("scroll_follow_resumed", {
+        lane,
+        reason: String(options.reason || "bottom_reached"),
+      });
+    }
+    updateJumpLatestButtons();
+    if (options.pin !== false) {
+      pinScrollToBottom(containerForLane(lane), { force: true });
+    }
+    return !wasFollowing;
+  }
+
+  function bindSubtitleScrollTracking(container){
+    if (!container || container.dataset.scrollBound === "1") return;
+    const lane = laneForContainer(container);
+    if (lane === "unknown") return;
+    container.dataset.scrollBound = "1";
+    container.addEventListener("scroll", () => {
+      const state = scrollFollowState[lane];
+      if (!state || state.autoScrolling) return;
+      if (isNearSubtitleBottom(container)) {
+        resumeSubtitleAutoFollow(lane, { reason: "user_bottom", pin: false });
+        return;
+      }
+      pauseSubtitleAutoFollow(lane, {
+        reason: "user_scroll",
+        scrollTop: Number(container.scrollTop || 0),
+      });
+    }, { passive: true });
+  }
+
+  function resetSubtitleAutoFollow(){
+    scrollFollowState.zh.follow = true;
+    scrollFollowState.zh.autoScrolling = false;
+    scrollFollowState.en.follow = true;
+    scrollFollowState.en.autoScrolling = false;
+    updateJumpLatestButtons();
+  }
+
+  function pinScrollToBottom(container, options = {}){
+    if (!container) return;
+    const lane = laneForContainer(container);
+    const state = scrollFollowState[lane];
+    const force = !!(options && options.force);
+    if (state && !state.follow && !force) return;
+    if (state) state.autoScrolling = true;
+    container.scrollTop = container.scrollHeight;
+    if (typeof requestAnimationFrame !== "function") {
+      if (state) state.autoScrolling = false;
+      return;
+    }
+    const prevHandle = autoScrollRaf.get(container);
+    if (prevHandle) {
+      cancelAnimationFrame(prevHandle);
+    }
+    const handle = requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+      if (state) state.autoScrolling = false;
+      autoScrollRaf.delete(container);
+    });
+    autoScrollRaf.set(container, handle);
   }
 
   function setRawAsrText(text, options = {}){
@@ -1059,7 +1925,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       rawAsrLastSnapshot = "";
       if (rawTextEl) {
         rawTextEl.textContent = rawAsrText;
-        rawTextEl.scrollTop = rawTextEl.scrollHeight;
+        pinScrollToBottom(rawTextEl);
       }
       return;
     }
@@ -1082,7 +1948,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       // Ignore temporary shrink rewrite from unstable partials.
       if (rawTextEl) {
         rawTextEl.textContent = rawAsrText;
-        rawTextEl.scrollTop = rawTextEl.scrollHeight;
+        pinScrollToBottom(rawTextEl);
       }
       return;
     } else {
@@ -1092,7 +1958,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     rawAsrLastSnapshot = next;
     if (rawTextEl) {
       rawTextEl.textContent = rawAsrText;
-      rawTextEl.scrollTop = rawTextEl.scrollHeight;
+      pinScrollToBottom(rawTextEl);
     }
   }
 
@@ -1110,21 +1976,30 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     return parts.join(" ").trim();
   }
 
-  function pruneSubtitleWindow(nowMs){
-    const cutoff = nowMs - SUBTITLE_KEEP_MS;
-    let drop = 0;
-    while (drop < subtitleSentencePairs.length - 1 && subtitleSentencePairs[drop].ts < cutoff) {
-      drop += 1;
-    }
-    if (drop > 0) {
-      const droppedIds = subtitleSentencePairs.slice(0, drop).map((item) => String(item.sid || "")).slice(0, 8);
-      subtitleSentencePairs = subtitleSentencePairs.slice(drop);
-      traceSubtitle("prune_subtitle_window", {
-        drop,
-        remaining: subtitleSentencePairs.length,
-        droppedIds,
-      });
-    }
+  function resolveTentativeTail(nextText, committedText, tentativeText){
+    const tentative = String(tentativeText || "").trim();
+    if (tentative) return tentative;
+    const full = String(nextText || "").trim();
+    if (!full) return "";
+    const committed = String(committedText || "").trim();
+    if (!committed) return full;
+    if (!full.startsWith(committed)) return "";
+    const tail = full.slice(committed.length).trim();
+    return tail;
+  }
+
+  function trimSubtitleHistory(){
+    const maxKeep = Math.max(1, Number(MAX_SUBTITLE_HISTORY || 100));
+    const overflow = Math.max(0, subtitleSentencePairs.length - maxKeep);
+    if (overflow <= 0) return;
+    const droppedIds = subtitleSentencePairs.slice(0, overflow).map((item) => String(item.sid || "")).slice(0, 8);
+    subtitleSentencePairs = subtitleSentencePairs.slice(overflow);
+    traceSubtitle("history_trimmed", {
+      drop: overflow,
+      remaining: subtitleSentencePairs.length,
+      maxKeep,
+      droppedIds,
+    });
   }
 
   function upsertCommittedSentence(sentenceId, text, tsMs, options = {}){
@@ -1233,32 +2108,23 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     const tail = String(currentTextTail || "").trim();
 
     if (USE_COMMITTED_SENTENCE_EVENTS) {
-      const reserveTailSlot = running && committedRows.length > 0;
-      const committedCap = reserveTailSlot ? Math.max(1, MAX_VISIBLE_ROWS - 1) : MAX_VISIBLE_ROWS;
-      const head = committedRows.length > committedCap
-        ? committedRows.slice(committedRows.length - committedCap)
-        : committedRows.slice();
-      if (tail || reserveTailSlot) {
-        head.push({ sid: "__tail__", zh: tail, en: "" });
+      const rows = committedRows.slice();
+      if (tail || (running && committedRows.length > 0)) {
+        rows.push({ sid: "__tail__", zh: tail, en: "" });
       }
-      return clipVisibleRows(head);
+      return rows;
     }
 
     const rows = committedRows.slice();
     if (tail) {
       rows.push({ sid: "__tail__", zh: tail, en: "" });
     }
-    return clipVisibleRows(rows);
+    return rows;
   }
 
   function clearSubtitleDom(){
     if (textEl) textEl.replaceChildren();
     if (translationEl) translationEl.replaceChildren();
-  }
-
-  function clipVisibleRows(rows){
-    if (!rows || rows.length <= MAX_VISIBLE_ROWS) return rows || [];
-    return rows.slice(rows.length - MAX_VISIBLE_ROWS);
   }
 
   function subtitleChars(rows, pickText){
@@ -1315,8 +2181,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         container.insertBefore(node, refNode);
       }
     }
-    // Always pin to latest lines when content exceeds lane height.
-    container.scrollTop = container.scrollHeight;
+    pinScrollToBottom(container);
     const lane = container === textEl ? "zh" : (container === translationEl ? "en" : "unknown");
     if (removed > 0 || created > 0 || changedText > 0) {
       traceSubtitle("patch_container", {
@@ -1328,8 +2193,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         changedText,
         removedIds,
         keepTail: !!currentTextTail,
+        follow: lane !== "unknown" ? !!scrollFollowState[lane].follow : true,
       });
     }
+    updateJumpLatestButtons();
     return nextNodes;
   }
 
@@ -1407,6 +2274,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       watchdogTimer = null;
     }
     lockUI(false);
+    setControlBarHidden(false, "reset_session");
   }
 
   function startWatchdog(){
@@ -1497,6 +2365,12 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   function selectedLanguage(){
     if (!languageSelect) return "";
     return String(languageSelect.value || "").trim();
+  }
+
+  function selectedAsrLanguage(){
+    const explicitLanguage = selectedLanguage();
+    if (explicitLanguage) return explicitLanguage;
+    return selectedTranslationDirection() === "en2zh" ? "English" : "Chinese";
   }
 
   function buildAudioConstraints(){
@@ -1782,6 +2656,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       }
       setCurrentSegmentText("");
       setRawAsrText("", { resetCurrent: true });
+      resetSubtitleAutoFollow();
       clearCommittedTentativeTailNow();
       currentTranslationTail = "";
       renderTranscript();
@@ -1809,7 +2684,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         { sliceCommit: !!msg.slice_commit }
       );
       if (!changed) return;
-      pruneSubtitleWindow(Date.now());
+      trimSubtitleHistory();
       renderTranscript();
       renderTranslation();
       if (running) {
@@ -1838,7 +2713,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         { allowOverwrite, sliceCommit: !!msg.slice_commit }
       );
       if (!changed) return;
-      pruneSubtitleWindow(Date.now());
+      trimSubtitleHistory();
       renderTranscript();
       renderTranslation();
       return;
@@ -1864,6 +2739,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       subtitleSentencePairs = [];
       setCurrentSegmentText("");
       setRawAsrText("", { resetCurrent: true });
+      resetSubtitleAutoFollow();
       clearSubtitleDom();
       zhLineNodes = new Map();
       enLineNodes = new Map();
@@ -1881,7 +2757,12 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       setRawAsrText(nextText);
       if (USE_COMMITTED_SENTENCE_EVENTS) {
         setCurrentSegmentText(nextText);
-        const tentativeTail = String(msg.tentative_text || "").trim();
+        const committedText = String(msg.committed_text || "").trim();
+        const tentativeTail = resolveTentativeTail(
+          nextText,
+          committedText,
+          msg.tentative_text || ""
+        );
         if (lastPartialSeq <= 5 || (lastPartialSeq % 20 === 0 && lastPartialTraceSeq !== lastPartialSeq)) {
           traceSubtitle("ws_partial", {
             seq: lastPartialSeq,
@@ -1926,6 +2807,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       renderTranslation();
       awaitingFinal = false;
       lockUI(false);
+      setControlBarHidden(false, "final");
       setStatus("Stopped / 已停止", "");
       if (resolve) resolve(msg);
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1941,6 +2823,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       rejectPendingFinal(new Error(msg.message || "websocket server error"));
       resetSessionFlags();
       stopPipeline();
+      setControlBarHidden(false, "server_error");
       setStatus("Error / 错误: " + (msg.message || "unknown"), "err");
       if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.close(); } catch (err) {}
@@ -2023,8 +2906,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
-  if (translationDirectionToggle) {
-    translationDirectionToggle.addEventListener("change", () => {
+  if (translationDirectionSelect) {
+    translationDirectionSelect.addEventListener("change", () => {
       const next = selectedTranslationDirection();
       applyTranslationDirection(next);
       sendTranslationDirection(next);
@@ -2038,10 +2921,50 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     });
   }
 
+  bindSubtitleScrollTracking(textEl);
+  bindSubtitleScrollTracking(translationEl);
+
+  if (jumpLatestEn) {
+    jumpLatestEn.addEventListener("click", () => {
+      traceSubtitle("jump_latest_clicked", { lane: "en" });
+      resumeSubtitleAutoFollow("en", { reason: "button_click", pin: true });
+    });
+  }
+
+  if (jumpLatestZh) {
+    jumpLatestZh.addEventListener("click", () => {
+      traceSubtitle("jump_latest_clicked", { lane: "zh" });
+      resumeSubtitleAutoFollow("zh", { reason: "button_click", pin: true });
+    });
+  }
+
+  if (controlReveal) {
+    controlReveal.addEventListener("click", () => {
+      traceSubtitle("control_reveal_clicked", {});
+      revealControlBarTemporarily("reveal_button");
+    });
+  }
+
+  if (controlBar) {
+    controlBar.addEventListener("focusin", () => {
+      if (running && !awaitingFinal) clearControlAutoHideTimer();
+    });
+    controlBar.addEventListener("focusout", () => {
+      scheduleControlBarAutoHide(2600);
+    });
+    controlBar.addEventListener("pointerenter", () => {
+      if (running && !awaitingFinal) clearControlAutoHideTimer();
+    });
+    controlBar.addEventListener("pointerleave", () => {
+      scheduleControlBarAutoHide(2600);
+    });
+  }
+
   btnStart.onclick = async () => {
     if (running || awaitingFinal) return;
     subtitleSentencePairs = [];
     setCurrentSegmentText("");
+    resetSubtitleAutoFollow();
     clearSubtitleDom();
     zhLineNodes = new Map();
     enLineNodes = new Map();
@@ -2073,7 +2996,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         ws.send(
           JSON.stringify({
             type: "start",
-            language: selectedLanguage(),
+            language: selectedAsrLanguage(),
             translation_direction: selectedTranslationDirection(),
           })
         );
@@ -2091,6 +3014,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           setStatus("Listening / 识别中", "ok");
         }
       }
+      setControlBarHidden(true, "start_success");
     } catch (err) {
       console.error(err);
       await stopPipeline();
@@ -2100,6 +3024,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       ws = null;
       running = false;
       lockUI(false);
+      setControlBarHidden(false, "start_failed");
       setStatus("Start failed / 启动失败: " + describeStartError(err), "err");
     }
   };
@@ -2109,6 +3034,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     // Stop microphone first, then flush queued PCM before sending finish.
     running = false;
     awaitingFinal = true;
+    setControlBarHidden(false, "stop_requested");
     lockUIFinishing();
     setStatus("Finishing / 收尾中", "warn");
     await stopPipeline(false);
@@ -2152,6 +3078,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   if (typeof window !== "undefined") {
     const _resetDebugSubtitleState = () => {
       subtitleSentencePairs = [];
+      resetSubtitleAutoFollow();
       setCurrentSegmentText("");
       setRawAsrText("", { resetCurrent: true });
       clearSubtitleDom();
@@ -2263,7 +3190,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           throw new Error("empty pcm payload");
         }
 
-        const language = String(cfg.language || "auto");
+        const language = String(cfg.language || selectedAsrLanguage() || "auto");
         const timeoutMs = Math.max(5000, Number(cfg.timeoutMs || 120000));
         const paceMs = Math.max(0, Number(cfg.paceMs || 0));
         let chunkBytes = Number(cfg.chunkBytes || 0);
@@ -2398,10 +3325,24 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         const toRows = (container) => container ? Array.from(container.children).map((node) => String(node.textContent || "")) : [];
         return {
           running,
+          controlsHidden: !!(appCard && appCard.classList.contains("controls-hidden")),
           subtitleTraceEnabled,
           subtitleTraceCount: subtitleTraceEvents.length,
           currentTextTail: String(currentTextTail || ""),
           currentSegmentText: String(currentSegmentText || ""),
+          historyCount: subtitleSentencePairs.length,
+          scrollFollowState: {
+            zh: { ...scrollFollowState.zh },
+            en: { ...scrollFollowState.en },
+          },
+          zhScrollTop: textEl ? Number(textEl.scrollTop || 0) : 0,
+          zhScrollHeight: textEl ? Number(textEl.scrollHeight || 0) : 0,
+          zhClientHeight: textEl ? Number(textEl.clientHeight || 0) : 0,
+          enScrollTop: translationEl ? Number(translationEl.scrollTop || 0) : 0,
+          enScrollHeight: translationEl ? Number(translationEl.scrollHeight || 0) : 0,
+          enClientHeight: translationEl ? Number(translationEl.clientHeight || 0) : 0,
+          jumpLatestZhVisible: !!(jumpLatestZh && !jumpLatestZh.hidden),
+          jumpLatestEnVisible: !!(jumpLatestEn && !jumpLatestEn.hidden),
           zhRows: toRows(textEl),
           enRows: toRows(translationEl),
         };
@@ -2557,6 +3498,10 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         last_text_snapshot = ""
         last_text_advance_at = time.monotonic()
         last_idle_commit_at = 0.0
+        partial_reset_guard_min_prev_chars = 20
+        partial_reset_guard_max_ratio = 0.6
+        partial_reset_guard_release_hits = 2
+        partial_reset_guard_max_hold_sec = 1.2
         vad_silence_trigger_ms = max(120.0, float(getattr(args, "vad_silence_sec", 0.9)) * 1000.0)
         vad_force_silence_ms = max(vad_silence_trigger_ms + 300.0, float(getattr(args, "vad_force_cut_sec", 1.8)) * 1000.0)
         vad_min_slice_ms = max(500.0, float(getattr(args, "vad_min_slice_sec", 4.0)) * 1000.0)
@@ -2566,6 +3511,15 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         vad_exit_snr_db = max(0.2, min(vad_enter_snr_db - 0.5, vad_exit_snr_db))
         vad_frame_samples = max(80, int(SAMPLE_RATE * 0.02))
         text_stable_cut_ms = max(180.0, float(getattr(args, "backend_cut_stable_sec", 0.45)) * 1000.0)
+        punct_cut_start_ms = max(0.0, float(getattr(args, "punct_cut_start_sec", 0.0)) * 1000.0)
+        punct_cut_wait_ms = max(0.0, float(getattr(args, "punct_cut_wait_sec", 0.0)) * 1000.0)
+        punct_cut_stable_ms = max(80.0, float(getattr(args, "punct_cut_stable_sec", 0.45)) * 1000.0)
+        punct_cut_stable_hits = max(1, int(getattr(args, "punct_cut_stable_hits", 2)))
+        punct_cut_max_carry_chars = max(0, int(getattr(args, "punct_cut_max_carry_chars", 12)))
+        # Deprecated: punctuation-timeout cutting is disabled permanently to avoid
+        # sentence loss/regression in streaming mode.
+        punct_cut_enabled = False
+        punct_cut_pattern = SENTENCE_BOUNDARY_PATTERN
         segment_policy = SegmentPolicy(
             vad_silence_ms=vad_silence_trigger_ms,
             hard_cut_ms=(segment_hard_cut_sec * 1000.0),
@@ -2581,6 +3535,20 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             id=1,
             started_at=time.monotonic(),
             last_cut_reason="open",
+        )
+        punct_cut_runtime = SimpleNamespace(
+            gate_open=False,
+            gate_chars=0,
+            gate_open_at=0.0,
+            candidate_end=0,
+            candidate_token="",
+            candidate_since=0.0,
+            candidate_hits=0,
+            anchor_end=0,
+            anchor_token="",
+            anchor_locked_at=0.0,
+            anchor_seq=0,
+            triggered=False,
         )
         backpressure_runtime = SimpleNamespace(
             under_pressure=False,
@@ -2620,11 +3588,27 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             tentative_tail="",
             pending_prefix_text="",
             pending_prefix_segment_id=0,
+            pending_prefix_reason="",
+            pending_prefix_miss_count=0,
             boundary_anchor_text="",
             boundary_anchor_segment_id=0,
             boundary_overlap_cap_chars=max(4, min(24, int(round(segment_overlap_sec * 14.0)))),
+            duplicate_filter_pause_until=0.0,
+            duplicate_filter_pause_reason="",
         )
-        stream_text_state = SimpleNamespace(last_text="")
+        stream_text_state = SimpleNamespace(
+            last_text="",
+            accepted_text="",
+            reset_candidate_text="",
+            reset_candidate_hits=0,
+            reset_candidate_since=0.0,
+        )
+        alignment_runtime = SimpleNamespace(
+            model_seen={},
+            committed_seen={},
+            model_observed_events=0,
+            committed_events=0,
+        )
         translation_source_default = str(getattr(args, "translation_source_language", "Chinese") or "Chinese")
         translation_target_default = str(getattr(args, "translation_target_language", "English") or "English")
 
@@ -2747,6 +3731,164 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 logger.info("text_pool %s", json.dumps(row, ensure_ascii=False, separators=(",", ":")))
             except Exception:
                 logger.info("text_pool %s", row)
+
+        def _sentence_signature_rows(
+            sentences: List[str],
+            *,
+            keep_head: int = 2,
+            keep_tail: int = 3,
+        ) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            cleaned = [str(seg or "").strip() for seg in list(sentences or [])]
+            total = len(cleaned)
+            if total <= 0:
+                return rows
+            head_n = max(0, int(keep_head))
+            tail_n = max(0, int(keep_tail))
+            indexes: List[int] = []
+            if total <= (head_n + tail_n):
+                indexes = list(range(total))
+            else:
+                indexes.extend(range(head_n))
+                indexes.extend(range(max(head_n, total - tail_n), total))
+            seen = set()
+            for idx in indexes:
+                if idx in seen or idx < 0 or idx >= total:
+                    continue
+                seen.add(idx)
+                text = str(cleaned[idx] or "")
+                rows.append(
+                    {
+                        "idx": int(idx),
+                        "chars": len(text),
+                        "hash8": _hash8(text),
+                        "preview": _trace_preview(text, 64),
+                    }
+                )
+            return rows
+
+        def _count_matching_sentence_prefix(prev: List[str], cur: List[str]) -> int:
+            if not prev or not cur:
+                return 0
+            limit = min(len(prev), len(cur))
+            i = 0
+            while i < limit:
+                if _normalize_sentence_for_duplicate_compare(str(prev[i] or "")) != _normalize_sentence_for_duplicate_compare(str(cur[i] or "")):
+                    break
+                i += 1
+            return int(i)
+
+        def _track_model_observed_sentences(text: str, seq_hint: int, source: str) -> None:
+            snapshot = str(text or "").strip()
+            if not snapshot:
+                return
+            completed, _ = _split_sentences_and_tail(snapshot)
+            if not completed:
+                return
+            new_unique = 0
+            for sentence in completed:
+                _, created, _ = _alignment_registry_touch_model(
+                    alignment_runtime.model_seen,
+                    sentence,
+                    int(seq_hint or 0),
+                    str(source or ""),
+                )
+                if created:
+                    new_unique += 1
+            alignment_runtime.model_observed_events = int(getattr(alignment_runtime, "model_observed_events", 0) or 0) + 1
+            if new_unique > 0:
+                _trace_event(
+                    "alignment_model_observed",
+                    seq=int(seq_hint or 0),
+                    source=str(source or ""),
+                    completed_count=int(len(completed)),
+                    new_unique=int(new_unique),
+                    model_unique_total=int(len(alignment_runtime.model_seen)),
+                )
+
+        def _track_committed_sentence(sentence: str, seq_hint: int, source: str, sentence_id: str) -> None:
+            key, created, committed_entry = _alignment_registry_touch(
+                alignment_runtime.committed_seen,
+                sentence,
+                int(seq_hint or 0),
+                str(source or ""),
+            )
+            if not key:
+                return
+            alignment_runtime.committed_events = int(getattr(alignment_runtime, "committed_events", 0) or 0) + 1
+            model_entry = alignment_runtime.model_seen.get(key)
+            if model_entry is None:
+                _trace_event(
+                    "alignment_commit_without_model_observation",
+                    seq=int(seq_hint or 0),
+                    source=str(source or ""),
+                    sentence_id=str(sentence_id or ""),
+                    chars=len(str(sentence or "").strip()),
+                    preview=_trace_preview(str(sentence or ""), 72),
+                    committed_unique_total=int(len(alignment_runtime.committed_seen)),
+                )
+                return
+            if created:
+                _trace_event(
+                    "alignment_commit_matched_model",
+                    seq=int(seq_hint or 0),
+                    source=str(source or ""),
+                    sentence_id=str(sentence_id or ""),
+                    model_hits=int(model_entry.get("hits", 0) or 0),
+                    first_model_seq=int(model_entry.get("first_seq", 0) or 0),
+                    committed_unique_total=int(len(alignment_runtime.committed_seen)),
+                    model_unique_total=int(len(alignment_runtime.model_seen)),
+                    committed_hits=int(committed_entry.get("hits", 0) or 0),
+                )
+
+        def _emit_alignment_summary(reason: str, seq_hint: int) -> None:
+            summary = _summarize_alignment_gap(
+                alignment_runtime.model_seen,
+                alignment_runtime.committed_seen,
+                min_model_hits=2,
+                max_samples=6,
+            )
+            samples = []
+            for row in list(summary.get("missing_samples", []) or []):
+                src = str(row.get("text", "") or "")
+                samples.append(
+                    {
+                        "preview": _trace_preview(src, 72),
+                        "chars": len(src),
+                        "hits": int(row.get("hits", 0) or 0),
+                        "first_seq": int(row.get("first_seq", 0) or 0),
+                        "last_seq": int(row.get("last_seq", 0) or 0),
+                        "sources": list(row.get("sources", []) or []),
+                    }
+                )
+            final_samples = []
+            for row in list(summary.get("final_missing_samples", []) or []):
+                src = str(row.get("text", "") or "")
+                final_samples.append(
+                    {
+                        "preview": _trace_preview(src, 72),
+                        "chars": len(src),
+                        "hits": int(row.get("hits", 0) or 0),
+                        "first_seq": int(row.get("first_seq", 0) or 0),
+                        "last_seq": int(row.get("last_seq", 0) or 0),
+                        "sources": list(row.get("sources", []) or []),
+                    }
+                )
+            _trace_event(
+                "alignment_summary",
+                seq=int(seq_hint or 0),
+                reason=str(reason or ""),
+                model_all_unique=int(summary.get("model_all_unique", 0) or 0),
+                model_stable_unique=int(summary.get("model_stable_unique", 0) or 0),
+                model_final_unique=int(summary.get("model_final_unique", 0) or 0),
+                committed_unique=int(summary.get("committed_unique", 0) or 0),
+                missing_unique=int(summary.get("missing_unique", 0) or 0),
+                missing_samples=samples,
+                final_missing_unique=int(summary.get("final_missing_unique", 0) or 0),
+                final_missing_samples=final_samples,
+                model_observed_events=int(getattr(alignment_runtime, "model_observed_events", 0) or 0),
+                committed_events=int(getattr(alignment_runtime, "committed_events", 0) or 0),
+            )
 
         _trace_event(
             "ws_open",
@@ -3083,6 +4225,154 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     delta_chars=max(0, len(snapshot) - prev_len),
                 )
 
+        def _reset_punct_cut_state(reason: str = "") -> None:
+            had_signal = bool(
+                int(getattr(punct_cut_runtime, "candidate_end", 0) or 0) > 0
+                or int(getattr(punct_cut_runtime, "anchor_end", 0) or 0) > 0
+            )
+            punct_cut_runtime.gate_open = False
+            punct_cut_runtime.gate_chars = 0
+            punct_cut_runtime.gate_open_at = 0.0
+            punct_cut_runtime.candidate_end = 0
+            punct_cut_runtime.candidate_token = ""
+            punct_cut_runtime.candidate_since = 0.0
+            punct_cut_runtime.candidate_hits = 0
+            punct_cut_runtime.anchor_end = 0
+            punct_cut_runtime.anchor_token = ""
+            punct_cut_runtime.anchor_locked_at = 0.0
+            punct_cut_runtime.anchor_seq = 0
+            punct_cut_runtime.triggered = False
+            if had_signal and reason:
+                _trace_event("punct_cut_state_reset", reason=str(reason), segment_id=int(getattr(segment_runtime, "id", 0) or 0))
+
+        def _maybe_get_punct_timeout_cut(
+            snapshot_text: str,
+            seq_hint: int,
+            segment_age_ms: float,
+        ) -> Optional[Dict[str, Any]]:
+            if not punct_cut_enabled:
+                return None
+            snapshot = str(snapshot_text or "").strip()
+            if not snapshot:
+                return None
+            age_ms = max(0.0, float(segment_age_ms))
+            if age_ms < float(punct_cut_start_ms):
+                return None
+            now_mono = time.monotonic()
+
+            if not bool(getattr(punct_cut_runtime, "gate_open", False)):
+                punct_cut_runtime.gate_open = True
+                punct_cut_runtime.gate_chars = len(snapshot)
+                punct_cut_runtime.gate_open_at = now_mono
+                _trace_event(
+                    "punct_cut_gate_open",
+                    seq=int(seq_hint or 0),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    gate_chars=int(punct_cut_runtime.gate_chars),
+                    segment_age_ms=int(age_ms),
+                )
+
+            gate_chars = int(getattr(punct_cut_runtime, "gate_chars", 0) or 0)
+            gate_chars = max(0, min(len(snapshot), gate_chars))
+            found = _find_first_boundary_after(snapshot, gate_chars, punct_cut_pattern)
+            if found is None:
+                return None
+            boundary_end, boundary_token = found
+
+            prev_candidate_end = int(getattr(punct_cut_runtime, "candidate_end", 0) or 0)
+            prev_candidate_token = str(getattr(punct_cut_runtime, "candidate_token", "") or "")
+            if boundary_end != prev_candidate_end or boundary_token != prev_candidate_token:
+                punct_cut_runtime.candidate_end = int(boundary_end)
+                punct_cut_runtime.candidate_token = str(boundary_token or "")
+                punct_cut_runtime.candidate_since = now_mono
+                punct_cut_runtime.candidate_hits = 1
+                _trace_event(
+                    "punct_cut_candidate_set",
+                    seq=int(seq_hint or 0),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    boundary_end=int(boundary_end),
+                    token=str(boundary_token or ""),
+                    gate_chars=int(gate_chars),
+                )
+            else:
+                punct_cut_runtime.candidate_hits = int(getattr(punct_cut_runtime, "candidate_hits", 0) or 0) + 1
+
+            stable_elapsed_ms = (now_mono - float(getattr(punct_cut_runtime, "candidate_since", now_mono) or now_mono)) * 1000.0
+            anchor_end = int(getattr(punct_cut_runtime, "anchor_end", 0) or 0)
+            if anchor_end <= 0:
+                if (
+                    int(getattr(punct_cut_runtime, "candidate_hits", 0) or 0) >= int(punct_cut_stable_hits)
+                    and stable_elapsed_ms >= float(punct_cut_stable_ms)
+                ):
+                    punct_cut_runtime.anchor_end = int(boundary_end)
+                    punct_cut_runtime.anchor_token = str(boundary_token or "")
+                    punct_cut_runtime.anchor_locked_at = now_mono
+                    punct_cut_runtime.anchor_seq = int(seq_hint or 0)
+                    anchor_end = int(boundary_end)
+                    _trace_event(
+                        "punct_cut_anchor_locked",
+                        seq=int(seq_hint or 0),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        boundary_end=int(boundary_end),
+                        token=str(boundary_token or ""),
+                        stable_hits=int(getattr(punct_cut_runtime, "candidate_hits", 0) or 0),
+                        stable_ms=int(stable_elapsed_ms),
+                    )
+
+            if anchor_end <= 0:
+                return None
+            if bool(getattr(punct_cut_runtime, "triggered", False)):
+                return None
+
+            wait_elapsed_ms = (now_mono - float(getattr(punct_cut_runtime, "anchor_locked_at", now_mono) or now_mono)) * 1000.0
+            if wait_elapsed_ms < float(punct_cut_wait_ms):
+                return None
+
+            resolved = _resolve_boundary_for_anchor(snapshot, anchor_end, punct_cut_pattern)
+            if resolved is None:
+                return None
+            split_end, split_token = resolved
+            split_left, split_right = _split_text_at_boundary(snapshot, split_end)
+            if not split_left:
+                return None
+            if int(punct_cut_max_carry_chars) > 0 and len(split_right) > int(punct_cut_max_carry_chars):
+                _trace_event(
+                    "punct_cut_skip_large_carry",
+                    seq=int(seq_hint or 0),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    anchor_end=int(anchor_end),
+                    split_end=int(split_end),
+                    token=str(split_token or ""),
+                    left_chars=len(split_left),
+                    right_chars=len(split_right),
+                    max_carry_chars=int(punct_cut_max_carry_chars),
+                )
+                punct_cut_runtime.anchor_end = int(split_end)
+                punct_cut_runtime.anchor_token = str(split_token or "")
+                punct_cut_runtime.anchor_locked_at = now_mono
+                punct_cut_runtime.anchor_seq = int(seq_hint or 0)
+                punct_cut_runtime.triggered = False
+                return None
+            punct_cut_runtime.triggered = True
+            _trace_event(
+                "punct_cut_triggered",
+                seq=int(seq_hint or 0),
+                segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                anchor_end=int(anchor_end),
+                split_end=int(split_end),
+                token=str(split_token or ""),
+                wait_ms=int(wait_elapsed_ms),
+                left_chars=len(split_left),
+                right_chars=len(split_right),
+            )
+            return {
+                "should_cut": True,
+                "split_end": int(split_end),
+                "split_token": str(split_token or ""),
+                "split_left": str(split_left or ""),
+                "split_right": str(split_right or ""),
+            }
+
         def _rms_db(samples: np.ndarray) -> float:
             if samples is None or int(samples.size) <= 0:
                 return -120.0
@@ -3185,32 +4475,104 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         def _compose_effective_text_for_commit(full_text: str, seq_no: int) -> str:
             raw = str(full_text or "").strip()
             pending_prefix = str(getattr(subtitle_state, "pending_prefix_text", "") or "").strip()
+            pending_reason = str(getattr(subtitle_state, "pending_prefix_reason", "") or "")
+            pending_miss_count = int(getattr(subtitle_state, "pending_prefix_miss_count", 0) or 0)
             merged = raw
+            overlap_cap = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
             if pending_prefix:
-                merged = dedup_segment_join(pending_prefix, raw, min_overlap=2).strip()
+                if not raw:
+                    merged = pending_prefix
+                else:
+                    min_overlap = 8 if pending_reason == "punct_timeout_cut" else 4
+                    max_overlap = max(int(min_overlap), int(overlap_cap))
+                    trimmed, overlap = trim_prefix_overlap(
+                        pending_prefix,
+                        raw,
+                        min_overlap=int(min_overlap),
+                        max_overlap=int(max_overlap),
+                    )
+                    if overlap >= int(min_overlap):
+                        merged = dedup_segment_join(
+                            pending_prefix,
+                            str(trimmed or "").strip(),
+                            min_overlap=int(min_overlap),
+                        ).strip()
+                        pending_miss_count = 0
+                        _trace_event(
+                            "pending_prefix_overlap_trimmed",
+                            seq=int(seq_no or 0),
+                            overlap_chars=int(overlap),
+                            min_overlap=int(min_overlap),
+                            cap_chars=int(max_overlap),
+                            pending_reason=str(pending_reason or ""),
+                            pending_chars=len(pending_prefix),
+                            raw_chars=len(raw),
+                            merged_chars=len(merged),
+                            pending_segment_id=int(getattr(subtitle_state, "pending_prefix_segment_id", 0) or 0),
+                        )
+                    elif raw.startswith(pending_prefix) or (pending_prefix and pending_prefix in raw):
+                        merged = raw
+                        pending_miss_count = 0
+                        subtitle_state.pending_prefix_text = ""
+                        subtitle_state.pending_prefix_segment_id = 0
+                        subtitle_state.pending_prefix_reason = ""
+                        _trace_event(
+                            "pending_prefix_cleared_consumed_by_raw",
+                            seq=int(seq_no or 0),
+                            pending_reason=str(pending_reason or ""),
+                            pending_chars=len(pending_prefix),
+                            raw_chars=len(raw),
+                        )
+                    elif pending_prefix.startswith(raw) and len(raw) <= max(10, int(len(pending_prefix) * 0.45)):
+                        merged = pending_prefix
+                        pending_miss_count = min(8, pending_miss_count + 1)
+                        _trace_event(
+                            "pending_prefix_hold_short_raw",
+                            seq=int(seq_no or 0),
+                            pending_reason=str(pending_reason or ""),
+                            pending_chars=len(pending_prefix),
+                            raw_chars=len(raw),
+                            miss_count=int(pending_miss_count),
+                        )
+                    else:
+                        pending_miss_count = min(8, pending_miss_count + 1)
+                        if pending_reason == "hard_cut":
+                            merged = dedup_segment_join(pending_prefix, raw, min_overlap=2).strip()
+                            _trace_event(
+                                "pending_prefix_hard_cut_fallback_merge",
+                                seq=int(seq_no or 0),
+                                pending_chars=len(pending_prefix),
+                                raw_chars=len(raw),
+                                merged_chars=len(merged),
+                                miss_count=int(pending_miss_count),
+                            )
+                        else:
+                            merged = raw
+                            completed_now, _ = _split_sentences_and_tail(raw)
+                            should_drop_pending = bool(
+                                completed_now
+                                or pending_miss_count >= 2
+                                or len(raw) >= max(24, int(len(pending_prefix) * 0.8))
+                            )
+                            if should_drop_pending:
+                                subtitle_state.pending_prefix_text = ""
+                                subtitle_state.pending_prefix_segment_id = 0
+                                subtitle_state.pending_prefix_reason = ""
+                                pending_miss_count = 0
+                                _trace_event(
+                                    "pending_prefix_drop_no_overlap",
+                                    seq=int(seq_no or 0),
+                                    pending_reason=str(pending_reason or ""),
+                                    pending_chars=len(pending_prefix),
+                                    raw_chars=len(raw),
+                                    has_completed=bool(completed_now),
+                                )
+            else:
+                pending_miss_count = 0
+            subtitle_state.pending_prefix_miss_count = int(max(0, pending_miss_count))
 
             boundary_anchor = str(getattr(subtitle_state, "boundary_anchor_text", "") or "").strip()
-            overlap_cap = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
-            if overlap_cap > 0 and raw and pending_prefix:
-                trimmed, overlap = trim_prefix_overlap(
-                    pending_prefix,
-                    raw,
-                    min_overlap=2,
-                    max_overlap=overlap_cap,
-                )
-                if overlap > 0:
-                    merged = dedup_segment_join(pending_prefix, trimmed, min_overlap=2).strip()
-                    _trace_event(
-                        "pending_prefix_overlap_trimmed",
-                        seq=int(seq_no or 0),
-                        overlap_chars=int(overlap),
-                        cap_chars=int(overlap_cap),
-                        pending_chars=len(pending_prefix),
-                        raw_chars=len(raw),
-                        merged_chars=len(merged),
-                        pending_segment_id=int(getattr(subtitle_state, "pending_prefix_segment_id", 0) or 0),
-                    )
-            elif overlap_cap > 0 and boundary_anchor and merged:
+            if overlap_cap > 0 and boundary_anchor and merged:
                 trimmed, overlap = trim_prefix_overlap(
                     boundary_anchor,
                     merged,
@@ -3251,6 +4613,82 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 return nxt[i:], False
             return nxt, True
 
+        def _stabilize_partial_text(raw_text: str, seq_hint: int) -> Tuple[str, bool]:
+            raw = str(raw_text or "").strip()
+            if not raw:
+                stream_text_state.accepted_text = ""
+                stream_text_state.reset_candidate_text = ""
+                stream_text_state.reset_candidate_hits = 0
+                stream_text_state.reset_candidate_since = 0.0
+                return "", False
+
+            prev = str(getattr(stream_text_state, "accepted_text", "") or "").strip()
+            if not prev:
+                stream_text_state.accepted_text = raw
+                stream_text_state.reset_candidate_text = ""
+                stream_text_state.reset_candidate_hits = 0
+                stream_text_state.reset_candidate_since = 0.0
+                return raw, False
+
+            should_hold = _should_hold_partial_reset(
+                prev_text=prev,
+                next_text=raw,
+                min_prev_chars=partial_reset_guard_min_prev_chars,
+                max_next_ratio=partial_reset_guard_max_ratio,
+            )
+            if not should_hold:
+                stream_text_state.accepted_text = raw
+                stream_text_state.reset_candidate_text = ""
+                stream_text_state.reset_candidate_hits = 0
+                stream_text_state.reset_candidate_since = 0.0
+                return raw, False
+
+            now_mono = time.monotonic()
+            candidate_text = str(getattr(stream_text_state, "reset_candidate_text", "") or "")
+            if raw == candidate_text:
+                stream_text_state.reset_candidate_hits = int(getattr(stream_text_state, "reset_candidate_hits", 0) or 0) + 1
+            else:
+                stream_text_state.reset_candidate_text = raw
+                stream_text_state.reset_candidate_hits = 1
+                stream_text_state.reset_candidate_since = now_mono
+
+            hold_sec = max(
+                0.0,
+                now_mono - float(getattr(stream_text_state, "reset_candidate_since", now_mono) or now_mono),
+            )
+            hits = int(getattr(stream_text_state, "reset_candidate_hits", 0) or 0)
+            release = _should_release_partial_reset_guard(
+                candidate_hits=hits,
+                hold_sec=hold_sec,
+                min_hits=partial_reset_guard_release_hits,
+                max_hold_sec=partial_reset_guard_max_hold_sec,
+            )
+            if not release:
+                _trace_event(
+                    "partial_reset_guard_hold",
+                    seq=int(seq_hint or 0),
+                    prev_chars=len(prev),
+                    next_chars=len(raw),
+                    candidate_hits=int(hits),
+                    hold_ms=int(hold_sec * 1000.0),
+                )
+                return prev, True
+
+            stream_text_state.accepted_text = raw
+            stream_text_state.reset_candidate_text = ""
+            stream_text_state.reset_candidate_hits = 0
+            stream_text_state.reset_candidate_since = 0.0
+            _trace_event(
+                "partial_reset_guard_release",
+                seq=int(seq_hint or 0),
+                prev_chars=len(prev),
+                next_chars=len(raw),
+                reason="hits" if hits >= int(partial_reset_guard_release_hits) else "timeout",
+                candidate_hits=int(hits),
+                hold_ms=int(hold_sec * 1000.0),
+            )
+            return raw, False
+
         def _apply_incremental_text_fields(payload: Dict[str, Any]) -> None:
             full_text = str(payload.get("text", "") or "").strip()
             prev_text = str(stream_text_state.last_text or "")
@@ -3258,6 +4696,24 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             payload["state_text"] = full_text
             payload["delta_text"] = delta_text
             payload["text_reset"] = bool(text_reset)
+            if text_reset:
+                pending_prefix_now = str(getattr(subtitle_state, "pending_prefix_text", "") or "").strip()
+                tentative_now = str(getattr(subtitle_state, "tentative_tail", "") or "").strip()
+                _trace_event(
+                    "partial_text_reset_detected",
+                    seq=int(payload.get("seq", 0) or 0),
+                    prev_chars=len(prev_text.strip()),
+                    next_chars=len(full_text),
+                    delta_chars=len(str(delta_text or "").strip()),
+                    prev_hash8=_hash8(prev_text),
+                    next_hash8=_hash8(full_text),
+                    pending_prefix_chars=len(pending_prefix_now),
+                    pending_prefix_hash8=_hash8(pending_prefix_now),
+                    tentative_chars=len(tentative_now),
+                    tentative_hash8=_hash8(tentative_now),
+                    prev_preview=_trace_preview(prev_text, 96),
+                    next_preview=_trace_preview(full_text, 96),
+                )
             stream_text_state.last_text = full_text
 
         async def _maybe_idle_tail_commit() -> None:
@@ -3326,6 +4782,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             snapshot_text: str,
             snapshot_language: str,
             force_finalize: bool,
+            cut_boundary_end: int = 0,
         ) -> bool:
             nonlocal state, seq, last_text_snapshot, last_text_advance_at, last_idle_commit_at, last_partial_emit_at
             if finish_requested or stop_consumer.is_set():
@@ -3372,7 +4829,28 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     return False
 
             seq = max(int(seq), int(seq_hint or 0)) + 1
-            final_text = str(getattr(local_state, "text", "") or snapshot_text or "").strip()
+            raw_final_text = str(getattr(local_state, "text", "") or snapshot_text or "").strip()
+            final_text = str(raw_final_text or "")
+            punct_cut_carry_text = ""
+            punct_cut_resolved_end = 0
+            if str(reason or "") == "punct_timeout_cut" and int(cut_boundary_end or 0) > 0 and raw_final_text:
+                resolved = _resolve_boundary_for_anchor(raw_final_text, int(cut_boundary_end or 0), punct_cut_pattern)
+                if resolved is not None:
+                    punct_cut_resolved_end, punct_cut_token = resolved
+                    split_left, split_right = _split_text_at_boundary(raw_final_text, punct_cut_resolved_end)
+                    if split_left:
+                        final_text = str(split_left or "").strip()
+                        punct_cut_carry_text = str(split_right or "").strip()
+                        _trace_event(
+                            "punct_cut_finalize_split",
+                            seq=int(seq),
+                            segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                            requested_end=int(cut_boundary_end or 0),
+                            resolved_end=int(punct_cut_resolved_end),
+                            token=str(punct_cut_token or ""),
+                            commit_chars=len(final_text),
+                            carry_chars=len(punct_cut_carry_text),
+                        )
             final_language = str(getattr(local_state, "language", "") or snapshot_language or "")
             commit_tail_on_finalize = _should_commit_tail_on_segment_finalize(
                 str(reason or ""),
@@ -3399,11 +4877,18 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 if not pending_prefix:
                     _, pending_tail = _split_sentences_and_tail(final_text)
                     pending_prefix = str(pending_tail or "").strip()
+            if punct_cut_carry_text:
+                if pending_prefix:
+                    pending_prefix = dedup_segment_join(pending_prefix, punct_cut_carry_text, min_overlap=2).strip()
+                else:
+                    pending_prefix = str(punct_cut_carry_text or "").strip()
             overlap_cap_chars = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
             boundary_anchor_chars = max(4, overlap_cap_chars * 2)
             boundary_anchor = str(final_text[-boundary_anchor_chars:] if final_text else "").strip()
             subtitle_state.pending_prefix_text = str(pending_prefix or "")
             subtitle_state.pending_prefix_segment_id = int(getattr(segment_runtime, "id", 0) or 0)
+            subtitle_state.pending_prefix_reason = str(reason or "")
+            subtitle_state.pending_prefix_miss_count = 0
             subtitle_state.boundary_anchor_text = str(boundary_anchor or "")
             subtitle_state.boundary_anchor_segment_id = int(getattr(segment_runtime, "id", 0) or 0)
             _trace_text_pool(
@@ -3440,8 +4925,13 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             segment_runtime.last_cut_reason = str(reason or "")
             backend_vad.last_cut_at = time.monotonic()
             _reset_backend_vad_segment(reset_cut_clock=True)
+            _reset_punct_cut_state("segment_finalize")
 
             stream_text_state.last_text = ""
+            stream_text_state.accepted_text = ""
+            stream_text_state.reset_candidate_text = ""
+            stream_text_state.reset_candidate_hits = 0
+            stream_text_state.reset_candidate_since = 0.0
             last_text_snapshot = ""
             last_text_advance_at = time.monotonic()
             last_idle_commit_at = 0.0
@@ -3462,9 +4952,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 segment_id=int(getattr(segment_runtime, "id", 0) or 0),
                 seq=int(seq),
                 final_text_chars=len(final_text),
+                raw_final_text_chars=len(raw_final_text),
                 overlap_samples=int(overlap_audio.size),
                 commit_tail=bool(commit_tail_on_finalize),
                 pending_prefix_chars=len(str(subtitle_state.pending_prefix_text or "").strip()),
+                punct_cut_carry_chars=len(punct_cut_carry_text),
+                punct_cut_split_end=int(punct_cut_resolved_end),
             )
             _trace_text_pool(
                 "segment_open",
@@ -3501,55 +4994,49 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 vad_candidate=bool(signal.get("candidate", False)),
                 vad_force=bool(signal.get("force", False)),
             )
-            if not decision.should_cut:
+            cut_reason = ""
+            force_finalize = False
+            cut_boundary_end = 0
+            cut_by_punct_timeout = False
+            if decision.should_cut:
+                cut_reason = str(decision.reason)
+                force_finalize = bool(decision.force_finalize)
+            if not cut_reason:
                 return
-            if decision.reason == "vad_silence" and not _text_ready_for_vad_cut(snapshot, force=bool(decision.force_finalize)):
+
+            if cut_reason == "vad_silence" and not _text_ready_for_vad_cut(snapshot, force=bool(force_finalize)):
                 _trace_event(
                     "segment_cut_deferred",
-                    reason=str(decision.reason),
+                    reason=str(cut_reason),
                     seq=int(seq_hint or 0),
                     segment_id=int(getattr(segment_runtime, "id", 0) or 0),
-                    silence_ms=int(decision.silence_ms),
-                    segment_age_ms=int(decision.segment_age_ms),
+                    silence_ms=int(float(signal.get("silence_ms", 0.0) or 0.0)),
+                    segment_age_ms=int(segment_age_ms),
                 )
                 return
             _trace_event(
                 "segment_cut_decision",
-                reason=str(decision.reason),
+                reason=str(cut_reason),
                 seq=int(seq_hint or 0),
                 segment_id=int(getattr(segment_runtime, "id", 0) or 0),
-                silence_ms=int(decision.silence_ms),
-                segment_age_ms=int(decision.segment_age_ms),
-                force_finalize=bool(decision.force_finalize),
+                silence_ms=int(float(signal.get("silence_ms", 0.0) or 0.0)),
+                segment_age_ms=int(segment_age_ms),
+                force_finalize=bool(force_finalize),
                 text_chars=len(snapshot),
+                cut_boundary_end=int(cut_boundary_end),
+                cut_by_punct_timeout=bool(cut_by_punct_timeout),
             )
             await _finalize_segment_and_rotate(
-                reason=str(decision.reason),
+                reason=str(cut_reason),
                 seq_hint=int(seq_hint or 0),
                 snapshot_text=snapshot,
                 snapshot_language=str(language or ""),
-                force_finalize=bool(decision.force_finalize),
+                force_finalize=bool(force_finalize),
+                cut_boundary_end=int(cut_boundary_end),
             )
 
         def _is_committed_sentence_upgrade(old_text: str, new_text: str) -> bool:
-            old = str(old_text or "").strip()
-            new = str(new_text or "").strip()
-            if not old or not new or old == new:
-                return False
-            if len(new) < len(old) + 8:
-                return False
-            if new.startswith(old):
-                return True
-            if old in new and len(new) >= len(old) + 12:
-                return True
-            old_base = re.sub(r"[。！？!?…]+[\"'”’)\]）】》]*$", "", old).strip()
-            new_base = re.sub(r"[。！？!?…]+[\"'”’)\]）】》]*$", "", new).strip()
-            if old_base and new_base and len(new_base) >= len(old_base) + 6:
-                if new_base.startswith(old_base):
-                    return True
-                if old_base in new_base and len(new_base) >= len(old_base) + 10:
-                    return True
-            return False
+            return _should_accept_sentence_upgrade(old_text, new_text)
 
         async def _update_sentence_commits(
             full_text: str,
@@ -3564,6 +5051,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             translate_now: bool = False,
         ) -> str:
             seq_no = int(seq_hint or 0)
+            raw_full_text = str(full_text or "").strip()
             total_committed_count = len(subtitle_state.committed_sentences)
             commit_base = int(getattr(subtitle_state, "commit_base", 0) or 0)
             commit_base = max(0, min(commit_base, total_committed_count))
@@ -3592,21 +5080,161 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 tail = ""
 
             committed_count = int(len(subtitle_state.committed_sentences) - commit_base)
-            ready_end = committed_count
+            carry_duplicate_dropped = False
+            duplicate_filter_paused = bool(
+                time.monotonic() < float(getattr(subtitle_state, "duplicate_filter_pause_until", 0.0) or 0.0)
+            )
+            duplicate_filter_pause_left_ms = max(
+                0,
+                int(
+                    (
+                        float(getattr(subtitle_state, "duplicate_filter_pause_until", 0.0) or 0.0)
+                        - time.monotonic()
+                    )
+                    * 1000.0
+                ),
+            )
+            if (
+                pending_prefix_before
+                and completed
+                and committed_count == 0
+                and total_committed_count > 0
+            ):
+                prev_sentence = str(subtitle_state.committed_sentences[total_committed_count - 1] or "").strip()
+                first_sentence = str(completed[0] or "").strip()
+                if duplicate_filter_paused:
+                    _trace_event(
+                        "carry_duplicate_filter_skipped_regression_guard",
+                        seq=seq_no,
+                        pause_left_ms=int(duplicate_filter_pause_left_ms),
+                        pending_prefix_chars=len(pending_prefix_before),
+                        candidate_chars=len(first_sentence),
+                        raw_chars=len(raw_full_text),
+                        pause_reason=str(getattr(subtitle_state, "duplicate_filter_pause_reason", "") or ""),
+                    )
+                elif _is_probable_pending_prefix_duplicate(
+                    prev_sentence,
+                    first_sentence,
+                    raw_full_text,
+                    pending_prefix_before,
+                ):
+                    completed = completed[1:]
+                    carry_duplicate_dropped = True
+                    trimmed_pending, trimmed = _trim_pending_prefix_leading_sentence(
+                        pending_prefix_before,
+                        first_sentence,
+                    )
+                    if trimmed:
+                        pending_prefix_prev = str(pending_prefix_before or "")
+                        subtitle_state.pending_prefix_text = str(trimmed_pending or "")
+                        subtitle_state.pending_prefix_miss_count = 0
+                        _trace_text_pool(
+                            "pending_prefix_trimmed",
+                            phase="generating",
+                            text=str(subtitle_state.pending_prefix_text or ""),
+                            reason="carry_duplicate_filtered",
+                            seq_hint=int(seq_no or 0),
+                            delta_chars=(
+                                len(str(subtitle_state.pending_prefix_text or "").strip())
+                                - len(str(pending_prefix_prev or "").strip())
+                            ),
+                            sentence_id="",
+                        )
+                        pending_prefix_before = str(subtitle_state.pending_prefix_text or "").strip()
+                    _trace_event(
+                        "carry_duplicate_filtered",
+                        seq=seq_no,
+                        duplicate_chars=len(first_sentence),
+                        raw_chars=len(raw_full_text),
+                        pending_prefix_chars=len(pending_prefix_before),
+                        commit_base=int(commit_base),
+                        total_committed_count=int(total_committed_count),
+                        prev_sentence_hash8=_hash8(prev_sentence),
+                        candidate_hash8=_hash8(first_sentence),
+                        raw_hash8=_hash8(raw_full_text),
+                        pending_prefix_hash8=_hash8(pending_prefix_before),
+                        prev_sentence_preview=_trace_preview(prev_sentence, 72),
+                        candidate_preview=_trace_preview(first_sentence, 72),
+                    )
+
+            raw_completed_count_before_stabilize = int(len(completed))
+            completed, committed_backfilled = _stabilize_completed_prefix_with_committed(
+                completed,
+                subtitle_state.committed_sentences,
+                commit_base=int(commit_base),
+                committed_count=int(committed_count),
+            )
+            raw_committed_underflow = max(0, int(committed_count - raw_completed_count_before_stabilize))
+            if committed_backfilled > 0:
+                _trace_event(
+                    "completed_regression_backfilled",
+                    seq=seq_no,
+                    commit_base=int(commit_base),
+                    committed_count=int(committed_count),
+                    raw_completed_count=int(raw_completed_count_before_stabilize),
+                    stabilized_completed_count=int(len(completed)),
+                    backfilled_count=int(committed_backfilled),
+                    raw_committed_underflow=int(raw_committed_underflow),
+                    slice_commit=bool(slice_commit),
+                    force_tail=bool(force_tail),
+                )
+            carry_overlap_skip = 0
+            if pending_prefix_before and committed_count == 0 and total_committed_count > 0 and completed:
+                overlap = _count_leading_completed_committed_overlap(
+                    completed,
+                    subtitle_state.committed_sentences,
+                    max_overlap=6,
+                )
+                if overlap > 0:
+                    overlap_chars = sum(len(str(completed[i] or "").strip()) for i in range(overlap))
+                    raw_chars_now = len(raw_full_text)
+                    if _should_apply_carry_overlap_skip(
+                        overlap_count=int(overlap),
+                        overlap_chars=int(overlap_chars),
+                        raw_chars=int(raw_chars_now),
+                    ):
+                        carry_overlap_skip = int(overlap)
+                        _trace_event(
+                            "carry_overlap_commit_skip",
+                            seq=seq_no,
+                            overlap_count=int(overlap),
+                            overlap_chars=int(overlap_chars),
+                            raw_chars=int(raw_chars_now),
+                            raw_limit=max(12, min(24, int(float(overlap_chars) * 0.35))),
+                            pending_prefix_chars=len(pending_prefix_before),
+                            committed_count=int(committed_count),
+                            total_committed_count=int(total_committed_count),
+                        )
+            effective_committed_count = max(int(committed_count), int(carry_overlap_skip))
+
+            ready_end = effective_committed_count
             if force_tail or commit_all_completed:
                 ready_end = len(completed)
             else:
                 upper = min(len(completed), len(subtitle_state.prev_completed_sentences))
-                i = committed_count
+                i = effective_committed_count
                 while i < upper and completed[i] == subtitle_state.prev_completed_sentences[i]:
                     i += 1
                 ready_end = i
-            ready_end = max(ready_end, committed_count)
+            ready_end = max(ready_end, effective_committed_count)
             if not force_tail and holdback_newest:
-                # Keep the newest completed sentence as tentative text so it can continue
-                # growing without being frozen as a committed row too early.
-                newest_holdback = max(committed_count, len(completed) - 1)
+                # Keep the newest completed sentence as tentative text so it can
+                # continue growing without being frozen as a committed row too early.
+                newest_holdback = max(effective_committed_count, len(completed) - 1)
                 ready_end = min(ready_end, newest_holdback)
+                ready_end = max(ready_end, effective_committed_count)
+
+            ready_new_commits = max(0, int(ready_end - effective_committed_count))
+            suppressed_new_commits = max(0, int(len(completed) - ready_end))
+            completed_underflow = max(0, int(prev_completed_count - len(completed)))
+            prev_completed_joined = _join_segments([str(seg or "").strip() for seg in subtitle_state.prev_completed_sentences])
+            completed_joined = _join_segments([str(seg or "").strip() for seg in completed])
+            if completed_underflow > 0 or raw_committed_underflow > 0:
+                pause_sec = max(1.2, min(3.0, 1.2 + 0.4 * float(completed_underflow)))
+                pause_until = time.monotonic() + pause_sec
+                prev_pause_until = float(getattr(subtitle_state, "duplicate_filter_pause_until", 0.0) or 0.0)
+                subtitle_state.duplicate_filter_pause_until = max(prev_pause_until, pause_until)
+                subtitle_state.duplicate_filter_pause_reason = "completed_regression"
 
             should_sample = (
                 seq_no <= 3
@@ -3615,8 +5243,104 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 or commit_tail_always
                 or commit_all_completed
                 or bool(slice_commit)
-                or ready_end != committed_count
+                or bool(carry_duplicate_dropped)
+                or ready_end != effective_committed_count
             )
+            if completed_underflow > 0:
+                matched_prefix = _count_matching_sentence_prefix(
+                    subtitle_state.prev_completed_sentences,
+                    completed,
+                )
+                _trace_event(
+                    "completed_regression_detected",
+                    seq=seq_no,
+                    prev_completed_count=int(prev_completed_count),
+                    completed_count=int(len(completed)),
+                    committed_count=int(committed_count),
+                    dropped_completed=int(completed_underflow),
+                    raw_chars=len(raw_full_text),
+                    effective_chars=len(effective_full_text),
+                    prev_completed_hash8=_hash8(prev_completed_joined),
+                    completed_hash8=_hash8(completed_joined),
+                    raw_hash8=_hash8(raw_full_text),
+                    effective_hash8=_hash8(effective_full_text),
+                    prev_completed_preview=_trace_preview(prev_completed_joined, 96),
+                    completed_preview=_trace_preview(completed_joined, 96),
+                    matched_prefix_count=int(matched_prefix),
+                )
+                _trace_event(
+                    "completed_regression_sentence_diff",
+                    seq=seq_no,
+                    dropped_completed=int(completed_underflow),
+                    prev_completed_count=int(prev_completed_count),
+                    completed_count=int(len(completed)),
+                    matched_prefix_count=int(matched_prefix),
+                    prev_sentences=_sentence_signature_rows(subtitle_state.prev_completed_sentences),
+                    new_sentences=_sentence_signature_rows(completed),
+                )
+                _trace_text_pool(
+                    "regression_snapshot_generating",
+                    phase="generating",
+                    text=str(effective_full_text or ""),
+                    reason="completed_regression",
+                    seq_hint=int(seq_no),
+                    delta_chars=0,
+                    dropped_completed=int(completed_underflow),
+                    matched_prefix_count=int(matched_prefix),
+                )
+                _trace_text_pool(
+                    "regression_snapshot_solidified",
+                    phase="solidified",
+                    text=_join_segments(subtitle_state.committed_sentences),
+                    reason="completed_regression",
+                    seq_hint=int(seq_no),
+                    delta_chars=0,
+                    dropped_completed=int(completed_underflow),
+                    matched_prefix_count=int(matched_prefix),
+                )
+            if raw_committed_underflow > 0 and completed_underflow <= 0:
+                _trace_event(
+                    "committed_underflow_detected",
+                    seq=seq_no,
+                    committed_count=int(committed_count),
+                    raw_completed_count=int(raw_completed_count_before_stabilize),
+                    stabilized_completed_count=int(len(completed)),
+                    raw_committed_underflow=int(raw_committed_underflow),
+                    prev_sentences=_sentence_signature_rows(subtitle_state.prev_completed_sentences),
+                    new_sentences=_sentence_signature_rows(completed),
+                )
+                _trace_text_pool(
+                    "underflow_snapshot_generating",
+                    phase="generating",
+                    text=str(effective_full_text or ""),
+                    reason="committed_underflow",
+                    seq_hint=int(seq_no),
+                    delta_chars=0,
+                    raw_committed_underflow=int(raw_committed_underflow),
+                )
+                _trace_text_pool(
+                    "underflow_snapshot_solidified",
+                    phase="solidified",
+                    text=_join_segments(subtitle_state.committed_sentences),
+                    reason="committed_underflow",
+                    seq_hint=int(seq_no),
+                    delta_chars=0,
+                    raw_committed_underflow=int(raw_committed_underflow),
+                )
+            if suppressed_new_commits > 0 and (should_sample or suppressed_new_commits > 1):
+                suppressed_reason = "holdback_newest" if bool(holdback_newest and not force_tail) else "stability_guard"
+                _trace_event(
+                    "commit_suppressed",
+                    seq=seq_no,
+                    reason=suppressed_reason,
+                    committed_count=int(committed_count),
+                    completed_count=int(len(completed)),
+                    ready_end=int(ready_end),
+                    ready_new_commits=int(ready_new_commits),
+                    suppressed_new_commits=int(suppressed_new_commits),
+                    force_tail=bool(force_tail),
+                    holdback_newest=bool(holdback_newest),
+                )
             if should_sample:
                 _trace_event(
                     "commit_eval",
@@ -3628,6 +5352,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     commit_base=int(commit_base),
                     total_committed_count=int(total_committed_count),
                     prev_committed_count=int(prev_committed_count),
+                    effective_committed_count=int(effective_committed_count),
+                    carry_overlap_skip=int(carry_overlap_skip),
                     prev_completed_count=int(prev_completed_count),
                     ready_end=int(ready_end),
                     holdback_newest=bool(holdback_newest),
@@ -3639,17 +5365,55 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     translate_now=bool(translate_now),
                     pending_prefix_chars=len(pending_prefix_before),
                     boundary_anchor_chars=len(boundary_anchor_before),
+                    duplicate_filter_paused=bool(duplicate_filter_paused),
+                    duplicate_filter_pause_left_ms=int(duplicate_filter_pause_left_ms),
+                )
+            if should_sample or completed_underflow > 0 or suppressed_new_commits > 0:
+                committed_last = (
+                    str(subtitle_state.committed_sentences[total_committed_count - 1] or "").strip()
+                    if total_committed_count > 0
+                    else ""
+                )
+                _trace_event(
+                    "commit_probe",
+                    seq=seq_no,
+                    raw_chars=len(raw_full_text),
+                    effective_chars=len(effective_full_text),
+                    tail_chars=len(str(tail or "").strip()),
+                    committed_count=int(committed_count),
+                    effective_committed_count=int(effective_committed_count),
+                    completed_count=int(len(completed)),
+                    prev_completed_count=int(prev_completed_count),
+                    ready_end=int(ready_end),
+                    ready_new_commits=int(ready_new_commits),
+                    suppressed_new_commits=int(suppressed_new_commits),
+                    completed_underflow=int(completed_underflow),
+                    raw_hash8=_hash8(raw_full_text),
+                    effective_hash8=_hash8(effective_full_text),
+                    pending_prefix_hash8=_hash8(pending_prefix_before),
+                    pending_prefix_chars=len(pending_prefix_before),
+                    boundary_anchor_hash8=_hash8(boundary_anchor_before),
+                    boundary_anchor_chars=len(boundary_anchor_before),
+                    prev_completed_hash8=_hash8(prev_completed_joined),
+                    completed_hash8=_hash8(completed_joined),
+                    committed_last_hash8=_hash8(committed_last),
+                    raw_preview=_trace_preview(raw_full_text, 96),
+                    effective_preview=_trace_preview(effective_full_text, 96),
+                    duplicate_filter_paused=bool(duplicate_filter_paused),
+                    duplicate_filter_pause_left_ms=int(duplicate_filter_pause_left_ms),
                 )
 
             active_sentence_items = max(0, int(len(subtitle_state.sentence_items) - commit_base))
             update_upper = min(committed_count, len(completed), active_sentence_items)
             committed_added = 0
+            upgraded_count = 0
             for i in range(update_upper):
                 upgraded = str(completed[i] or "").strip()
                 global_idx = int(commit_base + i)
                 current = str(subtitle_state.committed_sentences[global_idx] or "").strip()
                 if not _is_committed_sentence_upgrade(current, upgraded):
                     continue
+                upgraded_count += 1
                 subtitle_state.committed_sentences[global_idx] = upgraded
                 sentence_item = subtitle_state.sentence_items[global_idx]
                 sentence_id = str(sentence_item.get("id") or "")
@@ -3664,6 +5428,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     old_chars=len(current),
                     new_chars=len(upgraded),
                     slice_commit=bool(slice_commit),
+                )
+                _track_committed_sentence(
+                    upgraded,
+                    int(seq_no or 0),
+                    "sentence_updated",
+                    sentence_id,
                 )
                 _trace_text_pool(
                     "pool_solidified_update",
@@ -3719,10 +5489,27 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 else:
                     _request_sentence_translation(sentence_id, upgraded, language, seq_hint)
 
-            for i in range(committed_count, ready_end):
+            for i in range(effective_committed_count, ready_end):
                 sentence = str(completed[i] or "").strip()
                 if not sentence:
                     continue
+                if subtitle_state.committed_sentences:
+                    prev_sentence = str(subtitle_state.committed_sentences[-1] or "").strip()
+                    if (
+                        prev_sentence
+                        and prev_sentence != sentence
+                        and len(prev_sentence) >= len(sentence) + 6
+                        and prev_sentence.endswith(sentence)
+                    ):
+                        _trace_event(
+                            "suffix_duplicate_commit_skip",
+                            seq=seq_no,
+                            idx=int(i),
+                            sentence_chars=len(sentence),
+                            prev_chars=len(prev_sentence),
+                            slice_commit=bool(slice_commit),
+                        )
+                        continue
                 sentence_id = _new_sentence_id()
                 subtitle_state.committed_sentences.append(sentence)
                 subtitle_state.sentence_items.append({"id": sentence_id, "zh": sentence, "en": ""})
@@ -3735,6 +5522,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     sentence_id=sentence_id,
                     chars=len(sentence),
                     slice_commit=bool(slice_commit),
+                )
+                _track_committed_sentence(
+                    sentence,
+                    int(seq_no or 0),
+                    "sentence_committed",
+                    sentence_id,
                 )
                 _trace_text_pool(
                     "pool_solidified_append",
@@ -3782,9 +5575,34 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 else:
                     _request_sentence_translation(sentence_id, sentence, language, seq_hint)
 
+            if should_sample or committed_added > 0 or upgraded_count > 0 or completed_underflow > 0:
+                _trace_event(
+                    "commit_apply_result",
+                    seq=seq_no,
+                    updated_count=int(upgraded_count),
+                    committed_added=int(committed_added),
+                    committed_count_after=int(len(subtitle_state.committed_sentences) - commit_base),
+                    total_committed_count_after=int(len(subtitle_state.committed_sentences)),
+                    ready_new_commits=int(ready_new_commits),
+                    suppressed_new_commits=int(suppressed_new_commits),
+                    completed_underflow=int(completed_underflow),
+                    force_tail=bool(force_tail),
+                    slice_commit=bool(slice_commit),
+                )
+
             if pending_prefix_before and (committed_added > 0 or bool(force_tail)):
                 subtitle_state.pending_prefix_text = ""
                 subtitle_state.pending_prefix_segment_id = 0
+                subtitle_state.pending_prefix_reason = ""
+                subtitle_state.pending_prefix_miss_count = 0
+                _trace_event(
+                    "pending_prefix_cleared_commit",
+                    seq=seq_no,
+                    pending_prefix_chars=len(pending_prefix_before),
+                    pending_prefix_hash8=_hash8(pending_prefix_before),
+                    committed_added=int(committed_added),
+                    force_tail=bool(force_tail),
+                )
                 _trace_text_pool(
                     "pending_prefix_cleared",
                     phase="generating",
@@ -4136,6 +5954,11 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         )
                         await _maybe_idle_tail_commit()
                         continue
+                    _track_model_observed_sentences(
+                        payload_text,
+                        int(payload.get("seq", 0) or 0),
+                        "partial_raw",
+                    )
                     if seq <= 3 or seq % subtitle_trace_log_partial_every == 0:
                         _trace_event(
                             "partial_model_output",
@@ -4144,6 +5967,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             text_chars=len(str(payload.get("text", "") or "").strip()),
                             queue_depth=int(audio_queue.qsize()),
                         )
+                    stable_text, reset_guard_hold = _stabilize_partial_text(
+                        payload.get("text", ""),
+                        int(payload.get("seq", 0) or 0),
+                    )
+                    payload["text"] = stable_text
+                    payload["reset_guard_hold"] = bool(reset_guard_hold)
                     _track_text_progress(payload.get("text", ""))
                     payload["tentative_text"] = await _update_sentence_commits(
                         payload.get("text", ""),
@@ -4213,6 +6042,11 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     )
                     await _maybe_idle_tail_commit()
                     continue
+                _track_model_observed_sentences(
+                    payload_text,
+                    int(payload.get("seq", 0) or 0),
+                    "partial_raw",
+                )
                 if seq <= 3 or seq % subtitle_trace_log_partial_every == 0:
                     _trace_event(
                         "partial_model_output",
@@ -4221,6 +6055,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         text_chars=len(str(payload.get("text", "") or "").strip()),
                         queue_depth=int(audio_queue.qsize()),
                     )
+                stable_text, reset_guard_hold = _stabilize_partial_text(
+                    payload.get("text", ""),
+                    int(payload.get("seq", 0) or 0),
+                )
+                payload["text"] = stable_text
+                payload["reset_guard_hold"] = bool(reset_guard_hold)
                 _track_text_progress(payload.get("text", ""))
                 payload["tentative_text"] = await _update_sentence_commits(
                     payload.get("text", ""),
@@ -4340,8 +6180,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 subtitle_state.tentative_tail = ""
                 subtitle_state.pending_prefix_text = ""
                 subtitle_state.pending_prefix_segment_id = 0
+                subtitle_state.pending_prefix_reason = ""
+                subtitle_state.pending_prefix_miss_count = 0
                 subtitle_state.boundary_anchor_text = ""
                 subtitle_state.boundary_anchor_segment_id = 0
+                alignment_runtime.committed_seen = {}
+                alignment_runtime.committed_events = 0
                 await _send_json({"type": "sentence_reset", "reason": "final_redecode"})
 
             async with state_lock:
@@ -4362,6 +6206,11 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 finish_mode=str(finish_mode),
                 finish_reason=str(finish_reason),
             )
+            _track_model_observed_sentences(
+                payload.get("text", ""),
+                int(payload.get("seq", 0) or 0),
+                "final_raw",
+            )
             payload["tentative_text"] = await _update_sentence_commits(
                 payload.get("text", ""),
                 payload.get("language", ""),
@@ -4376,6 +6225,67 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             )
             _apply_incremental_text_fields(payload)
             payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
+            final_text_norm = _normalize_sentence_for_duplicate_compare(str(payload.get("text", "") or ""))
+            committed_text_norm = _normalize_sentence_for_duplicate_compare(str(payload.get("committed_text", "") or ""))
+            reconcile_allowed = bool(final_text_norm and final_text_norm != committed_text_norm)
+            if (
+                reconcile_allowed
+                and committed_text_norm
+                and committed_text_norm.endswith(final_text_norm)
+                and len(committed_text_norm) >= len(final_text_norm) + 6
+            ):
+                reconcile_allowed = False
+                _trace_event(
+                    "final_commit_reconcile_skipped_suffix_superstring",
+                    seq=int(payload.get("seq", 0) or 0),
+                    final_chars=len(str(payload.get("text", "") or "").strip()),
+                    committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
+                )
+            if reconcile_allowed:
+                _trace_event(
+                    "final_commit_reconcile_start",
+                    seq=int(payload.get("seq", 0) or 0),
+                    final_chars=len(str(payload.get("text", "") or "").strip()),
+                    committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
+                    final_hash8=_hash8(str(payload.get("text", "") or "")),
+                    committed_hash8=_hash8(str(payload.get("committed_text", "") or "")),
+                )
+                subtitle_state.stream_uid = f"{int(time.time() * 1000)}-{int(time.monotonic_ns() % 1000000)}"
+                subtitle_state.next_sentence_id = 1
+                subtitle_state.committed_sentences = []
+                subtitle_state.sentence_items = []
+                subtitle_state.commit_base = 0
+                subtitle_state.prev_completed_sentences = []
+                subtitle_state.tentative_tail = ""
+                subtitle_state.pending_prefix_text = ""
+                subtitle_state.pending_prefix_segment_id = 0
+                subtitle_state.pending_prefix_reason = ""
+                subtitle_state.pending_prefix_miss_count = 0
+                subtitle_state.boundary_anchor_text = ""
+                subtitle_state.boundary_anchor_segment_id = 0
+                alignment_runtime.committed_seen = {}
+                alignment_runtime.committed_events = 0
+                await _send_json({"type": "sentence_reset", "reason": "final_commit_reconcile"})
+                payload["tentative_text"] = await _update_sentence_commits(
+                    payload.get("text", ""),
+                    payload.get("language", ""),
+                    payload.get("seq", 0),
+                    force_tail=True,
+                    holdback_newest=False,
+                    commit_tail_if_no_completed=False,
+                    commit_tail_always=False,
+                    commit_all_completed=False,
+                    slice_commit=False,
+                    translate_now=True,
+                )
+                payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
+                _trace_event(
+                    "final_commit_reconcile_done",
+                    seq=int(payload.get("seq", 0) or 0),
+                    final_chars=len(str(payload.get("text", "") or "").strip()),
+                    committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
+                    committed_count=int(len(subtitle_state.committed_sentences)),
+                )
             if translation_runtime.task is not None and not translation_runtime.task.done():
                 with suppress(asyncio.TimeoutError, Exception):
                     await asyncio.wait_for(asyncio.shield(translation_runtime.task), timeout=1.2)
@@ -4487,6 +6397,14 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         finish_requested = False
                         finished = False
                         stream_text_state.last_text = ""
+                        stream_text_state.accepted_text = ""
+                        stream_text_state.reset_candidate_text = ""
+                        stream_text_state.reset_candidate_hits = 0
+                        stream_text_state.reset_candidate_since = 0.0
+                        alignment_runtime.model_seen = {}
+                        alignment_runtime.committed_seen = {}
+                        alignment_runtime.model_observed_events = 0
+                        alignment_runtime.committed_events = 0
                         last_text_snapshot = ""
                         last_text_advance_at = time.monotonic()
                         last_idle_commit_at = 0.0
@@ -4497,6 +6415,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         segment_runtime.started_at = time.monotonic()
                         segment_runtime.last_cut_reason = "start"
                         _reset_backend_vad_segment(reset_cut_clock=True)
+                        _reset_punct_cut_state("start")
                         full_audio_parts = []
                         full_audio_samples = 0
                         full_audio_overflow = False
@@ -4540,6 +6459,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             subtitle_state.tentative_tail = ""
                             subtitle_state.pending_prefix_text = ""
                             subtitle_state.pending_prefix_segment_id = 0
+                            subtitle_state.pending_prefix_reason = ""
+                            subtitle_state.pending_prefix_miss_count = 0
                             subtitle_state.boundary_anchor_text = ""
                             subtitle_state.boundary_anchor_segment_id = 0
                             _trace_text_pool(
@@ -4615,14 +6536,11 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             applied_reason=finish_reason,
                             queue_depth=int(audio_queue.qsize()),
                         )
-                        dropped = _clear_audio_queue()
-                        if dropped:
-                            logger.info(
-                                "ws finish drops pending queue peer=%s dropped=%d",
-                                peer,
-                                dropped,
-                            )
-                            _trace_event("finish_queue_cleared", dropped=int(dropped))
+                        _trace_event(
+                            "finish_queue_preserved",
+                            queue_depth=int(audio_queue.qsize()),
+                            note="drain_for_tail_accuracy",
+                        )
                         if consumer_task is not None:
                             await consumer_task
                         break
@@ -4683,6 +6601,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 solidified_count=int(len(subtitle_state.committed_sentences)),
                 segment_id=int(getattr(segment_runtime, "id", 0) or 0),
             )
+            _emit_alignment_summary("ws_close", int(seq or 0))
             _trace_event(
                 "ws_close",
                 active_connections=int(runtime.active_connections),
@@ -4828,7 +6747,7 @@ def parse_args() -> argparse.Namespace:
         help="Concurrent sentence translation workers for committed subtitles",
     )
 
-    p.add_argument("--client-chunk-ms", type=int, default=320, help="Client capture chunk length in milliseconds")
+    p.add_argument("--client-chunk-ms", type=int, default=200, help="Client capture chunk length in milliseconds")
     p.add_argument(
         "--slice-mode",
         default="time",
@@ -4938,6 +6857,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.45,
         help="Text stability time before backend VAD applies a silence cut.",
+    )
+    p.add_argument(
+        "--punct-cut-start-sec",
+        type=float,
+        default=0.0,
+        help="Deprecated no-op (punctuation-timeout cut removed).",
+    )
+    p.add_argument(
+        "--punct-cut-wait-sec",
+        type=float,
+        default=0.0,
+        help="Deprecated no-op (punctuation-timeout cut removed).",
+    )
+    p.add_argument(
+        "--punct-cut-stable-sec",
+        type=float,
+        default=0.45,
+        help="Deprecated no-op (punctuation-timeout cut removed).",
+    )
+    p.add_argument(
+        "--punct-cut-stable-hits",
+        type=int,
+        default=2,
+        help="Deprecated no-op (punctuation-timeout cut removed).",
+    )
+    p.add_argument(
+        "--punct-cut-max-carry-chars",
+        type=int,
+        default=12,
+        help="Deprecated no-op (punctuation-timeout cut removed).",
     )
     p.add_argument(
         "--max-frame-samples",

@@ -1,18 +1,28 @@
 import numpy as np
 import pytest
 import socket
+import re
 from pathlib import Path
 
 from voxbridge.cli.demo_streaming_ws import (
     INDEX_HTML_TEMPLATE,
     _acquire_instance_lock_or_raise,
+    _alignment_registry_touch,
+    _alignment_registry_touch_model,
+    _summarize_alignment_gap,
     _assert_port_bindable,
+    _should_accept_sentence_upgrade,
+    _is_probable_pending_prefix_duplicate,
+    _should_hold_partial_reset,
+    _should_release_partial_reset_guard,
+    _should_apply_carry_overlap_skip,
     _decode_pcm16le,
     _list_orphan_enginecore_pids,
     _parse_json_message,
     _should_skip_stream_decode,
     _should_use_high_batch_merge,
     _split_sentences_and_tail,
+    _find_first_boundary_after,
     parse_args,
 )
 
@@ -59,8 +69,8 @@ def test_should_skip_stream_decode_when_pure_silence_has_no_speech_phase_yet():
     )
 
 
-def test_should_not_skip_stream_decode_when_pending_text_exists():
-    assert not _should_skip_stream_decode(
+def test_should_skip_stream_decode_even_when_pending_text_exists():
+    assert _should_skip_stream_decode(
         in_speech=False,
         silence_ms=1500.0,
         segment_elapsed_ms=1500.0,
@@ -83,12 +93,167 @@ def test_should_not_skip_stream_decode_when_snr_is_high():
     )
 
 
+def test_should_skip_stream_decode_for_in_speech_trailing_silence():
+    assert _should_skip_stream_decode(
+        in_speech=True,
+        silence_ms=160.0,
+        segment_elapsed_ms=2400.0,
+        snr_db=2.5,
+        vad_silence_ms=900.0,
+        vad_exit_snr_db=4.0,
+        has_pending_text=True,
+    )
+
+
+def test_should_not_skip_stream_decode_for_in_speech_tiny_silence():
+    assert not _should_skip_stream_decode(
+        in_speech=True,
+        silence_ms=40.0,
+        segment_elapsed_ms=2400.0,
+        snr_db=2.5,
+        vad_silence_ms=900.0,
+        vad_exit_snr_db=4.0,
+        has_pending_text=True,
+    )
+
+
 def test_should_use_high_batch_merge_under_backpressure_even_with_shallow_depth():
     assert _should_use_high_batch_merge(queue_depth=12, audio_queue_size=64, under_pressure=True)
 
 
 def test_should_not_use_high_batch_merge_when_queue_is_light_and_no_pressure():
     assert not _should_use_high_batch_merge(queue_depth=6, audio_queue_size=64, under_pressure=False)
+
+
+def test_pending_prefix_duplicate_filter_keeps_exact_repeated_sentence():
+    # Pending prefix equal to one full sentence can be a real repetition;
+    # do not treat it as carry-over duplicate.
+    assert not _is_probable_pending_prefix_duplicate(
+        "这是什么题目？",
+        "这是什么题目？",
+        "这是什么",
+        "这是什么题目？",
+    )
+
+
+def test_pending_prefix_duplicate_filter_only_on_tiny_prefix_with_extra_tail():
+    assert _is_probable_pending_prefix_duplicate(
+        "这是什么题目？",
+        "这是什么题目？",
+        "这",
+        "这是什么题目？这又是什么题目？",
+    )
+
+
+def test_carry_overlap_skip_requires_at_least_two_overlapped_sentences():
+    assert not _should_apply_carry_overlap_skip(overlap_count=1, overlap_chars=36, raw_chars=8)
+    assert _should_apply_carry_overlap_skip(overlap_count=2, overlap_chars=36, raw_chars=8)
+
+
+def test_carry_overlap_skip_rejects_long_raw_text():
+    assert not _should_apply_carry_overlap_skip(overlap_count=2, overlap_chars=36, raw_chars=28)
+
+
+def test_partial_reset_guard_detects_suspicious_short_rewrite():
+    assert _should_hold_partial_reset(
+        prev_text="在耶和华神所造的所有活物当中，蛇是最狡猾的。蛇对女人说。",
+        next_text="神对女人。",
+    )
+
+
+def test_partial_reset_guard_ignores_normal_growth_text():
+    assert not _should_hold_partial_reset(
+        prev_text="第一遍测试翻译，第二遍测试翻译",
+        next_text="第一遍测试翻译，第二遍测试翻译，第三遍测试翻译",
+    )
+
+
+def test_partial_reset_guard_ignores_short_previous_text():
+    assert not _should_hold_partial_reset(
+        prev_text="第一遍。",
+        next_text="第二遍。",
+    )
+
+
+def test_partial_reset_release_requires_hits_or_timeout():
+    assert not _should_release_partial_reset_guard(candidate_hits=1, hold_sec=0.4)
+    assert _should_release_partial_reset_guard(candidate_hits=2, hold_sec=0.4)
+    assert _should_release_partial_reset_guard(candidate_hits=1, hold_sec=1.3)
+
+
+def test_find_first_boundary_after_prefers_latest_boundary():
+    pattern = re.compile(r"[.!?]")
+    found = _find_first_boundary_after("a.b.c.", 0, pattern)
+    assert found == (6, ".")
+
+
+def test_find_first_boundary_after_respects_start_offset():
+    pattern = re.compile(r"[.!?]")
+    found = _find_first_boundary_after("a.b.c.", 3, pattern)
+    assert found == (6, ".")
+
+
+def test_alignment_summary_reports_model_seen_not_committed():
+    model_seen = {}
+    committed_seen = {}
+    _alignment_registry_touch(model_seen, "第一句。", 10, "partial_raw")
+    _alignment_registry_touch(model_seen, "第一句。", 11, "partial_raw")
+    _alignment_registry_touch(model_seen, "第二句。", 12, "partial_raw")
+    _alignment_registry_touch(model_seen, "第二句。", 13, "final_raw")
+    _alignment_registry_touch(committed_seen, "第一句。", 20, "sentence_committed")
+
+    summary = _summarize_alignment_gap(model_seen, committed_seen, min_model_hits=2, max_samples=4)
+    assert summary["model_all_unique"] == 2
+    assert summary["model_stable_unique"] == 2
+    assert summary["model_final_unique"] == 1
+    assert summary["committed_unique"] == 1
+    assert summary["missing_unique"] == 1
+    assert summary["missing_samples"][0]["text"] == "第二句。"
+    assert summary["final_missing_unique"] == 1
+    assert summary["final_missing_samples"][0]["text"] == "第二句。"
+
+
+def test_alignment_summary_treats_final_raw_single_hit_as_stable():
+    model_seen = {}
+    committed_seen = {}
+    _alignment_registry_touch(model_seen, "最终句子。", 30, "final_raw")
+
+    summary = _summarize_alignment_gap(model_seen, committed_seen, min_model_hits=2, max_samples=4)
+    assert summary["model_stable_unique"] == 1
+    assert summary["model_final_unique"] == 1
+    assert summary["missing_unique"] == 1
+    assert summary["final_missing_unique"] == 1
+
+
+def test_alignment_summary_final_missing_only_counts_final_raw_sentences():
+    model_seen = {}
+    committed_seen = {}
+    _alignment_registry_touch(model_seen, "仅partial句子。", 10, "partial_raw")
+    _alignment_registry_touch(model_seen, "仅partial句子。", 11, "partial_raw")
+    summary = _summarize_alignment_gap(model_seen, committed_seen, min_model_hits=2, max_samples=4)
+    assert summary["missing_unique"] == 1
+    assert summary["final_missing_unique"] == 0
+    assert summary["final_missing_samples"] == []
+
+
+def test_alignment_touch_model_collapses_incremental_growth():
+    model_seen = {}
+    _alignment_registry_touch_model(model_seen, "第四遍测试翻译，第五遍。", 10, "partial_raw")
+    _alignment_registry_touch_model(model_seen, "第四遍测试翻译，第五遍测试翻译。", 11, "partial_raw")
+    assert len(model_seen) == 1
+    only = next(iter(model_seen.values()))
+    assert "第五遍测试翻译" in str(only.get("text", ""))
+    assert int(only.get("hits", 0) or 0) >= 2
+
+
+def test_alignment_touch_model_attaches_short_regression_to_longer_sentence():
+    model_seen = {}
+    _alignment_registry_touch_model(model_seen, "第四遍测试翻译，第五遍测试翻译。", 10, "partial_raw")
+    _alignment_registry_touch_model(model_seen, "第四遍测试翻译，第五遍。", 11, "partial_raw")
+    assert len(model_seen) == 1
+    only = next(iter(model_seen.values()))
+    assert "第五遍测试翻译" in str(only.get("text", ""))
+    assert int(only.get("hits", 0) or 0) >= 2
 
 
 def test_parse_json_message_accepts_object():
@@ -226,6 +391,33 @@ def test_index_template_contains_core_stream_controls():
     assert 'id="translation"' in INDEX_HTML_TEMPLATE
 
 
+def test_index_template_uses_eye_friendly_light_theme():
+    assert "--bg-a:#edf4ea" in INDEX_HTML_TEMPLATE
+    assert "--bg-b:#f6f0e6" in INDEX_HTML_TEMPLATE
+    assert "--surface:#f8fbf4" in INDEX_HTML_TEMPLATE
+    assert "#0f1114" not in INDEX_HTML_TEMPLATE
+    assert "linear-gradient(180deg, #2b3139" not in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_auto_hides_top_controls_while_running():
+    assert 'id="appCard"' in INDEX_HTML_TEMPLATE
+    assert 'id="controlBar"' in INDEX_HTML_TEMPLATE
+    assert 'id="controlReveal"' in INDEX_HTML_TEMPLATE
+    assert "function setControlBarHidden" in INDEX_HTML_TEMPLATE
+    assert "function revealControlBarTemporarily" in INDEX_HTML_TEMPLATE
+    assert 'setControlBarHidden(true, "start_success");' in INDEX_HTML_TEMPLATE
+    assert 'setControlBarHidden(false, "final");' in INDEX_HTML_TEMPLATE
+    assert 'setControlBarHidden(false, "start_failed");' in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_keeps_mobile_latest_subtitles_visible():
+    assert "height: 100svh;" in INDEX_HTML_TEMPLATE
+    assert "@supports (height: 100dvh)" in INDEX_HTML_TEMPLATE
+    assert ".card.controls-hidden" in INDEX_HTML_TEMPLATE
+    assert "grid-template-rows: auto minmax(0, 1fr);" in INDEX_HTML_TEMPLATE
+    assert "@media (max-width: 720px)" in INDEX_HTML_TEMPLATE
+
+
 def test_index_template_enables_ws_backpressure_controls():
     assert "MAX_WS_BUFFERED_BYTES" in INDEX_HTML_TEMPLATE
     assert "sendQueue" in INDEX_HTML_TEMPLATE
@@ -265,19 +457,22 @@ def test_index_template_uses_two_thirds_height_for_english_lane():
 
 def test_index_template_prefers_committed_sentence_events_for_stream_ui():
     assert "const USE_COMMITTED_SENTENCE_EVENTS = true;" in INDEX_HTML_TEMPLATE
-    assert "const tentativeTail = String(msg.tentative_text || \"\").trim();" in INDEX_HTML_TEMPLATE
+    assert "const committedText = String(msg.committed_text || \"\").trim();" in INDEX_HTML_TEMPLATE
+    assert "const tentativeTail = resolveTentativeTail(" in INDEX_HTML_TEMPLATE
     assert "if (USE_COMMITTED_SENTENCE_EVENTS) {" in INDEX_HTML_TEMPLATE
-    assert "const reserveTailSlot = running && committedRows.length > 0;" in INDEX_HTML_TEMPLATE
-    assert "return clipVisibleRows(head);" in INDEX_HTML_TEMPLATE
+    assert "const rows = committedRows.slice();" in INDEX_HTML_TEMPLATE
+    assert 'rows.push({ sid: "__tail__", zh: tail, en: "" });' in INDEX_HTML_TEMPLATE
 
 
-def test_index_template_limits_visible_rows_to_four():
-    assert "const MAX_VISIBLE_ROWS = 4;" in INDEX_HTML_TEMPLATE
-    assert "rows.slice(rows.length - MAX_VISIBLE_ROWS)" in INDEX_HTML_TEMPLATE
+def test_index_template_keeps_existing_lane_density_while_allowing_scroll():
+    assert "const MAX_VISIBLE_ROWS_ZH = 4;" in INDEX_HTML_TEMPLATE
+    assert "const MAX_VISIBLE_ROWS_EN = MAX_VISIBLE_ROWS_ZH + 2;" in INDEX_HTML_TEMPLATE
+    assert "overflow-y: auto;" in INDEX_HTML_TEMPLATE
 
 
-def test_index_template_clips_rows_after_sentence_cap_in_committed_mode():
-    assert "return clipVisibleRows(head);" in INDEX_HTML_TEMPLATE
+def test_index_template_keeps_full_history_rows_in_committed_mode():
+    assert "function clipVisibleRows" not in INDEX_HTML_TEMPLATE
+    assert "return rows;" in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_clears_dom_before_resetting_line_node_maps():
@@ -337,7 +532,7 @@ def test_index_template_stabilizes_tentative_tail_to_avoid_flash_drop():
     assert "const TAIL_STABILIZE_MS = 700;" in INDEX_HTML_TEMPLATE
     assert "function updateCommittedTentativeTail" in INDEX_HTML_TEMPLATE
     assert "tailStabilizeTimer = setTimeout" in INDEX_HTML_TEMPLATE
-    assert "const reserveTailSlot = running && committedRows.length > 0;" in INDEX_HTML_TEMPLATE
+    assert 'rows.push({ sid: "__tail__", zh: tail, en: "" });' in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_uses_stop_only_finish_mode():
@@ -367,7 +562,7 @@ def test_index_template_single_stream_state_no_frontend_slice_reopen():
     assert "async function rotateSliceSession(reason = \"time\"){" not in INDEX_HTML_TEMPLATE
     assert "await openSocket();" in INDEX_HTML_TEMPLATE
     assert 'type: "start"' in INDEX_HTML_TEMPLATE
-    assert "language: selectedLanguage()" in INDEX_HTML_TEMPLATE
+    assert "language: selectedAsrLanguage()" in INDEX_HTML_TEMPLATE
     assert "translation_direction: selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
 
 
@@ -459,6 +654,14 @@ def test_backend_forces_finish_mode_stop_for_single_stream_state():
     assert "if finish_mode == \"slice\":" not in text
 
 
+def test_backend_finish_preserves_audio_queue_for_tail_accuracy():
+    src = Path(__file__).resolve().parents[1] / "voxbridge" / "cli" / "demo_streaming_ws.py"
+    text = src.read_text(encoding="utf-8")
+    assert "ws finish drops pending queue" not in text
+    assert "_trace_event(\"finish_queue_cleared\"" not in text
+    assert "finish_queue_preserved" in text
+
+
 def test_backend_has_idle_tail_commit_fallback_for_translation():
     src = Path(__file__).resolve().parents[1] / "voxbridge" / "cli" / "demo_streaming_ws.py"
     text = src.read_text(encoding="utf-8")
@@ -474,6 +677,7 @@ def test_index_template_updates_tail_directly_from_backend_tentative_text():
     assert "const bridgeCandidate = tentativeTail || String(nextText || \"\").trim();" not in INDEX_HTML_TEMPLATE
     assert "if (holdBoundaryTail) {" not in INDEX_HTML_TEMPLATE
     assert "updateCommittedTentativeTail(tentativeTail);" in INDEX_HTML_TEMPLATE
+    assert "function resolveTentativeTail(nextText, committedText, tentativeText){" in INDEX_HTML_TEMPLATE
     assert "window.__subtitleDebug" in INDEX_HTML_TEMPLATE
 
 
@@ -513,18 +717,49 @@ def test_split_sentences_keeps_original_punctuation_without_style_rewrite():
     assert "第五。次测试翻译" in joined
 
 
+def test_should_accept_sentence_upgrade_allows_growth():
+    assert _should_accept_sentence_upgrade("第一遍测试翻译。", "第一遍测试翻译，第二遍测试翻译。")
+
+
+def test_should_accept_sentence_upgrade_allows_quality_fix_without_growth():
+    assert _should_accept_sentence_upgrade("第五。次测试翻译。", "第五次测试翻译。")
+
+
+def test_should_accept_sentence_upgrade_rejects_lower_quality_variant():
+    assert not _should_accept_sentence_upgrade("第五次测试翻译。", "第五。次测试翻译。")
+
+
+def test_should_accept_sentence_upgrade_rejects_unrelated_shorter_text():
+    assert not _should_accept_sentence_upgrade("这是一段完整的测试文本。", "这是测试。")
+
+
 def test_index_template_hides_raw_asr_text_panel():
     assert "Raw ASR Text" not in INDEX_HTML_TEMPLATE
     assert 'id="rawText"' not in INDEX_HTML_TEMPLATE
     assert "class=\"raw-panel\"" not in INDEX_HTML_TEMPLATE
 
 
-def test_index_template_has_translation_direction_toggle_and_ws_control():
-    assert 'id="translationDirectionToggle"' in INDEX_HTML_TEMPLATE
+def test_index_template_has_translation_direction_selector_and_ws_control():
+    assert 'id="translationDirectionSelect"' in INDEX_HTML_TEMPLATE
     assert 'id="translationDirectionLabel"' in INDEX_HTML_TEMPLATE
+    assert 'value="zh2en"' in INDEX_HTML_TEMPLATE
+    assert 'value="en2zh"' in INDEX_HTML_TEMPLATE
+    assert 'type="checkbox"' not in INDEX_HTML_TEMPLATE
     assert "function selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
     assert 'type: "set_translation_direction"' in INDEX_HTML_TEMPLATE
     assert "translation_direction: selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_uses_translation_source_language_for_asr_start():
+    assert "function selectedAsrLanguage()" in INDEX_HTML_TEMPLATE
+    assert 'return selectedTranslationDirection() === "en2zh" ? "English" : "Chinese";' in INDEX_HTML_TEMPLATE
+    assert "language: selectedAsrLanguage()" in INDEX_HTML_TEMPLATE
+    assert "language: selectedLanguage()" not in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_locks_translation_direction_during_active_session():
+    assert "if (translationDirectionSelect) translationDirectionSelect.disabled = active;" in INDEX_HTML_TEMPLATE
+    assert "if (translationDirectionSelect) translationDirectionSelect.disabled = true;" in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_has_audio_input_source_selector():
@@ -533,6 +768,28 @@ def test_index_template_has_audio_input_source_selector():
     assert 'value="mic"' in INDEX_HTML_TEMPLATE
     assert 'value="system"' in INDEX_HTML_TEMPLATE
     assert "function selectedInputSource()" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_supports_scrollable_subtitle_history():
+    assert "MAX_SUBTITLE_HISTORY = 100" in INDEX_HTML_TEMPLATE
+    assert "trimSubtitleHistory(" in INDEX_HTML_TEMPLATE
+    assert "history_trimmed" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_has_lane_auto_follow_state_machine():
+    assert "scrollFollowState" in INDEX_HTML_TEMPLATE
+    assert "bindSubtitleScrollTracking(" in INDEX_HTML_TEMPLATE
+    assert "pauseSubtitleAutoFollow(" in INDEX_HTML_TEMPLATE
+    assert "resumeSubtitleAutoFollow(" in INDEX_HTML_TEMPLATE
+    assert "scroll_follow_paused" in INDEX_HTML_TEMPLATE
+    assert "scroll_follow_resumed" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_has_scroll_to_latest_buttons_per_lane():
+    assert 'id="jumpLatestEn"' in INDEX_HTML_TEMPLATE
+    assert 'id="jumpLatestZh"' in INDEX_HTML_TEMPLATE
+    assert "function updateJumpLatestButtons()" in INDEX_HTML_TEMPLATE
+    assert "jump_latest_clicked" in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_supports_system_audio_capture_via_display_media():
