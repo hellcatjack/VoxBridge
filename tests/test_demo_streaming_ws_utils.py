@@ -1,11 +1,18 @@
+import asyncio
 import numpy as np
 import pytest
 import socket
 import re
+import json
+import threading
+import urllib.request
 from pathlib import Path
 
+import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import (
     INDEX_HTML_TEMPLATE,
+    OpenAIAPITranslator,
+    _await_thread_completion_on_cancel,
     _acquire_instance_lock_or_raise,
     _alignment_registry_touch,
     _alignment_registry_touch_model,
@@ -17,12 +24,20 @@ from voxbridge.cli.demo_streaming_ws import (
     _should_release_partial_reset_guard,
     _should_apply_carry_overlap_skip,
     _decode_pcm16le,
+    _is_short_english_sentence_for_early_commit,
+    _looks_like_asr_context_echo,
+    _filter_asr_context_echo_sentences,
+    _safe_exception_trace_fields,
+    _should_accept_context_sentence_correction,
     _list_orphan_enginecore_pids,
     _parse_json_message,
     _should_skip_stream_decode,
     _should_use_high_batch_merge,
     _split_sentences_and_tail,
     _find_first_boundary_after,
+    _hash_auth_password,
+    _trim_leading_boundary_overlap,
+    _verify_auth_password,
     parse_args,
 )
 
@@ -43,6 +58,126 @@ def test_decode_pcm16le_known_samples():
 def test_decode_pcm16le_odd_length_raises():
     with pytest.raises(ValueError, match="even"):
         _decode_pcm16le(b"\x00")
+
+
+def test_context_echo_guard_rejects_glossary_copy_but_not_natural_speech():
+    context = "流便 扫罗 迦南女子 暗兰 约基别 亚伦 摩西 近亲婚姻"
+
+    assert _looks_like_asr_context_echo(context, context + "。") is True
+    assert _looks_like_asr_context_echo(context, "流便和扫罗都出现在这一段家谱中。") is False
+    assert _looks_like_asr_context_echo("出埃及记", "出埃及记。") is False
+    assert _looks_like_asr_context_echo(
+        "Amram Moses Aaron",
+        "Amram, Moses, and Aaron.",
+        previous_text="Amron, Moses, and Aaron.",
+    ) is False
+
+
+def test_context_echo_filter_removes_only_glossary_like_sentences():
+    context = "Reuben Saul Canaanite Amram Jochebed Aaron Moses"
+    glossary_copy = "Reuben Saul Canaanite Amram Jochebed Aaron Moses."
+    source = (
+        "The genealogy introduces several families. "
+        f"{glossary_copy} "
+        "Moses later returned to Egypt."
+    )
+
+    filtered, removed = _filter_asr_context_echo_sentences(context, source)
+
+    assert removed == 1
+    assert glossary_copy not in filtered
+    assert "The genealogy introduces several families." in filtered
+    assert "Moses later returned to Egypt." in filtered
+
+    natural = "Reuben and Saul both appear in this part of the genealogy."
+    assert _filter_asr_context_echo_sentences(context, natural) == (natural, 0)
+    assert _filter_asr_context_echo_sentences("Exodus", "Exodus.") == ("Exodus.", 0)
+
+
+def test_context_echo_filter_preserves_a_spoken_glossary_with_incremental_evidence():
+    context = "Reuben Saul Canaanite Amram Jochebed Aaron Moses"
+    prefix = (
+        "The reading begins here with a long explanation of the historical setting. "
+        "Another introductory sentence gives the audience additional background."
+    )
+    previous = prefix + " Reuben Saul Canaanite Amram Jochebed"
+    spoken = prefix + " " + context + "."
+
+    filtered, removed = _filter_asr_context_echo_sentences(
+        context,
+        spoken,
+        previous_text=previous,
+    )
+
+    assert removed == 0
+    assert context in filtered
+
+
+def test_compact_occurrence_coverage_consumes_each_existing_span_once():
+    existing = "thefamilyrecordissimpleanditcontainsmanyancestralnames"
+    used_spans = []
+
+    assert demo_streaming_ws._consume_unmatched_compact_occurrence(
+        existing,
+        "thefamilyrecordissimple",
+        used_spans,
+    ) is True
+    assert demo_streaming_ws._consume_unmatched_compact_occurrence(
+        existing,
+        "itcontainsmanyancestralnames",
+        used_spans,
+    ) is True
+    assert demo_streaming_ws._consume_unmatched_compact_occurrence(
+        existing,
+        "itcontainsmanyancestralnames",
+        used_spans,
+    ) is False
+
+
+def test_context_sentence_correction_accepts_lexical_revision_only_when_aligned():
+    assert _should_accept_context_sentence_correction(
+        "Amron went home.",
+        "Amram went home.",
+    ) is True
+    assert _should_accept_context_sentence_correction(
+        "摩西和暗男一同离开。",
+        "摩西和暗兰一同离开。",
+    ) is True
+    assert _should_accept_context_sentence_correction(
+        "摩西和暗男一同离开。",
+        "流便扫罗迦南女子暗兰约基别。",
+    ) is False
+
+
+def test_context_exception_trace_fields_never_include_exception_text():
+    secret = "SECRET_CONTEXT_TERM"
+    fields = _safe_exception_trace_fields(RuntimeError(f"request prompt: {secret}"))
+
+    assert fields["error_type"] == "RuntimeError"
+    assert len(fields["error_sha256"]) == 64
+    assert secret not in json.dumps(fields)
+
+
+def test_cancelled_thread_bridge_waits_for_worker_completion():
+    async def scenario():
+        started = threading.Event()
+        release = threading.Event()
+
+        def worker():
+            started.set()
+            release.wait(timeout=2.0)
+            return "finished"
+
+        task = asyncio.create_task(_await_thread_completion_on_cancel(worker))
+        assert await asyncio.to_thread(started.wait, 1.0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
 
 
 def test_should_skip_stream_decode_for_clean_silence_without_pending_text():
@@ -181,6 +316,120 @@ def test_partial_reset_release_requires_hits_or_timeout():
     assert _should_release_partial_reset_guard(candidate_hits=1, hold_sec=1.3)
 
 
+def test_short_english_sentence_early_commit_guard_blocks_short_heading_fragment():
+    assert _is_short_english_sentence_for_early_commit("The Short Session Topic.")
+
+
+def test_short_english_sentence_early_commit_guard_allows_long_english_and_cjk():
+    assert not _is_short_english_sentence_for_early_commit(
+        "A complete longer English sentence contains enough words to be committed safely."
+    )
+    assert not _is_short_english_sentence_for_early_commit("这是一个已经稳定完成并且长度足够的句子。")
+
+
+def test_split_sentences_treats_three_letter_name_as_terminal_boundary():
+    sentences, tail = _split_sentences_and_tail(
+        "This conversation is with me and my husband Dan. You asked a useful question."
+    )
+    assert sentences == [
+        "This conversation is with me and my husband Dan.",
+        "You asked a useful question.",
+    ]
+    assert tail == ""
+
+
+def test_split_sentences_keeps_initials_and_decimal_periods_internal():
+    sentences, tail = _split_sentences_and_tail(
+        "The U.S. rate was 3.14 percent. The report ended."
+    )
+    assert sentences == ["The U.S. rate was 3.14 percent.", "The report ended."]
+    assert tail == ""
+
+
+def test_boundary_join_mode_distinguishes_overlap_spacing_and_direct_join():
+    classifier = getattr(demo_streaming_ws, "_classify_boundary_join_mode", None)
+    assert classifier is not None
+    assert classifier("repeat text", "text continues", "repeat text continues") == "overlap"
+    assert classifier("She's a girl", "Yes.", "She's a girl Yes.") == "spaced"
+    assert classifier("上半句", "下半句", "上半句下半句") == "direct"
+
+
+def test_short_english_slice_fragment_guard_blocks_period_fragments_only():
+    guard = demo_streaming_ws._is_short_english_slice_fragment
+    assert guard("Short fragment.")
+    assert guard("The Short Session Topic.")
+    assert not guard("A complete longer English sentence contains enough words.")
+    assert not guard("Are you ready?")
+    assert not guard("这是一个已经稳定完成并且长度足够的句子。")
+
+
+def test_hard_cut_fallback_does_not_merge_completed_prefix_with_unrelated_raw():
+    assert hasattr(demo_streaming_ws, "_should_hard_cut_fallback_merge")
+    assert not demo_streaming_ws._should_hard_cut_fallback_merge(
+        'A completed quoted sentence."',
+        "A different unrelated sentence should stay separate.",
+    )
+
+
+def test_hard_cut_fallback_merges_unfinished_cjk_tail():
+    assert hasattr(demo_streaming_ws, "_should_hard_cut_fallback_merge")
+    assert demo_streaming_ws._should_hard_cut_fallback_merge("第一句不完整", "继续补全成句。")
+
+
+def test_openai_api_translator_retries_when_generation_hits_token_limit(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        body = json.loads(req.data.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "截断输出"},
+                        }
+                    ]
+                }
+            )
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "完整输出"},
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    translator = OpenAIAPITranslator(
+        "http://127.0.0.1:8001",
+        "fake-model",
+        source_language="English",
+        target_language="中文",
+        max_new_tokens=64,
+    )
+
+    assert translator.translate("A long English sentence.", "English", "中文") == "完整输出"
+    assert [call["max_tokens"] for call in calls] == [64, 128]
+
+
 def test_find_first_boundary_after_prefers_latest_boundary():
     pattern = re.compile(r"[.!?]")
     found = _find_first_boundary_after("a.b.c.", 0, pattern)
@@ -281,6 +530,45 @@ def test_parse_args_accepts_force_language_and_max_new_tokens(monkeypatch):
     assert args.max_new_tokens == 48
 
 
+def test_parse_args_uses_safe_asr_context_defaults(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    args = parse_args()
+
+    assert args.asr_context_schedule == ""
+    assert args.asr_context_max_terms == 24
+    assert args.asr_context_max_chars == 160
+    assert args.asr_context_lookaround_sec == 30.0
+    assert args.asr_context_apply_mode == "segment_final"
+
+
+def test_parse_args_accepts_asr_context_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--asr-context-schedule",
+            "/tmp/context.json",
+            "--asr-context-max-terms",
+            "12",
+            "--asr-context-max-chars",
+            "80",
+            "--asr-context-lookaround-sec",
+            "15",
+            "--asr-context-apply-mode",
+            "streaming",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.asr_context_schedule == "/tmp/context.json"
+    assert args.asr_context_max_terms == 12
+    assert args.asr_context_max_chars == 80
+    assert args.asr_context_lookaround_sec == 15.0
+    assert args.asr_context_apply_mode == "streaming"
+
+
 def test_parse_args_accepts_audio_queue_size(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -288,6 +576,16 @@ def test_parse_args_accepts_audio_queue_size(monkeypatch):
     )
     args = parse_args()
     assert args.audio_queue_size == 12
+
+
+def test_parse_args_uses_balanced_early_translation_defaults(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+    args = parse_args()
+    assert args.translation_max_new_tokens == 128
+    assert args.early_translation_stable_sec == 0.8
+    assert args.early_translation_stable_hits == 3
+    assert args.early_translation_short_stable_sec == 1.2
+    assert args.early_translation_short_stable_hits == 4
 
 
 def test_parse_args_accepts_consumer_batch_and_rollover(monkeypatch):
@@ -383,6 +681,67 @@ def test_parse_args_accepts_subtitle_trace_options(monkeypatch):
     assert args.subtitle_trace_log_partial_every == 7
 
 
+def test_auth_password_hash_verifies_and_rejects_wrong_password():
+    encoded = _hash_auth_password("secret")
+    assert encoded.startswith("pbkdf2_sha256$")
+    assert _verify_auth_password("secret", encoded)
+    assert not _verify_auth_password("wrong", encoded)
+    assert not _verify_auth_password("secret", "not-a-valid-hash")
+
+
+def test_parse_args_accepts_auth_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--auth-enabled",
+            "--auth-username",
+            "operator",
+            "--auth-password-hash",
+            "pbkdf2_sha256$1$c2FsdA$ZGlnZXN0",
+            "--auth-cookie-secure",
+            "--auth-session-ttl-sec",
+            "7200",
+            "--disable-debug-file",
+        ],
+    )
+    args = parse_args()
+    assert args.auth_enabled is True
+    assert args.auth_username == "operator"
+    assert args.auth_password_hash == "pbkdf2_sha256$1$c2FsdA$ZGlnZXN0"
+    assert args.auth_cookie_secure is True
+    assert args.auth_session_ttl_sec == 7200
+    assert args.disable_debug_file is True
+
+
+def test_parse_args_accepts_early_translation_stability_controls(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--early-translation-stable-sec",
+            "0.4",
+            "--early-translation-stable-hits",
+            "3",
+            "--early-translation-short-stable-sec",
+            "0.9",
+            "--early-translation-short-stable-hits",
+            "5",
+            "--early-translation-min-english-words",
+            "7",
+            "--early-translation-min-english-chars",
+            "36",
+        ],
+    )
+    args = parse_args()
+    assert args.early_translation_stable_sec == 0.4
+    assert args.early_translation_stable_hits == 3
+    assert args.early_translation_short_stable_sec == 0.9
+    assert args.early_translation_short_stable_hits == 5
+    assert args.early_translation_min_english_words == 7
+    assert args.early_translation_min_english_chars == 36
+
+
 def test_index_template_contains_core_stream_controls():
     assert 'id="btnStart"' in INDEX_HTML_TEMPLATE
     assert 'id="btnStop"' in INDEX_HTML_TEMPLATE
@@ -408,6 +767,21 @@ def test_index_template_auto_hides_top_controls_while_running():
     assert 'setControlBarHidden(true, "start_success");' in INDEX_HTML_TEMPLATE
     assert 'setControlBarHidden(false, "final");' in INDEX_HTML_TEMPLATE
     assert 'setControlBarHidden(false, "start_failed");' in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_has_configurable_subtitle_font_controls():
+    assert 'id="subtitleTopFontInput"' in INDEX_HTML_TEMPLATE
+    assert 'id="subtitleBottomFontInput"' in INDEX_HTML_TEMPLATE
+    assert "--subtitle-top-font-size" in INDEX_HTML_TEMPLATE
+    assert "--subtitle-bottom-font-size" in INDEX_HTML_TEMPLATE
+    assert 'font-size: var(--subtitle-top-font-size' in INDEX_HTML_TEMPLATE
+    assert 'font-size: var(--subtitle-bottom-font-size' in INDEX_HTML_TEMPLATE
+    assert "const SUBTITLE_TOP_FONT_KEY" in INDEX_HTML_TEMPLATE
+    assert "const SUBTITLE_BOTTOM_FONT_KEY" in INDEX_HTML_TEMPLATE
+    assert "function applySubtitleFontSizes" in INDEX_HTML_TEMPLATE
+    assert "function readSubtitleFontConfig" in INDEX_HTML_TEMPLATE
+    assert "subtitleTopFontInput.addEventListener" in INDEX_HTML_TEMPLATE
+    assert "subtitleBottomFontInput.addEventListener" in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_keeps_mobile_latest_subtitles_visible():
@@ -528,10 +902,13 @@ def test_index_template_avoids_committed_row_rewrite_and_empty_translation_reset
     assert "translation_updated_local" in INDEX_HTML_TEMPLATE
 
 
-def test_index_template_stabilizes_tentative_tail_to_avoid_flash_drop():
-    assert "const TAIL_STABILIZE_MS = 700;" in INDEX_HTML_TEMPLATE
-    assert "function updateCommittedTentativeTail" in INDEX_HTML_TEMPLATE
-    assert "tailStabilizeTimer = setTimeout" in INDEX_HTML_TEMPLATE
+def test_index_template_uses_backend_stability_for_tentative_tail():
+    assert "const TAIL_STABILIZE_MS = 700;" not in INDEX_HTML_TEMPLATE
+    assert "tailStabilizeTimer = setTimeout" not in INDEX_HTML_TEMPLATE
+    assert "function readBackendStability" in INDEX_HTML_TEMPLATE
+    assert "function updateCommittedTentativeTailFromBackend" in INDEX_HTML_TEMPLATE
+    assert "readBackendStability(msg)" in INDEX_HTML_TEMPLATE
+    assert "source.stability" in INDEX_HTML_TEMPLATE
     assert 'rows.push({ sid: "__tail__", zh: tail, en: "" });' in INDEX_HTML_TEMPLATE
 
 
@@ -676,7 +1053,7 @@ def test_backend_has_idle_tail_commit_fallback_for_translation():
 def test_index_template_updates_tail_directly_from_backend_tentative_text():
     assert "const bridgeCandidate = tentativeTail || String(nextText || \"\").trim();" not in INDEX_HTML_TEMPLATE
     assert "if (holdBoundaryTail) {" not in INDEX_HTML_TEMPLATE
-    assert "updateCommittedTentativeTail(tentativeTail);" in INDEX_HTML_TEMPLATE
+    assert "updateCommittedTentativeTailFromBackend(tentativeTail, stability);" in INDEX_HTML_TEMPLATE
     assert "function resolveTentativeTail(nextText, committedText, tentativeText){" in INDEX_HTML_TEMPLATE
     assert "window.__subtitleDebug" in INDEX_HTML_TEMPLATE
 
@@ -717,8 +1094,74 @@ def test_split_sentences_keeps_original_punctuation_without_style_rewrite():
     assert "第五。次测试翻译" in joined
 
 
+def test_split_sentences_uses_generic_closing_quote_boundaries():
+    text = 'Alpha beta." Gamma delta? Zeta eta!'
+    sentences, tail = _split_sentences_and_tail(text)
+    assert sentences == ['Alpha beta."', "Gamma delta?", "Zeta eta!"]
+    assert tail == ""
+
+
+def test_split_sentences_keeps_generic_initialism_and_decimal_together():
+    text = "The U.S. marker is version 3.14 today. Next sentence."
+    sentences, tail = _split_sentences_and_tail(text)
+    assert sentences == ["The U.S. marker is version 3.14 today.", "Next sentence."]
+    assert tail == ""
+
+
+def test_split_sentences_handles_mixed_cjk_latin_strong_boundaries():
+    text = '这是第一句已经足够长。Alpha beta."这是第三句已经足够长！'
+    sentences, tail = _split_sentences_and_tail(text)
+    assert sentences == ["这是第一句已经足够长。", 'Alpha beta."', "这是第三句已经足够长！"]
+    assert tail == ""
+
+
+def test_trim_leading_boundary_overlap_removes_cjk_suffix_replay():
+    assert (
+        _trim_leading_boundary_overlap(
+            "已经有火从天上降下来，烧灭前两次来的五十人。",
+            "人。现在，愿我的性命在你眼前看为宝贵。",
+        )
+        == "现在，愿我的性命在你眼前看为宝贵。"
+    )
+    assert (
+        _trim_leading_boundary_overlap(
+            "过去之后，他说：“你要我为你做什么？”",
+            "什么？只管求我。",
+        )
+        == "只管求我。"
+    )
+
+
+def test_trim_leading_boundary_overlap_requires_terminal_replay():
+    assert _trim_leading_boundary_overlap("这是上一句的尾字人。", "人现在继续说。") == "人现在继续说。"
+    assert _trim_leading_boundary_overlap("这是上一句。", "这是下一句。") == "这是下一句。"
+
+
 def test_should_accept_sentence_upgrade_allows_growth():
     assert _should_accept_sentence_upgrade("第一遍测试翻译。", "第一遍测试翻译，第二遍测试翻译。")
+
+
+def test_should_accept_sentence_upgrade_allows_corrected_tail_growth():
+    old = (
+        "But I would have ultimately been okay with it because yeah, like when you take out "
+        "a piece of paper and you start writing down, why do I want to."
+    )
+    new = (
+        "But I would have ultimately been okay with it because yeah, like when you take out "
+        "a piece of paper and you start writing down, why do I want a third kid, and you're "
+        "like, I don't even know, this is going to be a lot more work, and we're going to "
+        "have to have a minivan forever and stuff like that."
+    )
+    assert _should_accept_sentence_upgrade(old, new)
+
+
+def test_should_accept_sentence_upgrade_rejects_middle_rewrite_with_shared_intro():
+    old = "This is a carefully completed sentence about pregnancy planning."
+    new = (
+        "This is a carefully completed sentence about retirement accounts, investment risk, "
+        "and an unrelated subject that continues for much longer."
+    )
+    assert not _should_accept_sentence_upgrade(old, new)
 
 
 def test_should_accept_sentence_upgrade_allows_quality_fix_without_growth():
@@ -731,6 +1174,99 @@ def test_should_accept_sentence_upgrade_rejects_lower_quality_variant():
 
 def test_should_accept_sentence_upgrade_rejects_unrelated_shorter_text():
     assert not _should_accept_sentence_upgrade("这是一段完整的测试文本。", "这是测试。")
+
+
+def test_monotonic_sentence_extension_accepts_short_terminal_suffixes():
+    classifier = getattr(demo_streaming_ws, "_is_monotonic_sentence_extension", None)
+    assert classifier is not None
+    assert classifier(
+        "The result is ready.",
+        "The result is ready now.",
+    )
+    assert classifier("结果已经确认。", "结果已经确认完成。")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("The result is ready.", "The result is ready."),
+        ("The result is ready now.", "The result is ready."),
+        ("The report is ready.", "The report was rejected today."),
+        ("Fifth test completed.", "Fifth. test completed."),
+    ],
+)
+def test_monotonic_sentence_extension_rejects_non_growth_and_rewrites(old, new):
+    classifier = getattr(demo_streaming_ws, "_is_monotonic_sentence_extension", None)
+    assert classifier is not None
+    assert not classifier(old, new)
+
+
+def test_deferred_sentence_upgrade_requires_hits_and_elapsed_stability():
+    observer = getattr(demo_streaming_ws, "_observe_deferred_sentence_upgrade", None)
+    assert observer is not None
+    candidates = {}
+
+    first = observer(
+        candidates,
+        sentence_id="sentence-1",
+        text="The result is ready now.",
+        seq=10,
+        now=100.0,
+        required_hits=3,
+        required_stable_sec=0.6,
+    )
+    second = observer(
+        candidates,
+        sentence_id="sentence-1",
+        text="The result is ready now.",
+        seq=11,
+        now=100.3,
+        required_hits=3,
+        required_stable_sec=0.6,
+    )
+    third = observer(
+        candidates,
+        sentence_id="sentence-1",
+        text="The result is ready now.",
+        seq=12,
+        now=100.61,
+        required_hits=3,
+        required_stable_sec=0.6,
+    )
+
+    assert (first.transition, first.ready, first.hits) == ("started", False, 1)
+    assert (second.transition, second.ready, second.hits) == ("waiting", False, 2)
+    assert (third.transition, third.ready, third.hits) == ("accepted", True, 3)
+    assert third.stable_ms == 610
+
+
+def test_deferred_sentence_upgrade_change_restarts_stability_window():
+    observer = getattr(demo_streaming_ws, "_observe_deferred_sentence_upgrade", None)
+    assert observer is not None
+    candidates = {}
+    observer(
+        candidates,
+        "sentence-1",
+        "The result is ready so.",
+        10,
+        100.0,
+        3,
+        0.6,
+    )
+    changed = observer(
+        candidates,
+        "sentence-1",
+        "The result is ready now.",
+        11,
+        100.7,
+        3,
+        0.6,
+    )
+
+    assert changed.transition == "changed"
+    assert changed.ready is False
+    assert changed.hits == 1
+    assert changed.previous_text == "The result is ready so."
 
 
 def test_index_template_hides_raw_asr_text_panel():
@@ -790,6 +1326,57 @@ def test_index_template_has_scroll_to_latest_buttons_per_lane():
     assert 'id="jumpLatestZh"' in INDEX_HTML_TEMPLATE
     assert "function updateJumpLatestButtons()" in INDEX_HTML_TEMPLATE
     assert "jump_latest_clicked" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_has_persisted_session_context_control():
+    assert 'id="asrContextInput"' in INDEX_HTML_TEMPLATE
+    assert 'for="asrContextInput"' in INDEX_HTML_TEMPLATE
+    assert "专业术语 Context" in INDEX_HTML_TEMPLATE
+    assert 'const ASR_CONTEXT_STORAGE_KEY = "voxbridge_asr_context_terms";' in INDEX_HTML_TEMPLATE
+    assert "function parseAsrContextTerms" in INDEX_HTML_TEMPLATE
+    assert "function readAsrContextTerms" in INDEX_HTML_TEMPLATE
+    assert "localStorage.setItem(ASR_CONTEXT_STORAGE_KEY" in INDEX_HTML_TEMPLATE
+    assert "localStorage.removeItem(ASR_CONTEXT_STORAGE_KEY)" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_sends_context_in_microphone_and_replay_starts():
+    assert INDEX_HTML_TEMPLATE.count("asr_context_terms: asrContextTerms") == 2
+    assert "const asrContextTerms = readAsrContextTerms();" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_locks_context_during_start_active_and_finishing_states():
+    assert "if (asrContextInput) asrContextInput.disabled = active;" in INDEX_HTML_TEMPLATE
+    assert "if (asrContextInput) asrContextInput.disabled = true;" in INDEX_HTML_TEMPLATE
+    assert 'setControlBarHidden(false, "start_failed");' in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_waits_for_started_before_capture_becomes_active():
+    assert "function waitForStarted" in INDEX_HTML_TEMPLATE
+    assert "resolvePendingStart(msg);" in INDEX_HTML_TEMPLATE
+    assert "rejectPendingStart(new Error(msg.message" in INDEX_HTML_TEMPLATE
+    assert "const startedPromise = waitForStarted(10000);" in INDEX_HTML_TEMPLATE
+    assert "const started = await startedPromise;" in INDEX_HTML_TEMPLATE
+    assert "await buildCaptureGraph();" in INDEX_HTML_TEMPLATE
+    assert INDEX_HTML_TEMPLATE.index(
+        "const started = await startedPromise;"
+    ) < INDEX_HTML_TEMPLATE.index("await buildCaptureGraph();")
+
+
+def test_index_template_uses_backend_context_limits_and_safe_status_metadata():
+    assert "const ASR_CONTEXT_MAX_TERMS = __ASR_CONTEXT_MAX_TERMS__;" in INDEX_HTML_TEMPLATE
+    assert "const ASR_CONTEXT_MAX_CHARS = __ASR_CONTEXT_MAX_CHARS__;" in INDEX_HTML_TEMPLATE
+    assert "Context 已启用" in INDEX_HTML_TEMPLATE
+    assert "function asrContextTermHasSentencePunctuation" in INDEX_HTML_TEMPLATE
+    assert "asr_context_term_count" in INDEX_HTML_TEMPLATE
+    assert "asr_context_chars" in INDEX_HTML_TEMPLATE
+    assert "contextTerms:" not in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_context_control_uses_own_mobile_row_without_frontend_text_splitting():
+    assert ".context-control" in INDEX_HTML_TEMPLATE
+    assert "flex: 1 1 100%;" in INDEX_HTML_TEMPLATE
+    assert "splitTextByDisplayRules" not in INDEX_HTML_TEMPLATE
+    assert "VAD_SILENCE_SEC" not in INDEX_HTML_TEMPLATE
 
 
 def test_index_template_supports_system_audio_capture_via_display_media():

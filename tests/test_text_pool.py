@@ -37,6 +37,14 @@ def test_dedup_removes_overlap_between_segments():
     assert merged == "第一遍测试翻译，第二遍测试翻译。第三遍测试翻译。"
 
 
+def test_dedup_segment_join_inserts_space_between_latin_words_without_overlap():
+    assert dedup_segment_join("She's a girl", "Yes.") == "She's a girl Yes."
+
+
+def test_dedup_segment_join_keeps_cjk_compact_without_overlap():
+    assert dedup_segment_join("这是上半句", "这是下半句。") == "这是上半句这是下半句。"
+
+
 def test_trim_prefix_overlap_trims_small_boundary_overlap():
     ref = "女人对蛇说：那棵树上的果子"
     candidate = "树上的果子，神曾经说过。"

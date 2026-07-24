@@ -6,6 +6,15 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 
+def _join_without_overlap(prev_text: str, new_text: str) -> str:
+    prev = str(prev_text or "")
+    nxt = str(new_text or "")
+    need_space = bool(re.match(r"[A-Za-z0-9]", prev[-1:])) and bool(
+        re.match(r"[A-Za-z0-9]", nxt[:1])
+    )
+    return f"{prev} {nxt}" if need_space else f"{prev}{nxt}"
+
+
 def dedup_segment_join(prev_text: str, new_text: str, min_overlap: int = 2) -> str:
     prev = str(prev_text or "")
     nxt = str(new_text or "")
@@ -23,7 +32,7 @@ def dedup_segment_join(prev_text: str, new_text: str, min_overlap: int = 2) -> s
             best = k
             break
     if best <= 0:
-        return f"{prev}{nxt}"
+        return _join_without_overlap(prev, nxt)
     return f"{prev}{nxt[best:]}"
 
 

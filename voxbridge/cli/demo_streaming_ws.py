@@ -18,46 +18,275 @@ Browser microphone streaming demo over WebSocket (vLLM backend).
 """
 import argparse
 import asyncio
+import base64
 import difflib
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import os
 import signal
+import secrets
 import socket
 import threading
 import time
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from voxbridge.streaming.backpressure import QueueBackpressureController
+from voxbridge.streaming.context_schedule import (
+    ContextSchedule,
+    normalize_session_context_terms,
+)
 from voxbridge.streaming.segment_policy import SegmentPolicy
 from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overlap
 
 SAMPLE_RATE = 16000
 logger = logging.getLogger(__name__)
-SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？!?…]+[\"'”’)\]）】》]*|\.+(?=\s|$)[\"'”’)\]）】》]*")
+SENTENCE_BOUNDARY_PATTERN = re.compile(
+    r"[。！？!?…]+[\"'”’)\]）】》]*|\.+[\"'”’)\]）】》]*(?=\s|$|[\u3400-\u9fff])"
+)
 SENTENCE_CLOSER_CHARS = "\"'”’)]）】》"
 INITIALS_ABBREVIATION_PATTERN = re.compile(r"(?:\b[A-Za-z]\.){2,}$")
-COMMON_ABBREVIATION_PATTERN = re.compile(
-    r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|No|etc|vs|e\.g|i\.e)\.$",
-    re.IGNORECASE,
-)
-SENTENCE_START_HINT_PATTERN = re.compile(
-    r"^(?:[\"'“”‘’(\[]\s*)?(?:I|We|You|He|She|They|It|This|That|There|Here)\b",
-)
 MIN_CJK_SENTENCE_CHARS = 10
 _INSTANCE_LOCK_HANDLE: Optional[Any] = None
+AUTH_COOKIE_NAME = "voxbridge_session"
+AUTH_HASH_SCHEME = "pbkdf2_sha256"
+AUTH_HASH_ITERATIONS = 260_000
+AUTH_SESSION_TOKEN_BYTES = 32
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(text: str) -> bytes:
+    value = str(text or "").strip()
+    padding = "=" * ((4 - len(value) % 4) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _hash_auth_password(password: str, *, salt: Optional[bytes] = None, iterations: int = AUTH_HASH_ITERATIONS) -> str:
+    raw_password = str(password or "")
+    if not raw_password:
+        raise ValueError("password must not be empty")
+    rounds = max(1, int(iterations))
+    raw_salt = salt if salt is not None else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", raw_password.encode("utf-8"), raw_salt, rounds)
+    return f"{AUTH_HASH_SCHEME}${rounds}${_b64url_encode(raw_salt)}${_b64url_encode(digest)}"
+
+
+def _parse_auth_password_hash(encoded_hash: str) -> Tuple[int, bytes, bytes]:
+    parts = str(encoded_hash or "").strip().split("$")
+    if len(parts) != 4 or parts[0] != AUTH_HASH_SCHEME:
+        raise ValueError("unsupported password hash format")
+    try:
+        iterations = int(parts[1])
+    except ValueError as exc:
+        raise ValueError("invalid password hash iterations") from exc
+    if iterations <= 0:
+        raise ValueError("invalid password hash iterations")
+    try:
+        salt = _b64url_decode(parts[2])
+        digest = _b64url_decode(parts[3])
+    except Exception as exc:
+        raise ValueError("invalid password hash encoding") from exc
+    if not salt or not digest:
+        raise ValueError("invalid password hash payload")
+    return iterations, salt, digest
+
+
+def _verify_auth_password(password: str, encoded_hash: str) -> bool:
+    try:
+        iterations, salt, expected = _parse_auth_password_hash(encoded_hash)
+    except ValueError:
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(candidate, expected)
+
+
+def _build_auth_config(args: argparse.Namespace) -> SimpleNamespace:
+    enabled = bool(getattr(args, "auth_enabled", False))
+    username = str(getattr(args, "auth_username", "admin") or "admin").strip() or "admin"
+    password_hash = str(
+        getattr(args, "auth_password_hash", "") or os.environ.get("VOXBRIDGE_AUTH_PASSWORD_HASH", "")
+    ).strip()
+    if enabled:
+        if not password_hash:
+            raise RuntimeError(
+                "auth is enabled but no password hash was provided; set --auth-password-hash "
+                "or VOXBRIDGE_AUTH_PASSWORD_HASH"
+            )
+        try:
+            _parse_auth_password_hash(password_hash)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid auth password hash: {exc}") from exc
+    return SimpleNamespace(
+        enabled=enabled,
+        username=username,
+        password_hash=password_hash,
+        cookie_secure=bool(getattr(args, "auth_cookie_secure", False)),
+        session_ttl_sec=max(60, int(getattr(args, "auth_session_ttl_sec", 12 * 60 * 60))),
+        disable_debug_file=bool(getattr(args, "disable_debug_file", False)),
+    )
+
+
+def _load_asr_context_schedule(args: argparse.Namespace) -> Optional[ContextSchedule]:
+    cached = getattr(args, "_asr_context_schedule_obj", None)
+    if isinstance(cached, ContextSchedule):
+        return cached
+    schedule_path = str(getattr(args, "asr_context_schedule", "") or "").strip()
+    if not schedule_path:
+        return None
+    schedule = ContextSchedule.from_path(Path(schedule_path).expanduser())
+    setattr(args, "_asr_context_schedule_obj", schedule)
+    return schedule
+
+
+def _normalize_asr_context_apply_mode(value: Any) -> str:
+    mode = str(value or "segment_final").strip().lower().replace("-", "_")
+    if mode not in {"segment_final", "streaming"}:
+        raise ValueError(f"unsupported ASR context apply mode: {value!r}")
+    return mode
+
+
+def _compact_asr_compare_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", str(value or ""), flags=re.UNICODE).casefold()
+
+
+def _consume_unmatched_compact_occurrence(
+    existing: str,
+    candidate: str,
+    used_spans: List[Tuple[int, int]],
+) -> bool:
+    if not existing or not candidate:
+        return False
+    search_from = 0
+    while search_from < len(existing):
+        start = existing.find(candidate, search_from)
+        if start < 0:
+            return False
+        end = start + len(candidate)
+        if all(end <= used_start or start >= used_end for used_start, used_end in used_spans):
+            used_spans.append((start, end))
+            return True
+        search_from = start + 1
+    return False
+
+
+def _should_accept_context_sentence_correction(old_text: str, new_text: str) -> bool:
+    old_compact = _compact_asr_compare_text(old_text)
+    new_compact = _compact_asr_compare_text(new_text)
+    if not old_compact or not new_compact or old_compact == new_compact:
+        return False
+    length_ratio = len(new_compact) / float(len(old_compact))
+    if length_ratio < 0.65 or length_ratio > 1.45:
+        return False
+    return difflib.SequenceMatcher(None, old_compact, new_compact).ratio() >= 0.72
+
+
+def _looks_like_asr_context_echo(context: str, text: str, previous_text: str = "") -> bool:
+    terms = [part for part in str(context or "").split() if part]
+    if len(terms) < 3:
+        return False
+    context_compact = _compact_asr_compare_text(context)
+    text_compact = _compact_asr_compare_text(text)
+    if len(context_compact) < 12 or not text_compact:
+        return False
+    length_ratio = len(text_compact) / float(len(context_compact))
+    if length_ratio < 0.8 or length_ratio > 1.25:
+        return False
+    if difflib.SequenceMatcher(None, context_compact, text_compact).ratio() < 0.9:
+        return False
+
+    previous_compact = _compact_asr_compare_text(previous_text)
+    if previous_compact:
+        evidence_ratio = len(previous_compact) / float(len(text_compact))
+        evidence_similarity = difflib.SequenceMatcher(
+            None,
+            previous_compact,
+            text_compact,
+        ).ratio()
+        if 0.6 <= evidence_ratio <= 1.6 and evidence_similarity >= 0.55:
+            return False
+    return True
+
+
+def _filter_asr_context_echo_sentences(
+    context: str,
+    text: str,
+    previous_text: str = "",
+) -> Tuple[str, int]:
+    source = str(text or "").strip()
+    if not source or not str(context or "").strip():
+        return source, 0
+
+    completed, tail = _split_sentences_and_tail(source)
+    candidates = list(completed)
+    if tail:
+        candidates.append(str(tail or "").strip())
+    previous_completed, previous_tail = _split_sentences_and_tail(previous_text)
+    previous_candidates = [str(item or "").strip() for item in previous_completed]
+    if previous_tail:
+        previous_candidates.append(str(previous_tail or "").strip())
+
+    kept: List[str] = []
+    removed = 0
+    for candidate in candidates:
+        current = str(candidate or "").strip()
+        if not current:
+            continue
+        current_compact = _compact_asr_compare_text(current)
+        previous_evidence = max(
+            previous_candidates,
+            key=lambda item: difflib.SequenceMatcher(
+                None,
+                _compact_asr_compare_text(item),
+                current_compact,
+            ).ratio(),
+            default="",
+        )
+        if _looks_like_asr_context_echo(
+            context,
+            current,
+            previous_text=previous_evidence,
+        ):
+            removed += 1
+            continue
+        kept.append(current)
+    return _join_segments(kept), int(removed)
+
+
+def _safe_exception_trace_fields(exc: BaseException) -> Dict[str, str]:
+    error_text = str(exc or "").encode("utf-8", errors="replace")
+    return {
+        "error_type": type(exc).__name__,
+        "error_sha256": hashlib.sha256(error_text).hexdigest(),
+    }
+
+
+async def _await_thread_completion_on_cancel(func: Any, *args: Any, **kwargs: Any) -> Any:
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(worker)
+        except Exception:
+            pass
+        raise
 
 
 def _instance_lock_path(port: int) -> Path:
@@ -273,6 +502,81 @@ def _split_sentences_and_tail(text: str) -> Tuple[List[str], str]:
     return sentences, tail
 
 
+def _terminal_core(token: str) -> str:
+    src = str(token or "")
+    for ch in src:
+        if ch in ".。":
+            return "."
+        if ch in "?？":
+            return "?"
+        if ch in "!！":
+            return "!"
+        if ch == "…":
+            return "…"
+    return ""
+
+
+def _trim_leading_boundary_overlap(
+    prev_sentence: str,
+    candidate_sentence: str,
+    *,
+    max_cjk_chars: int = 4,
+) -> str:
+    prev = str(prev_sentence or "").strip()
+    candidate = str(candidate_sentence or "").strip()
+    if not prev or not candidate or not _has_cjk(prev) or not _has_cjk(candidate):
+        return candidate
+
+    terminal_match = re.search(r"([。！？!?…]+[\"'”’)\]）】》]*)$", prev)
+    if not terminal_match:
+        return candidate
+    prev_terminal = _terminal_core(str(terminal_match.group(1) or ""))
+    if not prev_terminal:
+        return candidate
+
+    prev_body = prev[: terminal_match.start()].strip()
+    if not prev_body:
+        return candidate
+
+    max_len = min(int(max(1, max_cjk_chars)), len(prev_body), len(candidate))
+    for size in range(max_len, 0, -1):
+        suffix = prev_body[-size:]
+        if not suffix or not all(_has_cjk(ch) for ch in suffix):
+            continue
+        if not candidate.startswith(suffix):
+            continue
+        rest = candidate[size:]
+        replay_terminal = re.match(r"[。！？!?…]+[\"'”’)\]）】》]*", rest)
+        if not replay_terminal:
+            continue
+        if _terminal_core(str(replay_terminal.group(0) or "")) != prev_terminal:
+            continue
+        trimmed = rest[int(replay_terminal.end()) :].strip()
+        if trimmed:
+            return trimmed
+    return candidate
+
+
+def _text_ends_with_sentence_terminator(text: str) -> bool:
+    src = str(text or "").strip()
+    if not src:
+        return False
+    src = re.sub(r"[\"'”’)\]）】》\s]+$", "", src).strip()
+    return bool(re.search(r"[。！？!?….]$", src))
+
+
+def _should_hard_cut_fallback_merge(pending_prefix: str, raw_text: str) -> bool:
+    pending = str(pending_prefix or "").strip()
+    raw = str(raw_text or "").strip()
+    if not pending or not raw:
+        return False
+    # Completed carry text should not be glued to unrelated next-segment text
+    # when no reliable overlap exists.
+    if _text_ends_with_sentence_terminator(pending):
+        return False
+    return True
+
+
 def _is_abbreviation_period_boundary(text: str, start: int, end: int) -> bool:
     src = str(text or "")
     if not src:
@@ -293,18 +597,20 @@ def _is_abbreviation_period_boundary(text: str, start: int, end: int) -> bool:
     if not suffix:
         return False
 
-    left_tail = src[max(0, trimmed_end - 40):trimmed_end]
-    is_abbreviation = bool(
-        INITIALS_ABBREVIATION_PATTERN.search(left_tail)
-        or COMMON_ABBREVIATION_PATTERN.search(left_tail)
-    )
-    if not is_abbreviation:
-        return False
+    prev_char = src[trimmed_end - 2] if trimmed_end >= 2 else ""
+    next_char = suffix[0] if suffix else ""
+    if prev_char.isdigit() and next_char.isdigit():
+        return True
 
-    # If suffix strongly looks like a new sentence start, keep the split.
-    if SENTENCE_START_HINT_PATTERN.match(suffix):
-        return False
-    return True
+    left_tail = src[max(0, trimmed_end - 40):trimmed_end]
+    if INITIALS_ABBREVIATION_PATTERN.search(left_tail):
+        return True
+
+    token_match = re.search(r"([A-Za-z]+)$", src[: max(0, trimmed_end - 1)])
+    token = token_match.group(1) if token_match else ""
+    if token and len(token) <= 2 and token[:1].isupper():
+        return True
+    return False
 
 
 def _iter_sentence_boundaries(text: str, boundary_pattern: Any):
@@ -398,6 +704,92 @@ def _canonical_sentence_for_upgrade_compare(text: str) -> str:
     return src.strip()
 
 
+_SMALL_UPGRADE_REQUIRED_HITS = 3
+_SMALL_UPGRADE_STABLE_SEC = 0.6
+
+
+@dataclass
+class _DeferredSentenceUpgrade:
+    text: str
+    first_seen_at: float
+    last_seen_at: float
+    hits: int
+    last_seq: int
+
+
+@dataclass(frozen=True)
+class _DeferredSentenceUpgradeObservation:
+    transition: str
+    ready: bool
+    hits: int
+    stable_ms: int
+    text: str
+    previous_text: str = ""
+
+
+def _terminal_growth_base(text: str) -> str:
+    src = str(text or "").strip()
+    src = re.sub(r"[。！？!?….,，;；:：]+[\"'”’)\]）】》]*$", "", src).strip()
+    return _canonical_sentence_for_upgrade_compare(src).casefold()
+
+
+def _is_monotonic_sentence_extension(old_text: str, new_text: str) -> bool:
+    old = str(old_text or "").strip()
+    new = str(new_text or "").strip()
+    if not old or not new or old == new:
+        return False
+    old_base = _terminal_growth_base(old)
+    new_base = _terminal_growth_base(new)
+    return bool(
+        old_base
+        and new_base
+        and len(new_base) > len(old_base)
+        and new_base.startswith(old_base)
+        and _sentence_text_quality_score(new) >= _sentence_text_quality_score(old)
+    )
+
+
+def _observe_deferred_sentence_upgrade(
+    candidates: Dict[str, _DeferredSentenceUpgrade],
+    sentence_id: str,
+    text: str,
+    seq: int,
+    now: float,
+    required_hits: int = _SMALL_UPGRADE_REQUIRED_HITS,
+    required_stable_sec: float = _SMALL_UPGRADE_STABLE_SEC,
+) -> _DeferredSentenceUpgradeObservation:
+    sid = str(sentence_id or "")
+    candidate_text = str(text or "").strip()
+    previous = candidates.get(sid)
+    transition = "waiting"
+    previous_text = ""
+    if previous is None or previous.text != candidate_text:
+        previous_text = str(previous.text if previous is not None else "")
+        transition = "changed" if previous is not None else "started"
+        current = _DeferredSentenceUpgrade(candidate_text, now, now, 1, int(seq))
+        candidates[sid] = current
+    else:
+        previous.hits += 1
+        previous.last_seen_at = float(now)
+        previous.last_seq = int(seq)
+        current = previous
+    stable_ms = max(0, int(round((float(now) - current.first_seen_at) * 1000.0)))
+    ready = bool(
+        current.hits >= max(1, int(required_hits))
+        and stable_ms >= max(0, int(round(float(required_stable_sec) * 1000.0)))
+    )
+    if ready:
+        transition = "accepted"
+    return _DeferredSentenceUpgradeObservation(
+        transition=transition,
+        ready=ready,
+        hits=int(current.hits),
+        stable_ms=int(stable_ms),
+        text=current.text,
+        previous_text=previous_text,
+    )
+
+
 def _should_accept_sentence_upgrade(old_text: str, new_text: str) -> bool:
     old = str(old_text or "").strip()
     new = str(new_text or "").strip()
@@ -419,6 +811,18 @@ def _should_accept_sentence_upgrade(old_text: str, new_text: str) -> bool:
                 return True
             if old_base in new_base and len(new_base) >= len(old_base) + 10:
                 return True
+            old_growth = _canonical_sentence_for_upgrade_compare(old_base).casefold()
+            new_growth = _canonical_sentence_for_upgrade_compare(new_base).casefold()
+            if old_growth and len(new_growth) >= len(old_growth) + 6:
+                common_prefix_chars = 0
+                for old_char, new_char in zip(old_growth, new_growth):
+                    if old_char != new_char:
+                        break
+                    common_prefix_chars += 1
+                correction_budget = max(2, min(16, (len(old_growth) + 7) // 8))
+                required_prefix_chars = max(8, len(old_growth) - correction_budget)
+                if common_prefix_chars >= required_prefix_chars:
+                    return True
 
     # Secondary path: allow minor corrections if text quality improves
     # (for example removing hallucinated terminal punctuation inside a word).
@@ -440,6 +844,64 @@ def _should_accept_sentence_upgrade(old_text: str, new_text: str) -> bool:
             return True
 
     return False
+
+
+def _english_word_count(text: str) -> int:
+    src = str(text or "")
+    if not src:
+        return 0
+    return len(re.findall(r"[A-Za-z]+(?:['-][A-Za-z]+)?|\d+", src))
+
+
+def _is_short_english_sentence_for_early_commit(
+    text: str,
+    *,
+    min_words: int = 6,
+    min_chars: int = 32,
+) -> bool:
+    src = str(text or "").strip()
+    if not src or _has_cjk(src) or not _has_latin(src):
+        return False
+    words = _english_word_count(src)
+    chars = len(src)
+    return words < int(max(1, min_words)) and chars < int(max(1, min_chars))
+
+
+def _is_short_english_slice_fragment(
+    text: str,
+    *,
+    min_words: int = 6,
+    min_chars: int = 32,
+) -> bool:
+    src = str(text or "").strip()
+    if not src or _has_cjk(src) or not _has_latin(src):
+        return False
+    # Periods in very short English partials are often ASR boundary guesses
+    # rather than reliable sentence endings. Keep questions and exclamations
+    # eligible because they are stronger end-of-sentence signals.
+    if not re.search(r"\.[\"'”’)\]）】》]*$", src):
+        return False
+    return _is_short_english_sentence_for_early_commit(
+        src,
+        min_words=int(min_words),
+        min_chars=int(min_chars),
+    )
+
+
+def _strip_short_english_fragment_period(
+    text: str,
+    *,
+    min_words: int = 6,
+    min_chars: int = 32,
+) -> str:
+    src = str(text or "").strip()
+    if not _is_short_english_slice_fragment(
+        src,
+        min_words=int(min_words),
+        min_chars=int(min_chars),
+    ):
+        return src
+    return re.sub(r"\.[\"'”’)\]）】》]*$", "", src).strip()
 
 
 def _trace_preview(text: str, max_chars: int = 72) -> str:
@@ -704,6 +1166,17 @@ def _join_segments(segments: List[str]) -> str:
         need_space = bool(re.match(r"[A-Za-z0-9]", out[-1])) and bool(re.match(r"[A-Za-z0-9]", cur[:1]))
         out = f"{out} {cur}" if need_space else f"{out}{cur}"
     return out
+
+
+def _classify_boundary_join_mode(prev_text: str, new_text: str, merged_text: str) -> str:
+    prev = str(prev_text or "").strip()
+    nxt = str(new_text or "").strip()
+    merged = str(merged_text or "").strip()
+    if len(merged) < len(prev) + len(nxt):
+        return "overlap"
+    if merged == f"{prev} {nxt}":
+        return "spaced"
+    return "direct"
 
 
 def _stabilize_completed_prefix_with_committed(
@@ -987,6 +1460,12 @@ class OpenAIAPITranslator:
                 return "".join(chunks).strip()
         return ""
 
+    def _extract_finish_reason(self, payload: Dict[str, Any]) -> str:
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            return str(choices[0].get("finish_reason") or "").strip().lower()
+        return ""
+
     def translate(
         self,
         text: str,
@@ -1001,36 +1480,49 @@ class OpenAIAPITranslator:
         if not _text_matches_source_language(src, source):
             return ""
 
-        body = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": self._build_prompt(
-                        src,
-                        source_language=source,
-                        target_language=target,
-                    ),
-                }
-            ],
-            "max_tokens": self.max_new_tokens,
-            "temperature": 0,
-            "top_p": 1,
-            "stream": False,
-        }
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        messages = [
+            {
+                "role": "user",
+                "content": self._build_prompt(
+                    src,
+                    source_language=source,
+                    target_language=target,
+                ),
+            }
+        ]
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        req = urllib.request.Request(self.chat_url, data=data, headers=headers, method="POST")
-        with self._lock:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        payload = json.loads(raw)
-        out = self._extract_content(payload)
-        out = out.replace("<target>", "").replace("</target>", "").strip()
-        return out
+        max_tokens = int(self.max_new_tokens)
+        retry_limit = max(max_tokens, min(512, max(128, max_tokens * 4)))
+        last_out = ""
+        while True:
+            body = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "top_p": 1,
+                "stream": False,
+            }
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(self.chat_url, data=data, headers=headers, method="POST")
+            with self._lock:
+                with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+            out = self._extract_content(payload)
+            out = out.replace("<target>", "").replace("</target>", "").strip()
+            finish_reason = self._extract_finish_reason(payload)
+            if out:
+                last_out = out
+            if finish_reason != "length":
+                return out
+            next_tokens = min(int(retry_limit), max(max_tokens * 2, 128))
+            if next_tokens <= max_tokens:
+                return out or last_out
+            max_tokens = next_tokens
 
 
 INDEX_HTML_TEMPLATE = r"""<!doctype html>
@@ -1168,6 +1660,53 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       color:var(--muted);
     }
 
+    .font-size-control{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border:1px solid var(--line);
+      border-radius: 10px;
+      background:var(--surface-soft);
+      padding: 6px 10px;
+      font-size: 12px;
+      color:var(--muted);
+    }
+
+    .context-control{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1 1 320px;
+      min-width: min(320px, 100%);
+      border:1px solid var(--line);
+      border-radius: 10px;
+      background:var(--surface-soft);
+      padding: 6px 10px;
+      font-size: 12px;
+      color:var(--muted);
+    }
+
+    .context-control textarea{
+      flex: 1 1 auto;
+      min-width: 120px;
+      height: 30px;
+      max-height: 64px;
+      resize: vertical;
+      border:1px solid #bdcbb7;
+      border-radius: 8px;
+      background:#fffdf7;
+      color:#2f3c33;
+      padding: 5px 8px;
+      font: inherit;
+      line-height: 1.35;
+      outline: none;
+    }
+
+    .context-control textarea:focus{
+      border-color:var(--accent);
+      box-shadow: 0 0 0 2px rgba(82, 126, 114, 0.16);
+    }
+
     .source-toggle{
       display: inline-flex;
       align-items: center;
@@ -1200,12 +1739,29 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       outline: none;
     }
 
+    .font-size-control input{
+      width: 58px;
+      border:1px solid #bdcbb7;
+      border-radius: 8px;
+      background:#fffdf7;
+      color:#2f3c33;
+      padding: 4px 7px;
+      font-size: 12px;
+      outline: none;
+      text-align: center;
+    }
+
     .direction-select select:focus{
       border-color:var(--accent);
       box-shadow: 0 0 0 2px rgba(82, 126, 114, 0.16);
     }
 
     .source-toggle select:focus{
+      border-color:var(--accent);
+      box-shadow: 0 0 0 2px rgba(82, 126, 114, 0.16);
+    }
+
+    .font-size-control input:focus{
       border-color:var(--accent);
       box-shadow: 0 0 0 2px rgba(82, 126, 114, 0.16);
     }
@@ -1343,7 +1899,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     #translation{
       min-height: 52px;
       font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
-      font-size: clamp(28px, 3.3vw, 42px);
+      font-size: var(--subtitle-top-font-size, clamp(28px, 3.3vw, 42px));
       font-weight: 750;
       color: #1f302b;
       letter-spacing: 0.02em;
@@ -1353,7 +1909,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     #text{
       min-height: 34px;
       font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-      font-size: clamp(16px, 2.25vw, 26px);
+      font-size: var(--subtitle-bottom-font-size, clamp(16px, 2.25vw, 26px));
       font-weight: 560;
       color: #526644;
       text-shadow: 0 1px 0 rgba(255, 255, 255, 0.78);
@@ -1386,13 +1942,19 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         flex: 1 0 100%;
       }
       .source-toggle,
-      .direction-select{
+      .direction-select,
+      .font-size-control,
+      .context-control{
         flex: 1 1 100%;
+        min-width: 0;
         justify-content: space-between;
       }
       .source-toggle select,
       .direction-select select{
         max-width: 62%;
+      }
+      .font-size-control input{
+        width: 72px;
       }
       .subtitle-stage{
         min-height: 0;
@@ -1403,10 +1965,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         line-height: 2.05;
       }
       #translation{
-        font-size: clamp(22px, 7vw, 32px);
+        font-size: var(--subtitle-top-font-size, clamp(22px, 7vw, 32px));
       }
       #text{
-        font-size: clamp(14px, 4.8vw, 20px);
+        font-size: var(--subtitle-bottom-font-size, clamp(14px, 4.8vw, 20px));
       }
       .control-reveal{
         top: 8px;
@@ -1449,6 +2011,24 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             <option value="en2zh">英文 -> 中文</option>
           </select>
         </label>
+        <label class="font-size-control" for="subtitleTopFontInput">
+          <span>上方字号</span>
+          <input id="subtitleTopFontInput" aria-label="上方字幕字号" type="number" min="18" max="72" step="1" inputmode="numeric" placeholder="自动" />
+        </label>
+        <label class="font-size-control" for="subtitleBottomFontInput">
+          <span>下方字号</span>
+          <input id="subtitleBottomFontInput" aria-label="下方字幕字号" type="number" min="12" max="56" step="1" inputmode="numeric" placeholder="自动" />
+        </label>
+        <label class="context-control" for="asrContextInput">
+          <span>专业术语 Context</span>
+          <textarea
+            id="asrContextInput"
+            rows="1"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="术语用逗号、空格或换行分隔"
+          ></textarea>
+        </label>
       </div>
 
       <div class="subtitle-stage">
@@ -1474,11 +2054,15 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const MAX_SEND_QUEUE_BYTES = 2 * 1024 * 1024;
   const WEBSOCKET_DRAIN_TIMEOUT_MS = 4000;
   const STOP_FINAL_TIMEOUT_MS = 120000;
-  const TAIL_STABILIZE_MS = 700;
   const MAX_SUBTITLE_HISTORY = 100;
   const MAX_VISIBLE_ROWS_ZH = 4;
   const MAX_VISIBLE_ROWS_EN = MAX_VISIBLE_ROWS_ZH + 2;
   const SUBTITLE_SCROLL_BOTTOM_EPSILON_PX = 24;
+  const SUBTITLE_TOP_FONT_KEY = "voxbridge_subtitle_top_font_px";
+  const SUBTITLE_BOTTOM_FONT_KEY = "voxbridge_subtitle_bottom_font_px";
+  const ASR_CONTEXT_MAX_TERMS = __ASR_CONTEXT_MAX_TERMS__;
+  const ASR_CONTEXT_MAX_CHARS = __ASR_CONTEXT_MAX_CHARS__;
+  const ASR_CONTEXT_STORAGE_KEY = "voxbridge_asr_context_terms";
   const USE_COMMITTED_SENTENCE_EVENTS = true;
   const SUBTITLE_TRACE_DEFAULT = __SUBTITLE_TRACE__;
   const SUBTITLE_TRACE_MAX_EVENTS = __SUBTITLE_TRACE_MAX_EVENTS__;
@@ -1499,6 +2083,9 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const inputSourceLabel = $("inputSourceLabel");
   const translationDirectionSelect = $("translationDirectionSelect");
   const translationDirectionLabel = $("translationDirectionLabel");
+  const subtitleTopFontInput = $("subtitleTopFontInput");
+  const subtitleBottomFontInput = $("subtitleBottomFontInput");
+  const asrContextInput = $("asrContextInput");
   const rawTextEl = $("rawText");
   const languageSelect = $("languageSelect");
   const toggleEchoCancellation = $("toggleEchoCancellation");
@@ -1530,12 +2117,14 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let pendingFinalResolve = null;
   let pendingFinalReject = null;
   let finalTimer = null;
+  let pendingStartResolve = null;
+  let pendingStartReject = null;
+  let pendingStartTimer = null;
   let watchdogTimer = null;
   let sessionStartedAt = 0;
   let lastCaptureAt = 0;
   let lastChunkSentAt = 0;
   let lastPartialAt = 0;
-  let tailStabilizeTimer = null;
   let controlAutoHideTimer = null;
   let subtitleTraceEnabled = false;
   let subtitleTraceSeq = 0;
@@ -1543,6 +2132,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let lastPartialTraceSeq = -1;
   let inputSource = "mic";
   let translationDirection = "zh2en";
+  let activeContextMetadata = null;
   const autoScrollRaf = new WeakMap();
   const scrollFollowState = {
     zh: { follow: true, autoScrolling: false },
@@ -1581,6 +2171,19 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       if (saved) initial = saved;
     } catch (err) {}
     applyTranslationDirection(initial, { silent: true });
+  })();
+
+  (() => {
+    applySubtitleFontSizes(readSubtitleFontConfig(), { persist: false, silent: true });
+  })();
+
+  (() => {
+    if (!asrContextInput) return;
+    try {
+      asrContextInput.value = String(localStorage.getItem(ASR_CONTEXT_STORAGE_KEY) || "");
+    } catch (err) {
+      asrContextInput.value = "";
+    }
   })();
 
   function traceSubtitle(event, payload = {}, force = false){
@@ -1651,45 +2254,65 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     scheduleControlBarAutoHide(6200);
   }
 
-  function clearTailStabilizeTimer(){
-    if (tailStabilizeTimer) {
-      clearTimeout(tailStabilizeTimer);
-      tailStabilizeTimer = null;
-    }
-  }
-
   function clearCommittedTentativeTailNow(){
-    clearTailStabilizeTimer();
     if (currentTextTail) {
       traceSubtitle("tail_cleared", { by: "clearCommittedTentativeTailNow", prevLen: currentTextTail.length });
     }
     currentTextTail = "";
   }
 
-  function updateCommittedTentativeTail(tailText){
+  function readBackendStability(msg){
+    const source = msg && typeof msg === "object" ? msg : {};
+    const meta = source.stability && typeof source.stability === "object" ? source.stability : {};
+    const metaStable = typeof meta.is_stable === "boolean" ? meta.is_stable : null;
+    const msgStable = typeof source.is_stable === "boolean" ? source.is_stable : null;
+    const hasSignal = metaStable !== null || msgStable !== null;
+    return {
+      hasSignal,
+      isStable: metaStable !== null ? metaStable : (msgStable === true),
+      phase: String(meta.phase || ""),
+      reason: String(meta.reason || ""),
+      unstableChars: Number(meta.unstable_chars || 0),
+    };
+  }
+
+  function updateCommittedTentativeTailFromBackend(tailText, stability){
     const nextTail = String(tailText || "").trim();
+    const signal = stability && typeof stability === "object" ? stability : { hasSignal: false, isStable: false, phase: "" };
     if (nextTail) {
-      clearTailStabilizeTimer();
       if (nextTail !== currentTextTail) {
-        traceSubtitle("tail_set", { by: "updateCommittedTentativeTail", nextLen: nextTail.length });
+        traceSubtitle("tail_set", {
+          by: "updateCommittedTentativeTailFromBackend",
+          nextLen: nextTail.length,
+          stable: !!signal.isStable,
+          phase: String(signal.phase || ""),
+        });
       }
       currentTextTail = nextTail;
       return;
     }
     if (!currentTextTail) {
-      clearTailStabilizeTimer();
       currentTextTail = "";
       return;
     }
-    if (tailStabilizeTimer) return;
-    tailStabilizeTimer = setTimeout(() => {
-      tailStabilizeTimer = null;
-      if (!currentTextTail) return;
-      traceSubtitle("tail_stabilize_expired", { prevLen: currentTextTail.length });
+
+    if (!signal.hasSignal || signal.isStable || signal.phase === "solidified" || signal.phase === "final") {
+      traceSubtitle("tail_cleared", {
+        by: "backend_stability",
+        prevLen: currentTextTail.length,
+        stable: !!signal.isStable,
+        phase: String(signal.phase || ""),
+        reason: String(signal.reason || ""),
+      });
       currentTextTail = "";
-      renderTranscript();
-      renderTranslation();
-    }, TAIL_STABILIZE_MS);
+      return;
+    }
+    traceSubtitle("tail_kept_unstable", {
+      prevLen: currentTextTail.length,
+      phase: String(signal.phase || ""),
+      reason: String(signal.reason || ""),
+      unstableChars: Number(signal.unstableChars || 0),
+    });
   }
 
   function isLocalhost(){
@@ -1709,6 +2332,19 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
+  function listeningStatus(sourceMode, started = activeContextMetadata){
+    let base = "Listening / 识别中";
+    if (sourceMode === "system") {
+      base = "Listening (system audio) / 识别中(系统声音)";
+    } else if (processor) {
+      base = "Listening (fallback) / 识别中(兼容模式)";
+    }
+    const contextSuffix = started && started.asr_context_active
+      ? ` · Context 已启用 · ${Number(started.asr_context_term_count || 0)} 个术语`
+      : "";
+    return base + contextSuffix;
+  }
+
   function normalizeTranslationDirection(raw){
     const text = String(raw || "").trim().toLowerCase();
     if (text === "en2zh" || text === "en->zh") return "en2zh";
@@ -1718,6 +2354,52 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   function normalizeInputSource(raw){
     const text = String(raw || "").trim().toLowerCase();
     return text === "system" ? "system" : "mic";
+  }
+
+  function parseAsrContextTerms(raw){
+    const terms = [];
+    const seen = new Set();
+    for (const part of String(raw || "").split(/[\s,，]+/u)) {
+      const term = String(part || "").trim();
+      if (!term) continue;
+      const key = term.toLocaleLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      terms.push(term);
+    }
+    return terms;
+  }
+
+  function asrContextTermHasSentencePunctuation(term){
+    const value = String(term || "");
+    if (/[。！？!?；;:：]/u.test(value)) return true;
+    if (!/\.["'”’)\]）】》]*$/u.test(value)) return false;
+    return !/^(?:[A-Z]\.){2,}$/u.test(value);
+  }
+
+  function readAsrContextTerms(){
+    const terms = parseAsrContextTerms(asrContextInput ? asrContextInput.value : "");
+    const invalidIndex = terms.findIndex(asrContextTermHasSentencePunctuation);
+    if (invalidIndex >= 0) {
+      throw new Error(`Context 第 ${invalidIndex + 1} 个术语包含句子标点`);
+    }
+    if (terms.length > ASR_CONTEXT_MAX_TERMS) {
+      throw new Error(`Context 最多允许 ${ASR_CONTEXT_MAX_TERMS} 个术语`);
+    }
+    const chars = terms.join(" ").length;
+    if (chars > ASR_CONTEXT_MAX_CHARS) {
+      throw new Error(`Context 最多允许 ${ASR_CONTEXT_MAX_CHARS} 个字符`);
+    }
+    return terms;
+  }
+
+  function persistAsrContextInput(){
+    if (!asrContextInput) return;
+    const raw = String(asrContextInput.value || "");
+    try {
+      if (raw.trim()) localStorage.setItem(ASR_CONTEXT_STORAGE_KEY, raw);
+      else localStorage.removeItem(ASR_CONTEXT_STORAGE_KEY);
+    } catch (err) {}
   }
 
   function selectedInputSource(){
@@ -1781,11 +2463,96 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
+  function normalizeSubtitleFontPx(raw, minPx, maxPx){
+    const text = String(raw == null ? "" : raw).trim();
+    if (!text) return "";
+    const value = Number(text);
+    if (!Number.isFinite(value)) return "";
+    return Math.max(Number(minPx || 12), Math.min(Number(maxPx || 72), Math.round(value)));
+  }
+
+  function readSubtitleFontConfig(){
+    let top = "";
+    let bottom = "";
+    try {
+      top = normalizeSubtitleFontPx(localStorage.getItem(SUBTITLE_TOP_FONT_KEY), 18, 72);
+      bottom = normalizeSubtitleFontPx(localStorage.getItem(SUBTITLE_BOTTOM_FONT_KEY), 12, 56);
+    } catch (err) {}
+    return { top, bottom };
+  }
+
+  function writeSubtitleFontConfig(config){
+    const next = config && typeof config === "object" ? config : {};
+    const top = normalizeSubtitleFontPx(next.top, 18, 72);
+    const bottom = normalizeSubtitleFontPx(next.bottom, 12, 56);
+    try {
+      if (top) localStorage.setItem(SUBTITLE_TOP_FONT_KEY, String(top));
+      else localStorage.removeItem(SUBTITLE_TOP_FONT_KEY);
+      if (bottom) localStorage.setItem(SUBTITLE_BOTTOM_FONT_KEY, String(bottom));
+      else localStorage.removeItem(SUBTITLE_BOTTOM_FONT_KEY);
+    } catch (err) {}
+    return { top, bottom };
+  }
+
+  function subtitleComputedFontPx(element){
+    if (!element || typeof getComputedStyle !== "function") return "";
+    const value = Number.parseFloat(getComputedStyle(element).fontSize || "");
+    if (!Number.isFinite(value)) return "";
+    return String(Math.round(value));
+  }
+
+  function syncSubtitleFontInputs(config){
+    const next = config && typeof config === "object" ? config : {};
+    if (subtitleTopFontInput) {
+      subtitleTopFontInput.value = next.top ? String(next.top) : "";
+      subtitleTopFontInput.placeholder = subtitleComputedFontPx(translationEl) || "自动";
+    }
+    if (subtitleBottomFontInput) {
+      subtitleBottomFontInput.value = next.bottom ? String(next.bottom) : "";
+      subtitleBottomFontInput.placeholder = subtitleComputedFontPx(textEl) || "自动";
+    }
+  }
+
+  function applySubtitleFontSizes(config, options = {}){
+    const next = config && typeof config === "object" ? config : {};
+    const top = normalizeSubtitleFontPx(next.top, 18, 72);
+    const bottom = normalizeSubtitleFontPx(next.bottom, 12, 56);
+    const rootStyle = document.documentElement.style;
+    if (top) rootStyle.setProperty("--subtitle-top-font-size", `${top}px`);
+    else rootStyle.removeProperty("--subtitle-top-font-size");
+    if (bottom) rootStyle.setProperty("--subtitle-bottom-font-size", `${bottom}px`);
+    else rootStyle.removeProperty("--subtitle-bottom-font-size");
+    const normalized = { top, bottom };
+    if (options && options.persist) {
+      writeSubtitleFontConfig(normalized);
+    }
+    syncSubtitleFontInputs(normalized);
+    if (!(options && options.silent)) {
+      traceSubtitle("subtitle_font_config_set", {
+        top: top || "auto",
+        bottom: bottom || "auto",
+        persist: !!(options && options.persist),
+      });
+    }
+    return normalized;
+  }
+
+  function applySubtitleFontInputs(){
+    applySubtitleFontSizes(
+      {
+        top: subtitleTopFontInput ? subtitleTopFontInput.value : "",
+        bottom: subtitleBottomFontInput ? subtitleBottomFontInput.value : "",
+      },
+      { persist: true }
+    );
+  }
+
   function lockUI(active){
     btnStart.disabled = active;
     btnStop.disabled = !active;
     if (inputSourceSelect) inputSourceSelect.disabled = active;
     if (translationDirectionSelect) translationDirectionSelect.disabled = active;
+    if (asrContextInput) asrContextInput.disabled = active;
   }
 
   function lockUIFinishing(){
@@ -1793,6 +2560,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     btnStop.disabled = true;
     if (inputSourceSelect) inputSourceSelect.disabled = true;
     if (translationDirectionSelect) translationDirectionSelect.disabled = true;
+    if (asrContextInput) asrContextInput.disabled = true;
   }
 
   function laneForContainer(container){
@@ -2200,6 +2968,38 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     return nextNodes;
   }
 
+  function clearPendingStartTimer(){
+    if (pendingStartTimer !== null) clearTimeout(pendingStartTimer);
+    pendingStartTimer = null;
+  }
+
+  function resolvePendingStart(msg){
+    const resolve = pendingStartResolve;
+    pendingStartResolve = null;
+    pendingStartReject = null;
+    clearPendingStartTimer();
+    if (resolve) resolve(msg);
+  }
+
+  function rejectPendingStart(err){
+    const reject = pendingStartReject;
+    pendingStartResolve = null;
+    pendingStartReject = null;
+    clearPendingStartTimer();
+    if (reject) reject(err instanceof Error ? err : new Error(String(err)));
+  }
+
+  function waitForStarted(timeoutMs = 10000){
+    if (pendingStartResolve) throw new Error("start already pending");
+    return new Promise((resolve, reject) => {
+      pendingStartResolve = resolve;
+      pendingStartReject = reject;
+      pendingStartTimer = setTimeout(() => {
+        rejectPendingStart(new Error("start acknowledgement timeout"));
+      }, Math.max(1000, Number(timeoutMs) || 10000));
+    });
+  }
+
   function resetFinalWait(){
     if (finalTimer) {
       clearTimeout(finalTimer);
@@ -2249,9 +3049,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       committedCount: subtitleSentencePairs.length,
       tailLen: String(currentTextTail || "").length,
     });
-    clearTailStabilizeTimer();
+    rejectPendingStart(new Error("session reset"));
     running = false;
     awaitingFinal = false;
+    activeContextMetadata = null;
     resetFinalWait();
     sendQueue = [];
     queuedBytes = 0;
@@ -2642,12 +3443,21 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     if (msg.type === "started") {
+      activeContextMetadata = {
+        asr_context_active: !!msg.asr_context_active,
+        asr_context_term_count: Number(msg.asr_context_term_count || 0),
+        asr_context_chars: Number(msg.asr_context_chars || 0),
+      };
+      resolvePendingStart(msg);
       if (msg.translation_direction) {
         applyTranslationDirection(msg.translation_direction);
       }
       traceSubtitle("ws_started", {
         language: String(msg.language || ""),
         translationDirection: String(msg.translation_direction || selectedTranslationDirection()),
+        contextActive: !!msg.asr_context_active,
+        contextTermCount: Number(msg.asr_context_term_count || 0),
+        contextChars: Number(msg.asr_context_chars || 0),
       });
       if (msg.language) {
         if (langEl) langEl.textContent = msg.language;
@@ -2763,21 +3573,24 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           committedText,
           msg.tentative_text || ""
         );
+        const stability = readBackendStability(msg);
         if (lastPartialSeq <= 5 || (lastPartialSeq % 20 === 0 && lastPartialTraceSeq !== lastPartialSeq)) {
           traceSubtitle("ws_partial", {
             seq: lastPartialSeq,
             textLen: nextText.trim().length,
             tailLen: tentativeTail.length,
             committedCount: subtitleSentencePairs.length,
+            stable: !!stability.isStable,
+            stabilityPhase: String(stability.phase || ""),
           });
           lastPartialTraceSeq = lastPartialSeq;
         }
-        updateCommittedTentativeTail(tentativeTail);
+        updateCommittedTentativeTailFromBackend(tentativeTail, stability);
         currentTranslationTail = "";
         renderTranscript();
         renderTranslation();
         if (running) {
-          setStatus("Listening / 识别中", "ok");
+          setStatus(listeningStatus(selectedInputSource()), "ok");
           pump();
         }
         return;
@@ -2799,9 +3612,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       const resolve = pendingFinalResolve;
       resetFinalWait();
 
-      clearTailStabilizeTimer();
       setCurrentSegmentText("");
-      currentTextTail = String(msg.tentative_text || "").trim();
+      updateCommittedTentativeTailFromBackend(String(msg.tentative_text || "").trim(), readBackendStability(msg));
       currentTranslationTail = "";
       renderTranscript();
       renderTranslation();
@@ -2820,6 +3632,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     if (msg.type === "error") {
+      rejectPendingStart(new Error(msg.message || "websocket server error"));
       rejectPendingFinal(new Error(msg.message || "websocket server error"));
       resetSessionFlags();
       stopPipeline();
@@ -2863,14 +3676,18 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       };
       sock.onerror = () => {
         if (sock !== ws) return;
-        finish(reject, new Error("websocket failed"));
+        const err = new Error("websocket failed");
+        rejectPendingStart(err);
+        finish(reject, err);
       };
       sock.onclose = (evt) => {
         if (sock !== ws) return;
+        const err = new Error(`websocket closed (${evt.code})`);
+        rejectPendingStart(err);
         if (!done) {
-          finish(reject, new Error(`websocket closed (${evt.code})`));
+          finish(reject, err);
         }
-        rejectPendingFinal(new Error(`websocket closed (${evt.code})`));
+        rejectPendingFinal(err);
         if (running) {
           resetSessionFlags();
           stopPipeline();
@@ -2921,6 +3738,21 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     });
   }
 
+  if (subtitleTopFontInput) {
+    subtitleTopFontInput.addEventListener("input", applySubtitleFontInputs);
+    subtitleTopFontInput.addEventListener("change", applySubtitleFontInputs);
+  }
+
+  if (subtitleBottomFontInput) {
+    subtitleBottomFontInput.addEventListener("input", applySubtitleFontInputs);
+    subtitleBottomFontInput.addEventListener("change", applySubtitleFontInputs);
+  }
+
+  if (asrContextInput) {
+    asrContextInput.addEventListener("input", persistAsrContextInput);
+    asrContextInput.addEventListener("change", persistAsrContextInput);
+  }
+
   bindSubtitleScrollTracking(textEl);
   bindSubtitleScrollTracking(translationEl);
 
@@ -2962,6 +3794,15 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
   btnStart.onclick = async () => {
     if (running || awaitingFinal) return;
+    let asrContextTerms = [];
+    try {
+      asrContextTerms = readAsrContextTerms();
+    } catch (err) {
+      setControlBarHidden(false, "start_failed");
+      lockUI(false);
+      setStatus("Start failed / 启动失败: " + describeStartError(err), "err");
+      return;
+    }
     subtitleSentencePairs = [];
     setCurrentSegmentText("");
     resetSubtitleAutoFollow();
@@ -2990,33 +3831,34 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       if (sourceMode === "system") {
         setStatus("Share full screen + system audio / 请选择整屏共享并勾选系统音频", "warn");
       }
+      // Request media inside the click activation; no samples are read or sent until started.
       mediaStream = sourceMode === "system" ? await openSystemAudio() : await openMicrophone();
       await openSocket();
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: "start",
-            language: selectedAsrLanguage(),
-            translation_direction: selectedTranslationDirection(),
-          })
-        );
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        throw new Error("websocket is not open");
       }
+      const startedPromise = waitForStarted(10000);
+      ws.send(
+        JSON.stringify({
+          type: "start",
+          language: selectedAsrLanguage(),
+          translation_direction: selectedTranslationDirection(),
+          asr_context_terms: asrContextTerms,
+        })
+      );
+      const started = await startedPromise;
 
       await buildCaptureGraph();
 
       running = true;
       sessionStartedAt = Date.now();
       startWatchdog();
-      if (!processor) {
-        if (sourceMode === "system") {
-          setStatus("Listening (system audio) / 识别中(系统声音)", "ok");
-        } else {
-          setStatus("Listening / 识别中", "ok");
-        }
-      }
+      setStatus(listeningStatus(sourceMode, started), "ok");
       setControlBarHidden(true, "start_success");
     } catch (err) {
       console.error(err);
+      rejectPendingStart(err);
+      activeContextMetadata = null;
       await stopPipeline();
       if (ws) {
         try { ws.close(); } catch (closeErr) {}
@@ -3190,6 +4032,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           throw new Error("empty pcm payload");
         }
 
+        const asrContextTerms = readAsrContextTerms();
         const language = String(cfg.language || selectedAsrLanguage() || "auto");
         const timeoutMs = Math.max(5000, Number(cfg.timeoutMs || 120000));
         const paceMs = Math.max(0, Number(cfg.paceMs || 0));
@@ -3213,6 +4056,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
         const events = [];
         let ready = false;
+        let startAccepted = false;
+        let startedMetadata = null;
         let finished = false;
         let errorMessage = "";
 
@@ -3221,6 +4066,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             const msg = JSON.parse(evt.data);
             events.push(msg);
             if (msg.type === "ready") ready = true;
+            if (msg.type === "started") {
+              startAccepted = true;
+              startedMetadata = msg;
+            }
             if (msg.type === "error") {
               errorMessage = String(msg.message || "websocket server error");
               finished = true;
@@ -3254,8 +4103,16 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             type: "start",
             language,
             translation_direction: selectedTranslationDirection(),
+            asr_context_terms: asrContextTerms,
           })
         );
+        const startOk = await _waitUntil(
+          () => startAccepted || !!errorMessage,
+          timeoutMs,
+        );
+        if (!startOk || errorMessage) {
+          throw new Error(errorMessage || "start acknowledgement timeout");
+        }
         for (let i = 0; i < bytes.length; i += chunkBytes) {
           if (sock.readyState !== WebSocket.OPEN) {
             errorMessage = errorMessage || "websocket closed during stream";
@@ -3315,6 +4172,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           ok: !errorMessage,
           error: String(errorMessage || ""),
           eventCounts,
+          started: startedMetadata ? {
+            asr_context_active: !!startedMetadata.asr_context_active,
+            asr_context_term_count: Number(startedMetadata.asr_context_term_count || 0),
+            asr_context_chars: Number(startedMetadata.asr_context_chars || 0),
+          } : null,
           committedTexts,
           committedJoined: committedTexts.join(" ").trim(),
           finalText,
@@ -3326,6 +4188,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         return {
           running,
           controlsHidden: !!(appCard && appCard.classList.contains("controls-hidden")),
+          subtitleTopFontPx: subtitleComputedFontPx(translationEl),
+          subtitleBottomFontPx: subtitleComputedFontPx(textEl),
           subtitleTraceEnabled,
           subtitleTraceCount: subtitleTraceEvents.length,
           currentTextTail: String(currentTextTail || ""),
@@ -3352,6 +4216,94 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
 })();
 </script>
+</body>
+</html>
+"""
+
+
+LOGIN_HTML_TEMPLATE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VoxBridge 登录</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg:#eef4ec;
+      --panel:#fbfdf8;
+      --text:#233026;
+      --muted:#667263;
+      --accent:#476a46;
+      --danger:#9f3328;
+      --line:#d7dfd3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 20% 15%, rgba(255,255,255,.75), transparent 34rem),
+        linear-gradient(135deg, #eef4ec, #f6f0e6);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(92vw, 420px);
+      padding: 32px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(251, 253, 248, .9);
+      box-shadow: 0 24px 72px rgba(46, 55, 43, .16);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: .02em; }
+    p { margin: 0 0 24px; color: var(--muted); line-height: 1.6; }
+    label { display: block; margin: 14px 0 6px; font-weight: 700; }
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      color: var(--text);
+      font-size: 16px;
+    }
+    button {
+      width: 100%;
+      margin-top: 22px;
+      padding: 13px 16px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 16px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .error {
+      margin: 0 0 18px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(159, 51, 40, .1);
+      color: var(--danger);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>VoxBridge</h1>
+    <p>请输入访问凭据后继续使用语音识别与翻译。</p>
+    __MESSAGE__
+    <form method="post" action="/login" autocomplete="on">
+      <label for="username">用户名</label>
+      <input id="username" name="username" type="text" autocomplete="username" required autofocus />
+      <label for="password">密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">登录</button>
+    </form>
+  </main>
 </body>
 </html>
 """
@@ -3385,6 +4337,68 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
     infer_lock = asyncio.Lock()
     runtime = SimpleNamespace(active_connections=0)
     debug_roots = [Path.cwd().resolve(), Path("/tmp").resolve()]
+    auth = _build_auth_config(args)
+    asr_context_schedule = _load_asr_context_schedule(args)
+    asr_context_max_terms = max(0, int(getattr(args, "asr_context_max_terms", 24)))
+    asr_context_max_chars = max(0, int(getattr(args, "asr_context_max_chars", 160)))
+    asr_context_lookaround_sec = max(0.0, float(getattr(args, "asr_context_lookaround_sec", 30.0)))
+    asr_context_apply_mode = _normalize_asr_context_apply_mode(
+        getattr(args, "asr_context_apply_mode", "segment_final")
+    )
+    auth_sessions: Dict[str, float] = {}
+
+    def _render_login_html(error: bool = False) -> str:
+        message = '<div class="error">用户名或密码错误。</div>' if error else ""
+        return LOGIN_HTML_TEMPLATE.replace("__MESSAGE__", message)
+
+    def _prune_auth_sessions(now: Optional[float] = None) -> None:
+        current = time.time() if now is None else float(now)
+        expired = [token for token, expires_at in auth_sessions.items() if expires_at <= current]
+        for token in expired:
+            auth_sessions.pop(token, None)
+
+    def _new_auth_session() -> str:
+        _prune_auth_sessions()
+        token = secrets.token_urlsafe(AUTH_SESSION_TOKEN_BYTES)
+        auth_sessions[token] = time.time() + float(auth.session_ttl_sec)
+        return token
+
+    def _drop_auth_session(token: Optional[str]) -> None:
+        if token:
+            auth_sessions.pop(str(token), None)
+
+    def _is_valid_auth_session(token: Optional[str]) -> bool:
+        if not auth.enabled:
+            return True
+        token_text = str(token or "")
+        if not token_text:
+            return False
+        _prune_auth_sessions()
+        expires_at = auth_sessions.get(token_text)
+        if expires_at is None or expires_at <= time.time():
+            auth_sessions.pop(token_text, None)
+            return False
+        return True
+
+    def _request_is_authenticated(request: Request) -> bool:
+        return _is_valid_auth_session(request.cookies.get(AUTH_COOKIE_NAME))
+
+    def _websocket_is_authenticated(websocket: WebSocket) -> bool:
+        return _is_valid_auth_session(websocket.cookies.get(AUTH_COOKIE_NAME))
+
+    def _set_auth_cookie(response: RedirectResponse, token: str) -> None:
+        response.set_cookie(
+            AUTH_COOKIE_NAME,
+            token,
+            max_age=int(auth.session_ttl_sec),
+            httponly=True,
+            secure=bool(auth.cookie_secure),
+            samesite="lax",
+            path="/",
+        )
+
+    def _clear_auth_cookie(response: RedirectResponse) -> None:
+        response.delete_cookie(AUTH_COOKIE_NAME, path="/")
 
     def _normalize_force_language(raw: Any) -> Optional[str]:
         if raw is None:
@@ -3396,34 +4410,126 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             return None
         return text
 
-    def _new_vllm_state(force_language: Optional[str]):
+    def _context_terms_for(
+        force_language: Optional[str],
+        elapsed_sec: float,
+        session_context_terms: Optional[Tuple[str, ...]],
+    ) -> Tuple[str, ...]:
+        if session_context_terms is not None:
+            return tuple(session_context_terms)
+        if asr_context_schedule is None:
+            return ()
+        return asr_context_schedule.terms_at(
+            elapsed_sec,
+            language=force_language,
+            lookaround_sec=asr_context_lookaround_sec,
+            max_terms=asr_context_max_terms,
+            max_chars=asr_context_max_chars,
+        )
+
+    def _context_for(
+        force_language: Optional[str],
+        elapsed_sec: float,
+        session_context_terms: Optional[Tuple[str, ...]],
+    ) -> str:
+        return " ".join(
+            _context_terms_for(force_language, elapsed_sec, session_context_terms)
+        )
+
+    def _new_vllm_state(
+        force_language: Optional[str],
+        elapsed_sec: float = 0.0,
+        session_context_terms: Optional[Tuple[str, ...]] = None,
+    ):
+        selected_context = _context_for(
+            force_language,
+            elapsed_sec,
+            session_context_terms,
+        )
+        streaming_context = selected_context if asr_context_apply_mode == "streaming" else ""
         kwargs = dict(
+            context=streaming_context,
             unfixed_chunk_num=args.unfixed_chunk_num,
             unfixed_token_num=args.unfixed_token_num,
             chunk_size_sec=args.chunk_size_sec,
         )
         if force_language is not None:
             kwargs["language"] = force_language
-        return asr.init_streaming_state(**kwargs)
+        streaming_state = asr.init_streaming_state(**kwargs)
+        setattr(
+            streaming_state,
+            "_voxbridge_final_context",
+            selected_context if asr_context_apply_mode == "segment_final" else "",
+        )
+        setattr(streaming_state, "_voxbridge_context_elapsed_sec", float(elapsed_sec))
+        return streaming_state
 
-    def _new_transformers_state(force_language: Optional[str]):
+    def _new_transformers_state(
+        force_language: Optional[str],
+        elapsed_sec: float = 0.0,
+        session_context_terms: Optional[Tuple[str, ...]] = None,
+    ):
+        selected_context = _context_for(
+            force_language,
+            elapsed_sec,
+            session_context_terms,
+        )
         return SimpleNamespace(
             audio_accum=np.zeros((0,), dtype=np.float32),
             language="",
             text="",
             force_language=force_language,
+            streaming_context=(
+                selected_context if asr_context_apply_mode == "streaming" else ""
+            ),
+            final_context=selected_context,
             min_decode_samples=max(1, int(round(float(args.min_audio_sec) * SAMPLE_RATE))),
             decode_interval_samples=max(1, int(round(float(args.decode_interval_sec) * SAMPLE_RATE))),
             last_decoded_samples=0,
         )
 
+    @app.get("/login")
+    async def login_page(request: Request):
+        if not auth.enabled:
+            return RedirectResponse("/", status_code=303)
+        if _request_is_authenticated(request):
+            return RedirectResponse("/", status_code=303)
+        return HTMLResponse(_render_login_html())
+
+    @app.post("/login")
+    async def login_submit(request: Request):
+        if not auth.enabled:
+            return RedirectResponse("/", status_code=303)
+        body = (await request.body()).decode("utf-8", errors="replace")
+        form = urllib.parse.parse_qs(body, keep_blank_values=True)
+        username = str((form.get("username") or [""])[0] or "")
+        password = str((form.get("password") or [""])[0] or "")
+        username_ok = hmac.compare_digest(username, str(auth.username))
+        password_ok = _verify_auth_password(password, str(auth.password_hash))
+        if not (username_ok and password_ok):
+            return HTMLResponse(_render_login_html(error=True), status_code=401)
+        response = RedirectResponse("/", status_code=303)
+        _set_auth_cookie(response, _new_auth_session())
+        return response
+
+    @app.post("/logout")
+    async def logout(request: Request):
+        _drop_auth_session(request.cookies.get(AUTH_COOKIE_NAME))
+        response = RedirectResponse("/login", status_code=303)
+        _clear_auth_cookie(response)
+        return response
+
     @app.get("/")
-    async def index() -> HTMLResponse:
+    async def index(request: Request):
+        if not _request_is_authenticated(request):
+            return RedirectResponse("/login", status_code=303)
         subtitle_trace = bool(getattr(args, "subtitle_trace", False))
         subtitle_trace_max_events = max(200, int(getattr(args, "subtitle_trace_max_events", 1200)))
         html = INDEX_HTML_TEMPLATE.replace("__CHUNK_MS__", str(int(args.client_chunk_ms)))
         html = html.replace("__SUBTITLE_TRACE__", "true" if subtitle_trace else "false")
         html = html.replace("__SUBTITLE_TRACE_MAX_EVENTS__", str(subtitle_trace_max_events))
+        html = html.replace("__ASR_CONTEXT_MAX_TERMS__", str(asr_context_max_terms))
+        html = html.replace("__ASR_CONTEXT_MAX_CHARS__", str(asr_context_max_chars))
         return HTMLResponse(html)
 
     def _resolve_debug_file(path_text: str) -> Path:
@@ -3443,12 +4549,22 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         raise HTTPException(status_code=403, detail="path out of debug roots")
 
     @app.get("/__debug/file")
-    async def debug_file(path: str) -> FileResponse:
+    async def debug_file(request: Request, path: str) -> FileResponse:
+        if auth.disable_debug_file:
+            raise HTTPException(status_code=404, detail="debug file endpoint disabled")
+        if not _request_is_authenticated(request):
+            raise HTTPException(status_code=401, detail="unauthorized")
         fp = _resolve_debug_file(path)
         return FileResponse(str(fp), media_type="application/octet-stream", filename=fp.name)
 
     @app.websocket("/ws")
     async def ws_stream(websocket: WebSocket) -> None:
+        if not _websocket_is_authenticated(websocket):
+            await websocket.accept()
+            await websocket.send_json({"type": "error", "message": "unauthorized"})
+            await websocket.close(code=1008)
+            return
+
         if runtime.active_connections >= args.max_connections:
             await websocket.accept()
             await websocket.send_json({"type": "error", "message": "too many active connections"})
@@ -3461,6 +4577,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
 
         use_vllm_streaming = getattr(args, "backend", "vllm") == "vllm"
         session_force_language = _normalize_force_language(getattr(args, "force_language", None))
+        session_context_terms: Optional[Tuple[str, ...]] = None
         state = None
         state_generation = 0
         seq = 0
@@ -3487,14 +4604,36 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         total_consumed_samples = 0
         last_partial_emit_at = time.monotonic()
         queue_samples = 0
+        audio_spill_generation: Optional[int] = None
+        audio_spill_parts: List[np.ndarray] = []
+        audio_spill_samples = 0
         full_audio_parts: List[np.ndarray] = []
         full_audio_samples = 0
         full_audio_overflow = False
+        segment_final_context_applied = False
         send_lock = asyncio.Lock()
         state_lock = asyncio.Lock()
         stop_consumer = asyncio.Event()
         consumer_task: Optional[asyncio.Task] = None
         idle_commit_sec = max(3.0, float(getattr(args, "vad_force_cut_sec", 1.8)) + 2.7)
+        early_translation_stable_sec = max(0.0, float(getattr(args, "early_translation_stable_sec", 0.8)))
+        early_translation_stable_hits = max(1, int(getattr(args, "early_translation_stable_hits", 3)))
+        early_translation_short_stable_sec = max(
+            0.0,
+            float(getattr(args, "early_translation_short_stable_sec", 1.2)),
+        )
+        early_translation_short_stable_hits = max(
+            1,
+            int(getattr(args, "early_translation_short_stable_hits", 4)),
+        )
+        early_translation_min_english_words = max(
+            1,
+            int(getattr(args, "early_translation_min_english_words", 6)),
+        )
+        early_translation_min_english_chars = max(
+            1,
+            int(getattr(args, "early_translation_min_english_chars", 32)),
+        )
         last_text_snapshot = ""
         last_text_advance_at = time.monotonic()
         last_idle_commit_at = 0.0
@@ -3575,6 +4714,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             final_msgs=0,
             queue_dropped=0,
             queue_depth_peak=0,
+            queue_spill_flushes=0,
+            queue_spill_samples_peak=0,
             last_error="",
             silent_decode_skipped=0,
         )
@@ -3584,17 +4725,27 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             committed_sentences=[],
             sentence_items=[],
             commit_base=0,
+            processed_completed_count=0,
+            candidate_sentence_ids=[],
+            candidate_texts=[],
+            deferred_sentence_upgrades={},
             prev_completed_sentences=[],
             tentative_tail="",
             pending_prefix_text="",
             pending_prefix_segment_id=0,
             pending_prefix_reason="",
             pending_prefix_miss_count=0,
+            pending_prefix_terminal_text="",
+            pending_prefix_is_separate=False,
             boundary_anchor_text="",
             boundary_anchor_segment_id=0,
             boundary_overlap_cap_chars=max(4, min(24, int(round(segment_overlap_sec * 14.0)))),
             duplicate_filter_pause_until=0.0,
             duplicate_filter_pause_reason="",
+            early_holdback_text="",
+            early_holdback_since=0.0,
+            early_holdback_first_seen_ms=0,
+            early_holdback_hits=0,
         )
         stream_text_state = SimpleNamespace(
             last_text="",
@@ -3603,6 +4754,59 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             reset_candidate_hits=0,
             reset_candidate_since=0.0,
         )
+
+        def _reset_early_translation_holdback_state() -> None:
+            subtitle_state.early_holdback_text = ""
+            subtitle_state.early_holdback_since = 0.0
+            subtitle_state.early_holdback_first_seen_ms = 0
+            subtitle_state.early_holdback_hits = 0
+
+        def _clear_pending_prefix_boundary_evidence() -> None:
+            subtitle_state.pending_prefix_terminal_text = ""
+            subtitle_state.pending_prefix_is_separate = False
+
+        def _reset_completed_candidate_cursor() -> None:
+            subtitle_state.processed_completed_count = 0
+            subtitle_state.candidate_sentence_ids = []
+            subtitle_state.candidate_texts = []
+            subtitle_state.deferred_sentence_upgrades.clear()
+
+        def _record_completed_candidate(index: int, text: str, sentence_id: str = "") -> None:
+            idx = max(0, int(index))
+            while len(subtitle_state.candidate_sentence_ids) <= idx:
+                subtitle_state.candidate_sentence_ids.append("")
+                subtitle_state.candidate_texts.append("")
+            subtitle_state.candidate_sentence_ids[idx] = str(sentence_id or "")
+            subtitle_state.candidate_texts[idx] = str(text or "").strip()
+            subtitle_state.processed_completed_count = max(
+                int(getattr(subtitle_state, "processed_completed_count", 0) or 0),
+                idx + 1,
+            )
+
+        def _find_sentence_item_index(sentence_id: str) -> Optional[int]:
+            sid = str(sentence_id or "")
+            if not sid:
+                return None
+            for item_idx, item in enumerate(subtitle_state.sentence_items):
+                if str(item.get("id", "") or "") == sid:
+                    return int(item_idx)
+            return None
+
+        def _stabilize_completed_prefix_with_cursor(completed: List[str]) -> Tuple[List[str], int]:
+            merged = [str(seg or "").strip() for seg in list(completed or [])]
+            expected = int(getattr(subtitle_state, "processed_completed_count", 0) or 0)
+            candidate_texts = list(getattr(subtitle_state, "candidate_texts", []) or [])
+            if expected <= len(merged):
+                return merged, 0
+            backfilled = 0
+            for idx in range(len(merged), min(expected, len(candidate_texts))):
+                text = str(candidate_texts[idx] or "").strip()
+                if not text:
+                    break
+                merged.append(text)
+                backfilled += 1
+            return merged, int(backfilled)
+
         alignment_runtime = SimpleNamespace(
             model_seen={},
             committed_seen={},
@@ -3652,9 +4856,21 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             direction=initial_translation_direction,
             source_language=initial_translation_source,
             target_language=initial_translation_target,
+            latest_by_sentence={},
         )
         subtitle_trace_log = bool(getattr(args, "subtitle_trace_log", False))
         subtitle_trace_log_partial_every = max(1, int(getattr(args, "subtitle_trace_log_partial_every", 20)))
+        subtitle_trace_log_file = str(getattr(args, "subtitle_trace_log_file", "") or "").strip()
+        trace_file_handle = None
+        if subtitle_trace_log and subtitle_trace_log_file:
+            try:
+                trace_log_path = Path(subtitle_trace_log_file).expanduser()
+                trace_log_path.parent.mkdir(parents=True, exist_ok=True)
+                trace_file_handle = trace_log_path.open("a", encoding="utf-8", buffering=1)
+                logger.info("subtitle trace file enabled peer=%s path=%s", peer, trace_log_path)
+            except Exception as exc:
+                logger.warning("subtitle trace file disabled peer=%s path=%s error=%s", peer, subtitle_trace_log_file, exc)
+                trace_file_handle = None
         trace_seq = 0
         trace_t0 = time.monotonic()
         logger.info(
@@ -3665,6 +4881,14 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             session_force_language or "",
             translation_runtime.direction,
         )
+
+        def _write_trace_file_row(row: Dict[str, Any]) -> None:
+            if trace_file_handle is None:
+                return
+            try:
+                trace_file_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            except Exception:
+                pass
 
         def _trace_event(event: str, **payload: Any) -> None:
             nonlocal trace_seq
@@ -3686,10 +4910,193 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             }
             if payload:
                 row.update(payload)
+            _write_trace_file_row(row)
             try:
                 logger.info("subtitle_trace %s", json.dumps(row, ensure_ascii=False, separators=(",", ":")))
             except Exception:
                 logger.info("subtitle_trace %s", row)
+
+        def _reset_deferred_sentence_upgrade(
+            sentence_id: str,
+            *,
+            seq_no: int,
+            reason: str,
+            replacement_text: str = "",
+        ) -> None:
+            sid = str(sentence_id or "")
+            previous = subtitle_state.deferred_sentence_upgrades.pop(sid, None)
+            if previous is None:
+                return
+            _trace_event(
+                "sentence_upgrade_candidate_reset",
+                seq=int(seq_no),
+                sentence_id=sid,
+                reason=str(reason or ""),
+                candidate_hash8=_hash8(previous.text),
+                candidate_chars=len(previous.text),
+                replacement_hash8=_hash8(replacement_text),
+                replacement_chars=len(str(replacement_text or "").strip()),
+            )
+
+        def _trace_asr_context(
+            force_language: Optional[str],
+            elapsed_sec: float,
+            context_terms: Optional[Tuple[str, ...]],
+        ) -> None:
+            selected_terms = _context_terms_for(
+                force_language,
+                elapsed_sec,
+                context_terms,
+            )
+            context = " ".join(selected_terms)
+            _trace_event(
+                "asr_context_selected",
+                audio_elapsed_ms=int(max(0.0, float(elapsed_sec)) * 1000.0),
+                language=str(force_language or "auto"),
+                apply_mode=str(asr_context_apply_mode),
+                context_source="session" if context_terms is not None else "schedule",
+                context_active=bool(selected_terms),
+                streaming_context=bool(context and asr_context_apply_mode == "streaming"),
+                term_count=len(selected_terms),
+                context_chars=len(context),
+                context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+            )
+
+        def _guard_streaming_context_output(local_state: Any, *, reason: str) -> int:
+            if asr_context_apply_mode != "streaming":
+                return 0
+            context = str(getattr(local_state, "context", "") or "")
+            current_text = str(getattr(local_state, "text", "") or "").strip()
+            previous_text = str(
+                getattr(local_state, "_voxbridge_context_guard_text", "") or ""
+            ).strip()
+            filtered_text, removed = _filter_asr_context_echo_sentences(
+                context,
+                current_text,
+                previous_text=previous_text,
+            )
+            if removed <= 0:
+                local_state._voxbridge_context_guard_text = current_text
+                return 0
+            local_state.text = filtered_text
+            local_state._voxbridge_context_guard_text = filtered_text
+            if getattr(local_state, "force_language", None) is not None and hasattr(local_state, "_raw_decoded"):
+                local_state._raw_decoded = filtered_text
+            _trace_event(
+                "asr_context_streaming_echo_filtered",
+                reason=str(reason or ""),
+                removed_sentences=int(removed),
+                previous_text_chars=len(current_text),
+                filtered_text_chars=len(filtered_text),
+                context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+            )
+            return int(removed)
+
+        async def _apply_segment_final_context(local_state: Any, *, reason: str) -> bool:
+            context = str(getattr(local_state, "_voxbridge_final_context", "") or "")
+            if asr_context_apply_mode != "segment_final" or not context:
+                return False
+
+            segment_wav = np.asarray(
+                getattr(local_state, "audio_accum", np.zeros((0,), dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)
+            if int(segment_wav.size) <= 0:
+                _trace_event(
+                    "asr_context_final_redecode_skipped",
+                    reason="empty_audio",
+                    cut_reason=str(reason or ""),
+                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                )
+                return False
+
+            previous_text = str(getattr(local_state, "text", "") or "").strip()
+            saved_max_tokens = None
+            sampling_params = getattr(asr, "sampling_params", None)
+            override_max_tokens = int(max(1, int(getattr(args, "final_redecode_max_new_tokens", 512))))
+            try:
+                if sampling_params is not None and hasattr(sampling_params, "max_tokens"):
+                    try:
+                        saved_max_tokens = int(getattr(sampling_params, "max_tokens"))
+                    except Exception:
+                        saved_max_tokens = None
+                    if saved_max_tokens is None or saved_max_tokens < override_max_tokens:
+                        setattr(sampling_params, "max_tokens", override_max_tokens)
+
+                segment_out = await _await_thread_completion_on_cancel(
+                    lambda: asr.transcribe(
+                        audio=[(segment_wav.copy(), SAMPLE_RATE)],
+                        context=context,
+                        language=(getattr(local_state, "force_language", None) or session_force_language),
+                    )[0]
+                )
+                corrected_text = str(getattr(segment_out, "text", "") or "").strip()
+                if not corrected_text:
+                    _trace_event(
+                        "asr_context_final_redecode_skipped",
+                        reason="empty_result",
+                        cut_reason=str(reason or ""),
+                        audio_samples=int(segment_wav.size),
+                        context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    )
+                    return False
+                if _compact_asr_compare_text(corrected_text) == _compact_asr_compare_text(
+                    previous_text
+                ):
+                    _trace_event(
+                        "asr_context_final_redecode_skipped",
+                        reason="unchanged_result",
+                        cut_reason=str(reason or ""),
+                        audio_samples=int(segment_wav.size),
+                        corrected_text_chars=len(corrected_text),
+                        context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    )
+                    return False
+                if _looks_like_asr_context_echo(
+                    context,
+                    corrected_text,
+                    previous_text=previous_text,
+                ):
+                    _trace_event(
+                        "asr_context_final_redecode_skipped",
+                        reason="context_echo",
+                        cut_reason=str(reason or ""),
+                        audio_samples=int(segment_wav.size),
+                        corrected_text_chars=len(corrected_text),
+                        context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    )
+                    return False
+
+                local_state.language = (
+                    getattr(segment_out, "language", "")
+                    or getattr(local_state, "language", "")
+                    or ""
+                )
+                local_state.text = corrected_text
+                _trace_event(
+                    "asr_context_final_redecode_done",
+                    reason=str(reason or ""),
+                    audio_samples=int(segment_wav.size),
+                    audio_ms=int(round(int(segment_wav.size) * 1000.0 / SAMPLE_RATE)),
+                    previous_text_chars=len(previous_text),
+                    corrected_text_chars=len(corrected_text),
+                    text_changed=bool(corrected_text != previous_text),
+                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                )
+                return True
+            except Exception as exc:
+                _trace_event(
+                    "asr_context_final_redecode_failed",
+                    reason=str(reason or ""),
+                    audio_samples=int(segment_wav.size),
+                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    **_safe_exception_trace_fields(exc),
+                )
+                return False
+            finally:
+                if saved_max_tokens is not None:
+                    with suppress(Exception):
+                        setattr(asr.sampling_params, "max_tokens", saved_max_tokens)
 
         def _hash8(text: str) -> str:
             src = str(text or "").encode("utf-8", errors="ignore")
@@ -3727,6 +5134,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             }
             if payload:
                 row.update(payload)
+            _write_trace_file_row(row)
             try:
                 logger.info("text_pool %s", json.dumps(row, ensure_ascii=False, separators=(",", ":")))
             except Exception:
@@ -3944,6 +5352,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         await translation_runtime.task
                 translation_runtime.task = None
                 dropped = await _clear_translation_queue()
+                translation_runtime.latest_by_sentence.clear()
 
             _trace_event(
                 "translation_direction_set",
@@ -3980,6 +5389,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             source_language: str,
             target_language: str,
             direction: str,
+            *,
+            sentence_id: str,
+            revision: int,
         ) -> str:
             if translator is None:
                 return ""
@@ -4002,7 +5414,10 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     effective_source_language=str(effective_source_language or ""),
                     target_language=str(target_language or ""),
                     direction=str(direction or ""),
+                    sentence_id=str(sentence_id or ""),
+                    revision=int(revision),
                     src_chars=len(src),
+                    src_hash8=_hash8(src),
                 )
 
             t0 = time.monotonic()
@@ -4026,7 +5441,10 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     source_language=str(source_language or ""),
                     target_language=str(target_language or ""),
                     direction=str(direction or ""),
+                    sentence_id=str(sentence_id or ""),
+                    revision=int(revision),
                     src_chars=len(src),
+                    src_hash8=_hash8(src),
                     error=str(e),
                 )
                 return ""
@@ -4039,8 +5457,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 effective_source_language=str(effective_source_language or ""),
                 target_language=str(target_language or ""),
                 direction=str(direction or ""),
+                sentence_id=str(sentence_id or ""),
+                revision=int(revision),
                 src_chars=len(src),
+                src_hash8=_hash8(src),
                 out_chars=len(out or ""),
+                out_hash8=_hash8(str(out or "")),
                 latency_ms=int(latency * 1000),
             )
             if latency >= 1.0:
@@ -4054,9 +5476,155 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 )
             return str(out or "").strip()
 
+        def _mark_latest_translation_request(
+            sentence_id: str,
+            revision: int,
+            sentence_text: str,
+            direction: str,
+        ) -> int:
+            state_gen_hint = int(state_generation)
+            translation_runtime.latest_by_sentence[str(sentence_id)] = (
+                state_gen_hint,
+                int(revision),
+                str(sentence_text or "").strip(),
+                str(direction or ""),
+            )
+            return state_gen_hint
+
+        def _current_translation_item(
+            sentence_id: str,
+            revision: int,
+            sentence_text: str,
+            state_gen_hint: int,
+            direction: str,
+            *,
+            phase: str,
+        ) -> Optional[Dict[str, Any]]:
+            sid = str(sentence_id or "")
+            src = str(sentence_text or "").strip()
+            queued_revision = int(revision)
+            queued_generation = int(state_gen_hint)
+            queued_direction = str(direction or "")
+            item_idx = _find_sentence_item_index(sid)
+            current_item = (
+                subtitle_state.sentence_items[item_idx]
+                if item_idx is not None and item_idx < len(subtitle_state.sentence_items)
+                else None
+            )
+            current_revision = int(current_item.get("revision", 0) or 0) if current_item else 0
+            current_text = str(current_item.get("zh", "") or "").strip() if current_item else ""
+            current_direction = str(getattr(translation_runtime, "direction", "") or "")
+            latest = translation_runtime.latest_by_sentence.get(sid)
+            expected = (queued_generation, queued_revision, src, queued_direction)
+            is_current = bool(
+                current_item is not None
+                and queued_generation == int(state_generation)
+                and current_revision == queued_revision
+                and current_text == src
+                and current_direction == queued_direction
+                and latest == expected
+            )
+            if is_current:
+                return current_item
+
+            latest_generation = int(latest[0]) if isinstance(latest, tuple) and len(latest) >= 1 else -1
+            latest_revision = int(latest[1]) if isinstance(latest, tuple) and len(latest) >= 2 else 0
+            latest_text = str(latest[2] or "") if isinstance(latest, tuple) and len(latest) >= 3 else ""
+            latest_direction = str(latest[3] or "") if isinstance(latest, tuple) and len(latest) >= 4 else ""
+            _trace_event(
+                "translation_stale_drop",
+                sentence_id=sid,
+                queued_revision=queued_revision,
+                current_revision=current_revision,
+                queued_generation=queued_generation,
+                current_generation=int(state_generation),
+                queued_direction=queued_direction,
+                current_direction=current_direction,
+                latest_generation=latest_generation,
+                latest_revision=latest_revision,
+                latest_direction=latest_direction,
+                phase=str(phase or ""),
+                src_chars=len(src),
+                src_hash8=_hash8(src),
+                current_src_chars=len(current_text),
+                current_src_hash8=_hash8(current_text),
+                latest_src_chars=len(latest_text),
+                latest_src_hash8=_hash8(latest_text),
+            )
+            return None
+
+        async def _translate_and_publish_current(
+            sentence_id: str,
+            revision: int,
+            sentence_text: str,
+            language: str,
+            seq_hint: int,
+            state_gen_hint: int,
+            source_language: str,
+            target_language: str,
+            direction: str,
+        ) -> str:
+            current_item = _current_translation_item(
+                sentence_id,
+                revision,
+                sentence_text,
+                state_gen_hint,
+                direction,
+                phase="pre_inference",
+            )
+            if current_item is None:
+                return ""
+            translated = await _translate_sentence_once(
+                sentence_text,
+                language,
+                int(seq_hint or 0),
+                str(source_language or ""),
+                str(target_language or ""),
+                str(direction or ""),
+                sentence_id=str(sentence_id or ""),
+                revision=int(revision),
+            )
+            if not translated:
+                return ""
+            current_item = _current_translation_item(
+                sentence_id,
+                revision,
+                sentence_text,
+                state_gen_hint,
+                direction,
+                phase="post_inference",
+            )
+            if current_item is None:
+                return ""
+
+            current_item["en"] = translated
+            _trace_text_pool(
+                "pool_translation_done",
+                phase="solidified",
+                text=translated,
+                reason="translation",
+                seq_hint=int(seq_hint or 0),
+                sentence_id=str(sentence_id),
+                revision=int(revision),
+                source_chars=len(str(sentence_text or "").strip()),
+                source_hash8=_hash8(str(sentence_text or "")),
+                delta_chars=len(translated),
+            )
+            await _send_json(
+                {
+                    "type": "sentence_translation",
+                    "sentence_id": str(sentence_id),
+                    "revision": int(revision),
+                    "translation": translated,
+                    "seq": int(seq_hint or 0),
+                }
+            )
+            return translated
+
         async def _translation_worker() -> None:
             async def _translate_one(
                 sentence_id: str,
+                revision: int,
                 sentence_text: str,
                 language: str,
                 seq_hint: int,
@@ -4065,40 +5633,16 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 target_language: str,
                 direction: str,
             ) -> None:
-                if int(state_gen_hint or 0) != int(state_generation):
-                    return
-                translated = await _translate_sentence_once(
+                await _translate_and_publish_current(
+                    sentence_id,
+                    revision,
                     sentence_text,
                     language,
                     int(seq_hint or 0),
+                    int(state_gen_hint or 0),
                     str(source_language or ""),
                     str(target_language or ""),
                     str(direction or ""),
-                )
-                if not translated:
-                    return
-
-                for item in subtitle_state.sentence_items:
-                    if item.get("id") == sentence_id:
-                        item["en"] = translated
-                        break
-                _trace_text_pool(
-                    "pool_translation_done",
-                    phase="solidified",
-                    text=translated,
-                    reason="translation",
-                    seq_hint=int(seq_hint or 0),
-                    sentence_id=str(sentence_id),
-                    delta_chars=len(translated),
-                )
-
-                await _send_json(
-                    {
-                        "type": "sentence_translation",
-                        "sentence_id": sentence_id,
-                        "translation": translated,
-                        "seq": int(seq_hint or 0),
-                    }
                 )
 
             active_tasks = set()
@@ -4107,6 +5651,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     try:
                         (
                             sentence_id,
+                            revision,
                             sentence_text,
                             language,
                             seq_hint,
@@ -4146,6 +5691,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     task = asyncio.create_task(
                         _translate_one(
                             str(sentence_id),
+                            int(revision),
                             str(sentence_text),
                             str(language),
                             int(seq_hint or 0),
@@ -4166,7 +5712,13 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     await asyncio.gather(*active_tasks, return_exceptions=True)
                 translation_runtime.task = None
 
-        def _request_sentence_translation(sentence_id: str, sentence_text: str, language: str, seq_hint: int) -> None:
+        def _request_sentence_translation(
+            sentence_id: str,
+            revision: int,
+            sentence_text: str,
+            language: str,
+            seq_hint: int,
+        ) -> None:
             if translator is None:
                 return
             src = str(sentence_text or "").strip()
@@ -4175,13 +5727,20 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             direction = str(getattr(translation_runtime, "direction", "zh2en") or "zh2en")
             source_language = str(getattr(translation_runtime, "source_language", "") or "")
             target_language = str(getattr(translation_runtime, "target_language", "") or "")
+            state_gen_hint = _mark_latest_translation_request(
+                sentence_id,
+                revision,
+                src,
+                direction,
+            )
 
             item = (
                 str(sentence_id),
+                int(revision),
                 src,
                 str(language or ""),
                 int(seq_hint or 0),
-                int(state_generation),
+                int(state_gen_hint),
                 source_language,
                 target_language,
                 direction,
@@ -4196,8 +5755,10 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             _trace_event(
                 "translation_queued",
                 sentence_id=str(sentence_id),
+                revision=int(revision),
                 seq=int(seq_hint or 0),
                 src_chars=len(src),
+                src_hash8=_hash8(src),
                 direction=direction,
                 source_language=source_language,
                 target_language=target_language,
@@ -4206,6 +5767,39 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
 
             if translation_runtime.task is None or translation_runtime.task.done():
                 translation_runtime.task = asyncio.create_task(_translation_worker())
+
+        async def _translate_sentence_now(
+            sentence_id: str,
+            revision: int,
+            sentence_text: str,
+            language: str,
+            seq_hint: int,
+        ) -> str:
+            if translator is None:
+                return ""
+            src = str(sentence_text or "").strip()
+            if not src:
+                return ""
+            direction = str(getattr(translation_runtime, "direction", "zh2en") or "zh2en")
+            source_language = str(getattr(translation_runtime, "source_language", "") or "")
+            target_language = str(getattr(translation_runtime, "target_language", "") or "")
+            state_gen_hint = _mark_latest_translation_request(
+                sentence_id,
+                revision,
+                src,
+                direction,
+            )
+            return await _translate_and_publish_current(
+                sentence_id,
+                revision,
+                src,
+                language,
+                seq_hint,
+                state_gen_hint,
+                source_language,
+                target_language,
+                direction,
+            )
 
         def _track_text_progress(text: str) -> None:
             nonlocal last_text_snapshot, last_text_advance_at
@@ -4477,6 +6071,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             pending_prefix = str(getattr(subtitle_state, "pending_prefix_text", "") or "").strip()
             pending_reason = str(getattr(subtitle_state, "pending_prefix_reason", "") or "")
             pending_miss_count = int(getattr(subtitle_state, "pending_prefix_miss_count", 0) or 0)
+            pending_terminal = str(
+                getattr(subtitle_state, "pending_prefix_terminal_text", "") or ""
+            ).strip()
             merged = raw
             overlap_cap = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
             if pending_prefix:
@@ -4492,12 +6089,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         max_overlap=int(max_overlap),
                     )
                     if overlap >= int(min_overlap):
-                        merged = dedup_segment_join(
-                            pending_prefix,
-                            str(trimmed or "").strip(),
-                            min_overlap=int(min_overlap),
-                        ).strip()
+                        merged = _join_segments([pending_prefix, str(trimmed or "").strip()]).strip()
                         pending_miss_count = 0
+                        _clear_pending_prefix_boundary_evidence()
                         _trace_event(
                             "pending_prefix_overlap_trimmed",
                             seq=int(seq_no or 0),
@@ -4508,6 +6102,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             pending_chars=len(pending_prefix),
                             raw_chars=len(raw),
                             merged_chars=len(merged),
+                            boundary_join_mode="overlap",
                             pending_segment_id=int(getattr(subtitle_state, "pending_prefix_segment_id", 0) or 0),
                         )
                     elif raw.startswith(pending_prefix) or (pending_prefix and pending_prefix in raw):
@@ -4516,6 +6111,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         subtitle_state.pending_prefix_text = ""
                         subtitle_state.pending_prefix_segment_id = 0
                         subtitle_state.pending_prefix_reason = ""
+                        _clear_pending_prefix_boundary_evidence()
                         _trace_event(
                             "pending_prefix_cleared_consumed_by_raw",
                             seq=int(seq_no or 0),
@@ -4537,15 +6133,51 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     else:
                         pending_miss_count = min(8, pending_miss_count + 1)
                         if pending_reason == "hard_cut":
-                            merged = dedup_segment_join(pending_prefix, raw, min_overlap=2).strip()
-                            _trace_event(
-                                "pending_prefix_hard_cut_fallback_merge",
-                                seq=int(seq_no or 0),
-                                pending_chars=len(pending_prefix),
-                                raw_chars=len(raw),
-                                merged_chars=len(merged),
-                                miss_count=int(pending_miss_count),
-                            )
+                            raw_completed, _ = _split_sentences_and_tail(raw)
+                            if pending_terminal and raw_completed:
+                                merged = f"{pending_terminal} {raw}".strip()
+                                pending_miss_count = 0
+                                subtitle_state.pending_prefix_is_separate = True
+                                subtitle_state.boundary_anchor_text = ""
+                                subtitle_state.boundary_anchor_segment_id = 0
+                                _trace_event(
+                                    "pending_prefix_terminal_boundary_preserved",
+                                    seq=int(seq_no or 0),
+                                    pending_chars=len(pending_prefix),
+                                    terminal_chars=len(pending_terminal),
+                                    raw_chars=len(raw),
+                                    raw_completed_count=len(raw_completed),
+                                    merged_chars=len(merged),
+                                )
+                            elif _should_hard_cut_fallback_merge(pending_prefix, raw):
+                                merged = dedup_segment_join(pending_prefix, raw, min_overlap=2).strip()
+                                _trace_event(
+                                    "pending_prefix_hard_cut_fallback_merge",
+                                    seq=int(seq_no or 0),
+                                    pending_chars=len(pending_prefix),
+                                    raw_chars=len(raw),
+                                    merged_chars=len(merged),
+                                    miss_count=int(pending_miss_count),
+                                    boundary_join_mode=_classify_boundary_join_mode(
+                                        pending_prefix,
+                                        raw,
+                                        merged,
+                                    ),
+                                )
+                            else:
+                                merged = raw
+                                subtitle_state.pending_prefix_text = ""
+                                subtitle_state.pending_prefix_segment_id = 0
+                                subtitle_state.pending_prefix_reason = ""
+                                _clear_pending_prefix_boundary_evidence()
+                                pending_miss_count = 0
+                                _trace_event(
+                                    "pending_prefix_hard_cut_fallback_skip",
+                                    seq=int(seq_no or 0),
+                                    pending_chars=len(pending_prefix),
+                                    raw_chars=len(raw),
+                                    pending_reason=str(pending_reason or ""),
+                                )
                         else:
                             merged = raw
                             completed_now, _ = _split_sentences_and_tail(raw)
@@ -4558,6 +6190,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                                 subtitle_state.pending_prefix_text = ""
                                 subtitle_state.pending_prefix_segment_id = 0
                                 subtitle_state.pending_prefix_reason = ""
+                                _clear_pending_prefix_boundary_evidence()
                                 pending_miss_count = 0
                                 _trace_event(
                                     "pending_prefix_drop_no_overlap",
@@ -4716,6 +6349,30 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 )
             stream_text_state.last_text = full_text
 
+        def _attach_stability(
+            payload: Dict[str, Any],
+            *,
+            is_stable: bool,
+            phase: str,
+            reason: str,
+            tentative_text: str = "",
+            sentence_id: str = "",
+        ) -> None:
+            tentative = str(tentative_text or "").strip()
+            stable = bool(is_stable)
+            payload["is_stable"] = stable
+            payload["stability"] = {
+                "is_stable": stable,
+                "phase": str(phase or ""),
+                "reason": str(reason or ""),
+                "sentence_id": str(sentence_id or payload.get("sentence_id", "") or ""),
+                "segment_id": int(getattr(segment_runtime, "id", 0) or 0),
+                "seq": int(payload.get("seq", 0) or 0),
+                "committed_count": int(len(subtitle_state.committed_sentences)),
+                "tentative_chars": int(len(tentative)),
+                "unstable_chars": int(0 if stable else len(tentative)),
+            }
+
         async def _maybe_idle_tail_commit() -> None:
             nonlocal last_idle_commit_at, last_text_advance_at
             if finish_requested or stop_consumer.is_set():
@@ -4785,6 +6442,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             cut_boundary_end: int = 0,
         ) -> bool:
             nonlocal state, seq, last_text_snapshot, last_text_advance_at, last_idle_commit_at, last_partial_emit_at
+            nonlocal segment_final_context_applied
             if finish_requested or stop_consumer.is_set():
                 return False
             if not use_vllm_streaming:
@@ -4813,8 +6471,14 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             )
 
             try:
+                context_final_applied = False
                 async with infer_lock:
                     await asyncio.to_thread(asr.finish_streaming_transcribe, local_state)
+                    _guard_streaming_context_output(local_state, reason=str(reason or "segment_finalize"))
+                    context_final_applied = await _apply_segment_final_context(
+                        local_state,
+                        reason=str(reason or ""),
+                    )
             except Exception as e:
                 _trace_event(
                     "segment_finalize_failed",
@@ -4827,6 +6491,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             async with state_lock:
                 if state is not local_state:
                     return False
+                if context_final_applied:
+                    segment_final_context_applied = True
 
             seq = max(int(seq), int(seq_hint or 0)) + 1
             raw_final_text = str(getattr(local_state, "text", "") or snapshot_text or "").strip()
@@ -4857,6 +6523,29 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 final_text,
                 force_finalize=bool(force_finalize),
             )
+            finalize_completed_preview, finalize_tail_preview = _split_sentences_and_tail(final_text)
+            defer_short_english_slice_commit = bool(
+                str(reason or "") in {"vad_silence", "hard_cut", "punct_timeout_cut"}
+                and len(finalize_completed_preview) == 1
+                and not str(finalize_tail_preview or "").strip()
+                and _is_short_english_sentence_for_early_commit(
+                    str(finalize_completed_preview[0] or ""),
+                    min_words=int(early_translation_min_english_words),
+                    min_chars=int(early_translation_min_english_chars),
+                )
+            )
+            if defer_short_english_slice_commit:
+                commit_tail_on_finalize = False
+                _trace_event(
+                    "short_english_slice_commit_deferred",
+                    seq=int(seq),
+                    reason=str(reason or ""),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    sentence_chars=len(str(finalize_completed_preview[0] or "").strip()),
+                    english_words=int(_english_word_count(str(finalize_completed_preview[0] or ""))),
+                    min_english_words=int(early_translation_min_english_words),
+                    min_english_chars=int(early_translation_min_english_chars),
+                )
 
             _track_text_progress(final_text)
             tentative_after_finalize = await _update_sentence_commits(
@@ -4864,12 +6553,14 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 final_language,
                 seq,
                 force_tail=bool(commit_tail_on_finalize),
-                holdback_newest=False,
+                holdback_newest=bool(defer_short_english_slice_commit),
                 commit_tail_if_no_completed=bool(commit_tail_on_finalize),
                 commit_tail_always=bool(commit_tail_on_finalize),
-                commit_all_completed=True,
+                commit_all_completed=not bool(defer_short_english_slice_commit),
                 slice_commit=True,
                 translate_now=False,
+                canonical_segment_correction=bool(context_final_applied),
+                final_reconcile=True,
             )
             pending_prefix = ""
             if not commit_tail_on_finalize:
@@ -4882,6 +6573,20 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     pending_prefix = dedup_segment_join(pending_prefix, punct_cut_carry_text, min_overlap=2).strip()
                 else:
                     pending_prefix = str(punct_cut_carry_text or "").strip()
+            pending_prefix_terminal_text = ""
+            if finalize_completed_preview:
+                terminal_candidate = str(finalize_completed_preview[-1] or "").strip()
+                continuation_candidate = _strip_short_english_fragment_period(
+                    terminal_candidate,
+                    min_words=int(early_translation_min_english_words),
+                    min_chars=int(early_translation_min_english_chars),
+                )
+                if (
+                    pending_prefix
+                    and continuation_candidate != terminal_candidate
+                    and pending_prefix == continuation_candidate
+                ):
+                    pending_prefix_terminal_text = terminal_candidate
             overlap_cap_chars = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
             boundary_anchor_chars = max(4, overlap_cap_chars * 2)
             boundary_anchor = str(final_text[-boundary_anchor_chars:] if final_text else "").strip()
@@ -4889,6 +6594,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             subtitle_state.pending_prefix_segment_id = int(getattr(segment_runtime, "id", 0) or 0)
             subtitle_state.pending_prefix_reason = str(reason or "")
             subtitle_state.pending_prefix_miss_count = 0
+            subtitle_state.pending_prefix_terminal_text = str(pending_prefix_terminal_text or "")
+            subtitle_state.pending_prefix_is_separate = False
             subtitle_state.boundary_anchor_text = str(boundary_anchor or "")
             subtitle_state.boundary_anchor_segment_id = int(getattr(segment_runtime, "id", 0) or 0)
             _trace_text_pool(
@@ -4899,11 +6606,14 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 seq_hint=int(seq),
                 delta_chars=len(str(subtitle_state.pending_prefix_text or "").strip()),
                 commit_tail=bool(commit_tail_on_finalize),
+                terminal_boundary_chars=len(str(pending_prefix_terminal_text or "")),
                 boundary_anchor_chars=len(str(subtitle_state.boundary_anchor_text or "").strip()),
             )
             subtitle_state.commit_base = int(len(subtitle_state.committed_sentences))
             subtitle_state.prev_completed_sentences = []
             subtitle_state.tentative_tail = ""
+            _reset_completed_candidate_cursor()
+            _reset_early_translation_holdback_state()
 
             overlap_audio = np.zeros((0,), dtype=np.float32)
             local_audio_accum = getattr(local_state, "audio_accum", None)
@@ -4911,7 +6621,18 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 take = min(int(local_audio_accum.size), int(segment_overlap_samples))
                 overlap_audio = np.asarray(local_audio_accum[-take:], dtype=np.float32).copy()
 
-            new_state = await asyncio.to_thread(_new_vllm_state, session_force_language)
+            context_elapsed_sec = float(total_consumed_samples) / float(SAMPLE_RATE)
+            new_state = await asyncio.to_thread(
+                _new_vllm_state,
+                session_force_language,
+                context_elapsed_sec,
+                session_context_terms,
+            )
+            _trace_asr_context(
+                session_force_language,
+                context_elapsed_sec,
+                session_context_terms,
+            )
             if int(overlap_audio.size) > 0:
                 new_state.audio_accum = overlap_audio
 
@@ -4955,7 +6676,11 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 raw_final_text_chars=len(raw_final_text),
                 overlap_samples=int(overlap_audio.size),
                 commit_tail=bool(commit_tail_on_finalize),
+                defer_short_english_slice_commit=bool(defer_short_english_slice_commit),
                 pending_prefix_chars=len(str(subtitle_state.pending_prefix_text or "").strip()),
+                pending_prefix_terminal_chars=len(
+                    str(getattr(subtitle_state, "pending_prefix_terminal_text", "") or "").strip()
+                ),
                 punct_cut_carry_chars=len(punct_cut_carry_text),
                 punct_cut_split_end=int(punct_cut_resolved_end),
             )
@@ -5049,6 +6774,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             commit_all_completed: bool = False,
             slice_commit: bool = False,
             translate_now: bool = False,
+            canonical_segment_correction: bool = False,
+            final_reconcile: bool = False,
         ) -> str:
             seq_no = int(seq_hint or 0)
             raw_full_text = str(full_text or "").strip()
@@ -5056,9 +6783,15 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             commit_base = int(getattr(subtitle_state, "commit_base", 0) or 0)
             commit_base = max(0, min(commit_base, total_committed_count))
             prev_committed_count = int(total_committed_count - commit_base)
+            canonical_existing_text = _join_segments(
+                subtitle_state.committed_sentences[commit_base:total_committed_count]
+            )
+            canonical_existing_compact = _compact_asr_compare_text(canonical_existing_text)
+            canonical_covered_spans: List[Tuple[int, int]] = []
             prev_tail_text = str(subtitle_state.tentative_tail or "")
             prev_completed_count = len(subtitle_state.prev_completed_sentences)
             pending_prefix_before = str(getattr(subtitle_state, "pending_prefix_text", "") or "").strip()
+            pending_prefix_reason = str(getattr(subtitle_state, "pending_prefix_reason", "") or "")
             boundary_anchor_before = str(getattr(subtitle_state, "boundary_anchor_text", "") or "").strip()
             effective_full_text = _compose_effective_text_for_commit(full_text, seq_no)
             completed, tail = _split_sentences_and_tail(effective_full_text)
@@ -5080,6 +6813,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 tail = ""
 
             committed_count = int(len(subtitle_state.committed_sentences) - commit_base)
+            processed_count = int(getattr(subtitle_state, "processed_completed_count", 0) or 0)
+            candidate_cursor_before = int(processed_count)
+            boundary_context = bool(pending_prefix_before or boundary_anchor_before)
             carry_duplicate_dropped = False
             duplicate_filter_paused = bool(
                 time.monotonic() < float(getattr(subtitle_state, "duplicate_filter_pause_until", 0.0) or 0.0)
@@ -5097,7 +6833,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             if (
                 pending_prefix_before
                 and completed
-                and committed_count == 0
+                and processed_count == 0
                 and total_committed_count > 0
             ):
                 prev_sentence = str(subtitle_state.committed_sentences[total_committed_count - 1] or "").strip()
@@ -5128,6 +6864,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         pending_prefix_prev = str(pending_prefix_before or "")
                         subtitle_state.pending_prefix_text = str(trimmed_pending or "")
                         subtitle_state.pending_prefix_miss_count = 0
+                        _clear_pending_prefix_boundary_evidence()
                         _trace_text_pool(
                             "pending_prefix_trimmed",
                             phase="generating",
@@ -5158,13 +6895,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     )
 
             raw_completed_count_before_stabilize = int(len(completed))
-            completed, committed_backfilled = _stabilize_completed_prefix_with_committed(
-                completed,
-                subtitle_state.committed_sentences,
-                commit_base=int(commit_base),
-                committed_count=int(committed_count),
-            )
-            raw_committed_underflow = max(0, int(committed_count - raw_completed_count_before_stabilize))
+            completed, committed_backfilled = _stabilize_completed_prefix_with_cursor(completed)
+            raw_committed_underflow = max(0, int(processed_count - raw_completed_count_before_stabilize))
             if committed_backfilled > 0:
                 _trace_event(
                     "completed_regression_backfilled",
@@ -5179,7 +6911,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     force_tail=bool(force_tail),
                 )
             carry_overlap_skip = 0
-            if pending_prefix_before and committed_count == 0 and total_committed_count > 0 and completed:
+            if boundary_context and processed_count == 0 and total_committed_count > 0 and completed:
                 overlap = _count_leading_completed_committed_overlap(
                     completed,
                     subtitle_state.committed_sentences,
@@ -5188,12 +6920,28 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 if overlap > 0:
                     overlap_chars = sum(len(str(completed[i] or "").strip()) for i in range(overlap))
                     raw_chars_now = len(raw_full_text)
-                    if _should_apply_carry_overlap_skip(
+                    hard_cut_prefix_replay = bool(
+                        pending_prefix_reason == "hard_cut"
+                        and (int(overlap) >= 2 or int(overlap_chars) >= 80)
+                    )
+                    if hard_cut_prefix_replay or _should_apply_carry_overlap_skip(
                         overlap_count=int(overlap),
                         overlap_chars=int(overlap_chars),
                         raw_chars=int(raw_chars_now),
                     ):
                         carry_overlap_skip = int(overlap)
+                        for skipped_idx in range(int(processed_count), int(carry_overlap_skip)):
+                            skipped_text = str(completed[skipped_idx] or "").strip()
+                            _record_completed_candidate(skipped_idx, skipped_text, "")
+                            _trace_event(
+                                "candidate_action",
+                                seq=seq_no,
+                                idx=int(skipped_idx),
+                                action="structural_overlap_skip",
+                                sentence_id="",
+                                text_hash8=_hash8(skipped_text),
+                                segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                            )
                         _trace_event(
                             "carry_overlap_commit_skip",
                             seq=seq_no,
@@ -5202,10 +6950,13 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             raw_chars=int(raw_chars_now),
                             raw_limit=max(12, min(24, int(float(overlap_chars) * 0.35))),
                             pending_prefix_chars=len(pending_prefix_before),
+                            pending_prefix_reason=pending_prefix_reason,
+                            hard_cut_prefix_replay=bool(hard_cut_prefix_replay),
                             committed_count=int(committed_count),
                             total_committed_count=int(total_committed_count),
                         )
-            effective_committed_count = max(int(committed_count), int(carry_overlap_skip))
+            processed_count = int(getattr(subtitle_state, "processed_completed_count", 0) or 0)
+            effective_committed_count = max(int(processed_count), int(carry_overlap_skip))
 
             ready_end = effective_committed_count
             if force_tail or commit_all_completed:
@@ -5223,6 +6974,118 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 newest_holdback = max(effective_committed_count, len(completed) - 1)
                 ready_end = min(ready_end, newest_holdback)
                 ready_end = max(ready_end, effective_committed_count)
+
+            early_translation_promoted = False
+            early_translation_waiting = False
+            early_translation_short_english = False
+            early_translation_required_sec = float(early_translation_stable_sec)
+            early_translation_required_hits = int(early_translation_stable_hits)
+            early_translation_stable_age_ms = 0
+            early_translation_terminal_first_seen_ms = 0
+            if (
+                not force_tail
+                and bool(holdback_newest)
+                and int(ready_end) == int(len(completed) - 1)
+                and int(ready_end) >= int(effective_committed_count)
+                and int(ready_end) < int(len(completed))
+            ):
+                candidate = str(completed[int(ready_end)] or "").strip()
+                now_mono = time.monotonic()
+                if candidate and candidate == str(getattr(subtitle_state, "early_holdback_text", "") or ""):
+                    subtitle_state.early_holdback_hits = int(getattr(subtitle_state, "early_holdback_hits", 0) or 0) + 1
+                else:
+                    subtitle_state.early_holdback_text = candidate
+                    subtitle_state.early_holdback_since = now_mono
+                    subtitle_state.early_holdback_first_seen_ms = int(time.time() * 1000)
+                    subtitle_state.early_holdback_hits = 1 if candidate else 0
+                stable_sec = max(
+                    0.0,
+                    now_mono - float(getattr(subtitle_state, "early_holdback_since", now_mono) or now_mono),
+                )
+                stable_hits = int(getattr(subtitle_state, "early_holdback_hits", 0) or 0)
+                early_translation_stable_age_ms = int(stable_sec * 1000.0)
+                early_translation_terminal_first_seen_ms = int(
+                    getattr(subtitle_state, "early_holdback_first_seen_ms", 0) or 0
+                )
+                early_translation_short_english = _is_short_english_sentence_for_early_commit(
+                    candidate,
+                    min_words=int(early_translation_min_english_words),
+                    min_chars=int(early_translation_min_english_chars),
+                )
+                early_translation_required_sec = (
+                    float(early_translation_short_stable_sec)
+                    if early_translation_short_english
+                    else float(early_translation_stable_sec)
+                )
+                early_translation_required_hits = (
+                    int(early_translation_short_stable_hits)
+                    if early_translation_short_english
+                    else int(early_translation_stable_hits)
+                )
+                if (
+                    candidate
+                    and stable_hits >= int(early_translation_required_hits)
+                    and stable_sec >= float(early_translation_required_sec)
+                ):
+                    ready_end += 1
+                    early_translation_promoted = True
+                    _trace_event(
+                        "early_translation_stable_commit",
+                        seq=seq_no,
+                        sentence_chars=len(candidate),
+                        terminal_first_seen_ms=int(early_translation_terminal_first_seen_ms),
+                        stable_age_ms=int(early_translation_stable_age_ms),
+                        stable_hits=int(stable_hits),
+                        required_hits=int(early_translation_required_hits),
+                        required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
+                        short_english=bool(early_translation_short_english),
+                        english_words=int(_english_word_count(candidate)),
+                    )
+                    _reset_early_translation_holdback_state()
+                elif candidate:
+                    early_translation_waiting = True
+                    _trace_event(
+                        "early_translation_stability_wait",
+                        seq=seq_no,
+                        sentence_chars=len(candidate),
+                        terminal_first_seen_ms=int(early_translation_terminal_first_seen_ms),
+                        stable_age_ms=int(early_translation_stable_age_ms),
+                        stable_hits=int(stable_hits),
+                        required_hits=int(early_translation_required_hits),
+                        required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
+                        short_english=bool(early_translation_short_english),
+                        english_words=int(_english_word_count(candidate)),
+                    )
+            else:
+                _reset_early_translation_holdback_state()
+
+            short_english_slice_fragment_held = False
+            short_english_slice_fragment_index = -1
+            short_english_slice_fragment_text = ""
+            if bool(slice_commit) and not force_tail and int(ready_end) > int(effective_committed_count):
+                for idx in range(int(effective_committed_count), int(ready_end)):
+                    candidate = str(completed[int(idx)] or "").strip()
+                    if not _is_short_english_slice_fragment(
+                        candidate,
+                        min_words=int(early_translation_min_english_words),
+                        min_chars=int(early_translation_min_english_chars),
+                    ):
+                        continue
+                    ready_end = int(idx)
+                    short_english_slice_fragment_held = True
+                    short_english_slice_fragment_index = int(idx)
+                    short_english_slice_fragment_text = candidate
+                    _trace_event(
+                        "short_english_slice_fragment_hold",
+                        seq=seq_no,
+                        idx=int(idx),
+                        sentence_chars=len(candidate),
+                        english_words=int(_english_word_count(candidate)),
+                        min_english_words=int(early_translation_min_english_words),
+                        min_english_chars=int(early_translation_min_english_chars),
+                        slice_commit=bool(slice_commit),
+                    )
+                    break
 
             ready_new_commits = max(0, int(ready_end - effective_committed_count))
             suppressed_new_commits = max(0, int(len(completed) - ready_end))
@@ -5244,6 +7107,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 or commit_all_completed
                 or bool(slice_commit)
                 or bool(carry_duplicate_dropped)
+                or bool(early_translation_promoted)
+                or bool(early_translation_waiting)
+                or bool(short_english_slice_fragment_held)
                 or ready_end != effective_committed_count
             )
             if completed_underflow > 0:
@@ -5328,7 +7194,10 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     raw_committed_underflow=int(raw_committed_underflow),
                 )
             if suppressed_new_commits > 0 and (should_sample or suppressed_new_commits > 1):
-                suppressed_reason = "holdback_newest" if bool(holdback_newest and not force_tail) else "stability_guard"
+                if short_english_slice_fragment_held:
+                    suppressed_reason = "short_english_slice_fragment"
+                else:
+                    suppressed_reason = "holdback_newest" if bool(holdback_newest and not force_tail) else "stability_guard"
                 _trace_event(
                     "commit_suppressed",
                     seq=seq_no,
@@ -5353,6 +7222,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     total_committed_count=int(total_committed_count),
                     prev_committed_count=int(prev_committed_count),
                     effective_committed_count=int(effective_committed_count),
+                    candidate_cursor_before=int(candidate_cursor_before),
+                    candidate_cursor_after=int(max(effective_committed_count, ready_end)),
                     carry_overlap_skip=int(carry_overlap_skip),
                     prev_completed_count=int(prev_completed_count),
                     ready_end=int(ready_end),
@@ -5363,6 +7234,15 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     commit_all_completed=bool(commit_all_completed),
                     slice_commit=bool(slice_commit),
                     translate_now=bool(translate_now),
+                    canonical_segment_correction=bool(canonical_segment_correction),
+                    early_translation_promoted=bool(early_translation_promoted),
+                    early_translation_waiting=bool(early_translation_waiting),
+                    early_translation_short_english=bool(early_translation_short_english),
+                    early_translation_stable_age_ms=int(early_translation_stable_age_ms),
+                    early_translation_required_hits=int(early_translation_required_hits),
+                    early_translation_required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
+                    short_english_slice_fragment_held=bool(short_english_slice_fragment_held),
+                    short_english_slice_fragment_index=int(short_english_slice_fragment_index),
                     pending_prefix_chars=len(pending_prefix_before),
                     boundary_anchor_chars=len(boundary_anchor_before),
                     duplicate_filter_paused=bool(duplicate_filter_paused),
@@ -5382,11 +7262,19 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     tail_chars=len(str(tail or "").strip()),
                     committed_count=int(committed_count),
                     effective_committed_count=int(effective_committed_count),
+                    candidate_cursor_before=int(candidate_cursor_before),
+                    candidate_cursor_after=int(max(effective_committed_count, ready_end)),
                     completed_count=int(len(completed)),
                     prev_completed_count=int(prev_completed_count),
                     ready_end=int(ready_end),
                     ready_new_commits=int(ready_new_commits),
                     suppressed_new_commits=int(suppressed_new_commits),
+                    early_translation_promoted=bool(early_translation_promoted),
+                    early_translation_waiting=bool(early_translation_waiting),
+                    early_translation_short_english=bool(early_translation_short_english),
+                    early_translation_stable_age_ms=int(early_translation_stable_age_ms),
+                    short_english_slice_fragment_held=bool(short_english_slice_fragment_held),
+                    short_english_slice_fragment_hash8=_hash8(short_english_slice_fragment_text),
                     completed_underflow=int(completed_underflow),
                     raw_hash8=_hash8(raw_full_text),
                     effective_hash8=_hash8(effective_full_text),
@@ -5403,31 +7291,150 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     duplicate_filter_pause_left_ms=int(duplicate_filter_pause_left_ms),
                 )
 
-            active_sentence_items = max(0, int(len(subtitle_state.sentence_items) - commit_base))
-            update_upper = min(committed_count, len(completed), active_sentence_items)
+            candidate_sentence_ids = list(getattr(subtitle_state, "candidate_sentence_ids", []) or [])
+            update_upper = min(processed_count, len(completed), len(candidate_sentence_ids))
             committed_added = 0
             upgraded_count = 0
+            evaluated_sentence_ids = set()
             for i in range(update_upper):
+                sentence_id = str(candidate_sentence_ids[i] or "")
+                global_idx = _find_sentence_item_index(sentence_id)
+                if global_idx is None or global_idx >= len(subtitle_state.committed_sentences):
+                    continue
+                evaluated_sentence_ids.add(sentence_id)
                 upgraded = str(completed[i] or "").strip()
-                global_idx = int(commit_base + i)
                 current = str(subtitle_state.committed_sentences[global_idx] or "").strip()
-                if not _is_committed_sentence_upgrade(current, upgraded):
+                accepted_upgrade = _is_committed_sentence_upgrade(current, upgraded)
+                accepted_context_correction = bool(
+                    canonical_segment_correction
+                    and _should_accept_context_sentence_correction(current, upgraded)
+                )
+                small_upgrade_source = ""
+                small_upgrade_observation = None
+
+                if accepted_upgrade or accepted_context_correction:
+                    _reset_deferred_sentence_upgrade(
+                        sentence_id,
+                        seq_no=seq_no,
+                        reason="superseded_by_existing_upgrade",
+                        replacement_text=upgraded,
+                    )
+                elif _is_monotonic_sentence_extension(current, upgraded):
+                    if final_reconcile:
+                        accepted_upgrade = True
+                        small_upgrade_source = "final_reconcile"
+                    else:
+                        small_upgrade_observation = _observe_deferred_sentence_upgrade(
+                            subtitle_state.deferred_sentence_upgrades,
+                            sentence_id,
+                            upgraded,
+                            seq_no,
+                            time.monotonic(),
+                            _SMALL_UPGRADE_REQUIRED_HITS,
+                            _SMALL_UPGRADE_STABLE_SEC,
+                        )
+                        if small_upgrade_observation.transition in {"started", "changed"}:
+                            if small_upgrade_observation.transition == "changed":
+                                _trace_event(
+                                    "sentence_upgrade_candidate_reset",
+                                    seq=seq_no,
+                                    sentence_id=sentence_id,
+                                    reason="candidate_changed",
+                                    candidate_hash8=_hash8(small_upgrade_observation.previous_text),
+                                    candidate_chars=len(small_upgrade_observation.previous_text),
+                                    replacement_hash8=_hash8(upgraded),
+                                    replacement_chars=len(upgraded),
+                                )
+                            _trace_event(
+                                "sentence_upgrade_deferred",
+                                seq=seq_no,
+                                sentence_id=sentence_id,
+                                transition=small_upgrade_observation.transition,
+                                old_chars=len(current),
+                                new_chars=len(upgraded),
+                                growth_chars=max(0, len(upgraded) - len(current)),
+                                candidate_hash8=_hash8(upgraded),
+                                hits=small_upgrade_observation.hits,
+                                stable_age_ms=small_upgrade_observation.stable_ms,
+                                old_preview=_trace_preview(current, 96),
+                                new_preview=_trace_preview(upgraded, 96),
+                            )
+                        if small_upgrade_observation.ready:
+                            accepted_upgrade = True
+                            small_upgrade_source = "streaming_stable"
+                elif sentence_id in subtitle_state.deferred_sentence_upgrades:
+                    previous = subtitle_state.deferred_sentence_upgrades.get(sentence_id)
+                    _trace_event(
+                        "sentence_upgrade_rejected",
+                        seq=seq_no,
+                        sentence_id=sentence_id,
+                        reason="candidate_retracted_or_rewritten",
+                        candidate_hash8=_hash8(previous.text if previous is not None else ""),
+                        replacement_hash8=_hash8(upgraded),
+                        replacement_chars=len(upgraded),
+                    )
+                    _reset_deferred_sentence_upgrade(
+                        sentence_id,
+                        seq_no=seq_no,
+                        reason="candidate_retracted_or_rewritten",
+                        replacement_text=upgraded,
+                    )
+                if not accepted_upgrade and not accepted_context_correction:
                     continue
                 upgraded_count += 1
                 subtitle_state.committed_sentences[global_idx] = upgraded
                 sentence_item = subtitle_state.sentence_items[global_idx]
-                sentence_id = str(sentence_item.get("id") or "")
                 sentence_item["zh"] = upgraded
-                sentence_item["en"] = ""
+                revision = int(sentence_item.get("revision", 1) or 1) + 1
+                sentence_item["revision"] = int(revision)
+                _record_completed_candidate(i, upgraded, sentence_id)
+                preserved_translation = str(sentence_item.get("en", "") or "")
+                if small_upgrade_source:
+                    accepted_candidate = subtitle_state.deferred_sentence_upgrades.pop(sentence_id, None)
+                    _trace_event(
+                        "sentence_upgrade_small_commit",
+                        seq=seq_no,
+                        sentence_id=sentence_id,
+                        source=small_upgrade_source,
+                        old_chars=len(current),
+                        new_chars=len(upgraded),
+                        growth_chars=max(0, len(upgraded) - len(current)),
+                        hits=int(
+                            small_upgrade_observation.hits
+                            if small_upgrade_observation is not None
+                            else getattr(accepted_candidate, "hits", 0)
+                        ),
+                        stable_age_ms=int(
+                            small_upgrade_observation.stable_ms
+                            if small_upgrade_observation is not None
+                            else 0
+                        ),
+                        candidate_hash8=_hash8(upgraded),
+                        old_preview=_trace_preview(current, 96),
+                        new_preview=_trace_preview(upgraded, 96),
+                    )
                 _trace_event(
                     "sentence_upgrade_commit",
                     seq=seq_no,
                     idx=int(i),
                     global_idx=int(global_idx),
                     sentence_id=sentence_id,
+                    revision=int(revision),
                     old_chars=len(current),
                     new_chars=len(upgraded),
+                    preserved_translation_chars=len(preserved_translation.strip()),
                     slice_commit=bool(slice_commit),
+                    context_correction=bool(accepted_context_correction and not accepted_upgrade),
+                )
+                _trace_event(
+                    "candidate_action",
+                    seq=seq_no,
+                    idx=int(i),
+                    action="upgrade",
+                    sentence_id=sentence_id,
+                    revision=int(revision),
+                    text_hash8=_hash8(upgraded),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
                 )
                 _track_committed_sentence(
                     upgraded,
@@ -5442,77 +7449,127 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     reason="sentence_updated",
                     seq_hint=int(seq_hint or 0),
                     sentence_id=sentence_id,
+                    revision=int(revision),
                     delta_chars=max(0, len(upgraded) - len(current)),
                     slice_commit=bool(slice_commit),
                 )
-                await _send_json(
-                    {
-                        "type": "sentence_updated",
-                        "sentence_id": sentence_id,
-                        "text": upgraded,
-                        "language": str(language or ""),
-                        "seq": int(seq_hint or 0),
-                        "ts_ms": int(time.time() * 1000),
-                        "slice_commit": bool(slice_commit),
-                    }
+                event = {
+                    "type": "sentence_updated",
+                    "sentence_id": sentence_id,
+                    "revision": int(revision),
+                    "text": upgraded,
+                    "language": str(language or ""),
+                    "seq": int(seq_hint or 0),
+                    "ts_ms": int(time.time() * 1000),
+                    "slice_commit": bool(slice_commit),
+                }
+                _attach_stability(
+                    event,
+                    is_stable=True,
+                    phase="solidified",
+                    reason="sentence_updated",
+                    sentence_id=sentence_id,
                 )
-                await _send_json(
-                    {
-                        "type": "sentence_translation",
-                        "sentence_id": sentence_id,
-                        "translation": "",
-                        "seq": int(seq_hint or 0),
-                    }
-                )
+                await _send_json(event)
                 if translate_now:
-                    source_language = str(getattr(translation_runtime, "source_language", "") or "")
-                    target_language = str(getattr(translation_runtime, "target_language", "") or "")
-                    direction = str(getattr(translation_runtime, "direction", "zh2en") or "zh2en")
-                    translated = await _translate_sentence_once(
+                    await _translate_sentence_now(
+                        sentence_id,
+                        revision,
                         upgraded,
                         language,
                         seq_hint,
-                        source_language,
-                        target_language,
-                        direction,
                     )
-                    if translated:
-                        sentence_item["en"] = translated
-                        await _send_json(
-                            {
-                                "type": "sentence_translation",
-                                "sentence_id": sentence_id,
-                                "translation": translated,
-                                "seq": int(seq_hint or 0),
-                            }
-                        )
                 else:
-                    _request_sentence_translation(sentence_id, upgraded, language, seq_hint)
+                    _request_sentence_translation(sentence_id, revision, upgraded, language, seq_hint)
+
+            for stale_sentence_id in list(subtitle_state.deferred_sentence_upgrades):
+                if stale_sentence_id not in evaluated_sentence_ids:
+                    _reset_deferred_sentence_upgrade(
+                        stale_sentence_id,
+                        seq_no=seq_no,
+                        reason="candidate_disappeared",
+                    )
 
             for i in range(effective_committed_count, ready_end):
                 sentence = str(completed[i] or "").strip()
                 if not sentence:
+                    _record_completed_candidate(i, "", "")
                     continue
-                if subtitle_state.committed_sentences:
-                    prev_sentence = str(subtitle_state.committed_sentences[-1] or "").strip()
-                    if (
-                        prev_sentence
-                        and prev_sentence != sentence
-                        and len(prev_sentence) >= len(sentence) + 6
-                        and prev_sentence.endswith(sentence)
-                    ):
+                original_sentence = sentence
+                if boundary_context and subtitle_state.committed_sentences:
+                    prev_for_overlap = str(subtitle_state.committed_sentences[-1] or "").strip()
+                    trimmed_sentence = _trim_leading_boundary_overlap(prev_for_overlap, sentence)
+                    if trimmed_sentence != sentence:
                         _trace_event(
-                            "suffix_duplicate_commit_skip",
+                            "leading_boundary_overlap_trimmed",
                             seq=seq_no,
                             idx=int(i),
-                            sentence_chars=len(sentence),
-                            prev_chars=len(prev_sentence),
+                            prev_chars=len(prev_for_overlap),
+                            old_chars=len(sentence),
+                            new_chars=len(trimmed_sentence),
+                            old_hash8=_hash8(sentence),
+                            new_hash8=_hash8(trimmed_sentence),
                             slice_commit=bool(slice_commit),
                         )
+                        sentence = trimmed_sentence
+                        completed[i] = sentence
+                    if not sentence:
+                        _record_completed_candidate(i, original_sentence, "")
+                        _trace_event(
+                            "candidate_action",
+                            seq=seq_no,
+                            idx=int(i),
+                            action="structural_overlap_skip",
+                            sentence_id="",
+                            text_hash8=_hash8(original_sentence),
+                            segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        )
                         continue
+                candidate_compact = _compact_asr_compare_text(sentence)
+                covered_min_chars = 6 if _has_cjk(sentence) else 12
+                if (
+                    canonical_segment_correction
+                    and len(candidate_compact) >= int(covered_min_chars)
+                    and _consume_unmatched_compact_occurrence(
+                        canonical_existing_compact,
+                        candidate_compact,
+                        canonical_covered_spans,
+                    )
+                ):
+                    _record_completed_candidate(i, sentence, "")
+                    _trace_event(
+                        "canonical_covered_commit_suppressed",
+                        seq=seq_no,
+                        idx=int(i),
+                        sentence_chars=len(sentence),
+                        existing_chars=len(canonical_existing_text),
+                        text_hash8=_hash8(sentence),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    _trace_event(
+                        "candidate_action",
+                        seq=seq_no,
+                        idx=int(i),
+                        action="canonical_covered_skip",
+                        sentence_id="",
+                        text_hash8=_hash8(sentence),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    continue
                 sentence_id = _new_sentence_id()
+                revision = 1
+                commit_ts_ms = int(time.time() * 1000)
                 subtitle_state.committed_sentences.append(sentence)
-                subtitle_state.sentence_items.append({"id": sentence_id, "zh": sentence, "en": ""})
+                subtitle_state.sentence_items.append(
+                    {
+                        "id": sentence_id,
+                        "zh": sentence,
+                        "en": "",
+                        "revision": int(revision),
+                        "ts_ms": int(commit_ts_ms),
+                        "seq": int(seq_hint or 0),
+                    }
+                )
                 committed_added += 1
                 _trace_event(
                     "sentence_new_commit",
@@ -5520,6 +7577,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     idx=int(i),
                     global_idx=int(len(subtitle_state.committed_sentences) - 1),
                     sentence_id=sentence_id,
+                    revision=int(revision),
                     chars=len(sentence),
                     slice_commit=bool(slice_commit),
                 )
@@ -5536,44 +7594,49 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     reason="sentence_committed",
                     seq_hint=int(seq_hint or 0),
                     sentence_id=sentence_id,
+                    revision=int(revision),
                     delta_chars=len(sentence),
                     slice_commit=bool(slice_commit),
                 )
-                await _send_json(
-                    {
-                        "type": "sentence_committed",
-                        "sentence_id": sentence_id,
-                        "text": sentence,
-                        "language": str(language or ""),
-                        "seq": int(seq_hint or 0),
-                        "ts_ms": int(time.time() * 1000),
-                        "slice_commit": bool(slice_commit),
-                    }
+                event = {
+                    "type": "sentence_committed",
+                    "sentence_id": sentence_id,
+                    "revision": int(revision),
+                    "text": sentence,
+                    "language": str(language or ""),
+                    "seq": int(seq_hint or 0),
+                    "ts_ms": int(commit_ts_ms),
+                    "slice_commit": bool(slice_commit),
+                }
+                _attach_stability(
+                    event,
+                    is_stable=True,
+                    phase="solidified",
+                    reason="sentence_committed",
+                    sentence_id=sentence_id,
                 )
+                await _send_json(event)
                 if translate_now:
-                    source_language = str(getattr(translation_runtime, "source_language", "") or "")
-                    target_language = str(getattr(translation_runtime, "target_language", "") or "")
-                    direction = str(getattr(translation_runtime, "direction", "zh2en") or "zh2en")
-                    translated = await _translate_sentence_once(
+                    await _translate_sentence_now(
+                        sentence_id,
+                        revision,
                         sentence,
                         language,
                         seq_hint,
-                        source_language,
-                        target_language,
-                        direction,
                     )
-                    if translated:
-                        subtitle_state.sentence_items[-1]["en"] = translated
-                        await _send_json(
-                            {
-                                "type": "sentence_translation",
-                                "sentence_id": sentence_id,
-                                "translation": translated,
-                                "seq": int(seq_hint or 0),
-                            }
-                        )
                 else:
-                    _request_sentence_translation(sentence_id, sentence, language, seq_hint)
+                    _request_sentence_translation(sentence_id, revision, sentence, language, seq_hint)
+                _record_completed_candidate(i, sentence, sentence_id)
+                _trace_event(
+                    "candidate_action",
+                    seq=seq_no,
+                    idx=int(i),
+                    action="commit",
+                    sentence_id=sentence_id,
+                    revision=int(revision),
+                    text_hash8=_hash8(sentence),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                )
 
             if should_sample or committed_added > 0 or upgraded_count > 0 or completed_underflow > 0:
                 _trace_event(
@@ -5583,36 +7646,59 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     committed_added=int(committed_added),
                     committed_count_after=int(len(subtitle_state.committed_sentences) - commit_base),
                     total_committed_count_after=int(len(subtitle_state.committed_sentences)),
+                    candidate_cursor_before=int(candidate_cursor_before),
+                    candidate_cursor_after=int(
+                        getattr(subtitle_state, "processed_completed_count", 0) or 0
+                    ),
                     ready_new_commits=int(ready_new_commits),
                     suppressed_new_commits=int(suppressed_new_commits),
+                    early_translation_promoted=bool(early_translation_promoted),
+                    early_translation_waiting=bool(early_translation_waiting),
+                    early_translation_short_english=bool(early_translation_short_english),
+                    short_english_slice_fragment_held=bool(short_english_slice_fragment_held),
+                    short_english_slice_fragment_index=int(short_english_slice_fragment_index),
                     completed_underflow=int(completed_underflow),
                     force_tail=bool(force_tail),
                     slice_commit=bool(slice_commit),
+                    canonical_segment_correction=bool(canonical_segment_correction),
                 )
 
             if pending_prefix_before and (committed_added > 0 or bool(force_tail)):
-                subtitle_state.pending_prefix_text = ""
-                subtitle_state.pending_prefix_segment_id = 0
-                subtitle_state.pending_prefix_reason = ""
-                subtitle_state.pending_prefix_miss_count = 0
-                _trace_event(
-                    "pending_prefix_cleared_commit",
-                    seq=seq_no,
-                    pending_prefix_chars=len(pending_prefix_before),
-                    pending_prefix_hash8=_hash8(pending_prefix_before),
-                    committed_added=int(committed_added),
-                    force_tail=bool(force_tail),
-                )
-                _trace_text_pool(
-                    "pending_prefix_cleared",
-                    phase="generating",
-                    text="",
-                    reason="sentence_committed",
-                    seq_hint=int(seq_hint or 0),
-                    delta_chars=-len(pending_prefix_before),
-                    committed_added=int(committed_added),
-                    force_tail=bool(force_tail),
-                )
+                if bool(getattr(subtitle_state, "pending_prefix_is_separate", False)):
+                    _trace_event(
+                        "pending_prefix_retained_for_candidate_alignment",
+                        seq=seq_no,
+                        pending_prefix_chars=len(pending_prefix_before),
+                        terminal_chars=len(
+                            str(getattr(subtitle_state, "pending_prefix_terminal_text", "") or "")
+                        ),
+                        committed_added=int(committed_added),
+                        force_tail=bool(force_tail),
+                    )
+                else:
+                    subtitle_state.pending_prefix_text = ""
+                    subtitle_state.pending_prefix_segment_id = 0
+                    subtitle_state.pending_prefix_reason = ""
+                    subtitle_state.pending_prefix_miss_count = 0
+                    _clear_pending_prefix_boundary_evidence()
+                    _trace_event(
+                        "pending_prefix_cleared_commit",
+                        seq=seq_no,
+                        pending_prefix_chars=len(pending_prefix_before),
+                        pending_prefix_hash8=_hash8(pending_prefix_before),
+                        committed_added=int(committed_added),
+                        force_tail=bool(force_tail),
+                    )
+                    _trace_text_pool(
+                        "pending_prefix_cleared",
+                        phase="generating",
+                        text="",
+                        reason="sentence_committed",
+                        seq_hint=int(seq_hint or 0),
+                        delta_chars=-len(pending_prefix_before),
+                        committed_added=int(committed_added),
+                        force_tail=bool(force_tail),
+                    )
             if boundary_anchor_before and (committed_added > 0 or bool(force_tail)):
                 subtitle_state.boundary_anchor_text = ""
                 subtitle_state.boundary_anchor_segment_id = 0
@@ -5633,6 +7719,12 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             else:
                 pending_segments = [str(seg or "").strip() for seg in completed[ready_end:]]
                 pending_segments = [seg for seg in pending_segments if seg]
+                if short_english_slice_fragment_held and pending_segments:
+                    pending_segments[0] = _strip_short_english_fragment_period(
+                        pending_segments[0],
+                        min_words=int(early_translation_min_english_words),
+                        min_chars=int(early_translation_min_english_chars),
+                    )
                 if tail:
                     pending_segments.append(str(tail).strip())
                 subtitle_state.tentative_tail = _join_segments(pending_segments)
@@ -5665,6 +7757,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             tentative_chars=len(str(p.get("tentative_text", "") or "").strip()),
                             committed_chars=len(str(p.get("committed_text", "") or "").strip()),
                             translation_chars=len(str(p.get("translation", "") or "").strip()),
+                            is_stable=bool(p.get("is_stable", False)),
+                            stability_phase=str((p.get("stability") or {}).get("phase", "") if isinstance(p.get("stability"), dict) else ""),
+                            stability_reason=str((p.get("stability") or {}).get("reason", "") if isinstance(p.get("stability"), dict) else ""),
                         )
                     elif msg_type in {
                         "started",
@@ -5684,19 +7779,80 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             translation_chars=len(str(p.get("translation", "") or "").strip()),
                             reason=str(p.get("reason", "") or ""),
                             message=str(p.get("message", "") or ""),
+                            is_stable=bool(p.get("is_stable", False)),
+                            stability_phase=str((p.get("stability") or {}).get("phase", "") if isinstance(p.get("stability"), dict) else ""),
                         )
             async with send_lock:
                 await websocket.send_json(payload)
 
         def _drop_oldest_audio() -> bool:
-            nonlocal queue_samples
+            nonlocal queue_samples, audio_spill_generation, audio_spill_samples
             try:
                 _, dropped_wav = audio_queue.get_nowait()
                 queue_samples = max(0, int(queue_samples - int(getattr(dropped_wav, "size", 0))))
                 stats.queue_dropped += 1
                 return True
             except asyncio.QueueEmpty:
+                if not audio_spill_parts:
+                    return False
+                dropped_wav = audio_spill_parts.pop(0)
+                dropped_samples = int(getattr(dropped_wav, "size", 0))
+                audio_spill_samples = max(0, int(audio_spill_samples - dropped_samples))
+                queue_samples = max(0, int(queue_samples - dropped_samples))
+                stats.queue_dropped += 1
+                if not audio_spill_parts:
+                    audio_spill_generation = None
+                return True
+
+        def _flush_audio_spill() -> bool:
+            nonlocal audio_spill_generation, audio_spill_samples
+            if not audio_spill_parts or audio_queue.full():
                 return False
+            spill_frames = len(audio_spill_parts)
+            spill_samples = int(audio_spill_samples)
+            merged = (
+                audio_spill_parts[0]
+                if spill_frames == 1
+                else np.concatenate(audio_spill_parts, axis=0)
+            )
+            try:
+                audio_queue.put_nowait((int(audio_spill_generation or 0), merged))
+            except asyncio.QueueFull:
+                return False
+            audio_spill_parts.clear()
+            audio_spill_generation = None
+            audio_spill_samples = 0
+            stats.queue_spill_flushes += 1
+            _trace_event(
+                "audio_queue_spill_flush",
+                spill_frames=int(spill_frames),
+                spill_samples=int(spill_samples),
+                queue_samples=int(queue_samples),
+                queue_depth=int(audio_queue.qsize()),
+            )
+            return True
+
+        def _append_audio_spill(gen: int, wav: np.ndarray) -> None:
+            nonlocal queue_samples, audio_spill_generation, audio_spill_samples
+            if audio_spill_parts and int(audio_spill_generation or 0) != int(gen):
+                raise RuntimeError("audio spill generation changed before queue reset")
+            spill_started = not audio_spill_parts
+            audio_spill_generation = int(gen)
+            audio_spill_parts.append(wav)
+            wav_samples = int(wav.size)
+            audio_spill_samples += wav_samples
+            queue_samples += wav_samples
+            stats.queue_spill_samples_peak = max(
+                int(stats.queue_spill_samples_peak),
+                int(audio_spill_samples),
+            )
+            if spill_started:
+                _trace_event(
+                    "audio_queue_spill_start",
+                    frame_samples=int(wav_samples),
+                    queue_samples=int(queue_samples),
+                    queue_depth=int(audio_queue.qsize()),
+                )
 
         def _clear_audio_queue() -> int:
             dropped = 0
@@ -5708,24 +7864,22 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             nonlocal queue_samples
             dropped_now = 0
             now_mono = time.monotonic()
-            try:
-                audio_queue.put_nowait((gen, wav))
-                queue_samples += int(wav.size)
-            except asyncio.QueueFull:
-                if _drop_oldest_audio():
-                    dropped_now += 1
+            if audio_spill_parts:
+                _append_audio_spill(gen, wav)
+                _flush_audio_spill()
+            else:
                 try:
                     audio_queue.put_nowait((gen, wav))
                     queue_samples += int(wav.size)
                 except asyncio.QueueFull:
-                    stats.queue_dropped += 1
-                    dropped_now += 1
+                    _append_audio_spill(gen, wav)
             pressure = backpressure.evaluate(int(queue_samples))
             if pressure.drop_oldest:
                 while backpressure.evaluate(int(queue_samples)).drop_oldest:
                     if not _drop_oldest_audio():
                         break
                     dropped_now += 1
+                _flush_audio_spill()
             if pressure.reason == "hard_overflow":
                 if float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0) <= 0.0:
                     backpressure_runtime.hard_overflow_since = now_mono
@@ -5862,12 +8016,14 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     )
 
             while not stop_consumer.is_set():
-                if finish_requested and audio_queue.empty():
+                _flush_audio_spill()
+                if finish_requested and audio_queue.empty() and not audio_spill_parts:
                     break
                 _relieve_hard_overflow_if_needed()
                 try:
                     gen, wav = await asyncio.wait_for(audio_queue.get(), timeout=0.2)
                 except asyncio.TimeoutError:
+                    _flush_audio_spill()
                     _relieve_hard_overflow_if_needed()
                     await _maybe_idle_tail_commit()
                     await _maybe_vad_silence_cut(
@@ -5883,6 +8039,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     )
                     continue
                 queue_samples = max(0, int(queue_samples - int(wav.size)))
+                _flush_audio_spill()
 
                 async with state_lock:
                     local_state = state
@@ -5934,6 +8091,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 if use_vllm_streaming:
                     async with infer_lock:
                         await asyncio.to_thread(asr.streaming_transcribe, wav, local_state)
+                        _guard_streaming_context_output(local_state, reason="partial")
                     async with state_lock:
                         if local_state is not state or gen != state_generation:
                             continue
@@ -5987,6 +8145,19 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     _apply_incremental_text_fields(payload)
                     payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
                     payload["translation"] = _committed_translation_text()
+                    tentative_text = str(payload.get("tentative_text", "") or "").strip()
+                    partial_is_stable = bool((not tentative_text) and not reset_guard_hold)
+                    _attach_stability(
+                        payload,
+                        is_stable=partial_is_stable,
+                        phase="solidified" if partial_is_stable else "generating",
+                        reason=(
+                            "reset_guard_hold"
+                            if bool(reset_guard_hold)
+                            else ("tentative_tail" if tentative_text else "no_tentative_tail")
+                        ),
+                        tentative_text=tentative_text,
+                    )
                     stats.partial_msgs += 1
                     await _send_json(payload)
                     last_partial_emit_at = time.monotonic()
@@ -6015,7 +8186,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     out = await asyncio.to_thread(
                         lambda: asr.transcribe(
                             audio=[(local_state.audio_accum, SAMPLE_RATE)],
-                            context="",
+                            context=str(
+                                getattr(local_state, "streaming_context", "") or ""
+                            ),
                             language=local_state.force_language,
                         )[0]
                     )
@@ -6075,6 +8248,19 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 _apply_incremental_text_fields(payload)
                 payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
                 payload["translation"] = _committed_translation_text()
+                tentative_text = str(payload.get("tentative_text", "") or "").strip()
+                partial_is_stable = bool((not tentative_text) and not reset_guard_hold)
+                _attach_stability(
+                    payload,
+                    is_stable=partial_is_stable,
+                    phase="solidified" if partial_is_stable else "generating",
+                    reason=(
+                        "reset_guard_hold"
+                        if bool(reset_guard_hold)
+                        else ("tentative_tail" if tentative_text else "no_tentative_tail")
+                    ),
+                    tentative_text=tentative_text,
+                )
                 stats.partial_msgs += 1
                 await _send_json(payload)
                 last_partial_emit_at = time.monotonic()
@@ -6096,11 +8282,27 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 return
 
             canonical_redecode_applied = False
+            stop_context_final_applied = False
             if use_vllm_streaming:
                 async with infer_lock:
                     await asyncio.to_thread(asr.finish_streaming_transcribe, local_state)
+                    _guard_streaming_context_output(
+                        local_state,
+                        reason=str(finish_reason or finish_mode or "stop"),
+                    )
+                    stop_context_final_applied = await _apply_segment_final_context(
+                        local_state,
+                        reason=str(finish_reason or finish_mode or "stop"),
+                    )
                 if finish_mode == "stop" and final_redecode_on_stop:
-                    if full_audio_overflow:
+                    if segment_final_context_applied or stop_context_final_applied:
+                        _trace_event(
+                            "final_redecode_skipped",
+                            reason="segment_final_context_active",
+                            full_audio_samples=int(full_audio_samples),
+                            cap_samples=int(final_redecode_max_samples),
+                        )
+                    elif full_audio_overflow:
                         _trace_event(
                             "final_redecode_skipped",
                             reason="audio_too_long",
@@ -6158,7 +8360,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                         out = await asyncio.to_thread(
                             lambda: asr.transcribe(
                                 audio=[(local_state.audio_accum, SAMPLE_RATE)],
-                                context="",
+                                context=str(
+                                    getattr(local_state, "final_context", "") or ""
+                                ),
                                 language=local_state.force_language,
                             )[0]
                         )
@@ -6175,15 +8379,19 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 subtitle_state.next_sentence_id = 1
                 subtitle_state.committed_sentences = []
                 subtitle_state.sentence_items = []
+                translation_runtime.latest_by_sentence.clear()
                 subtitle_state.commit_base = 0
+                _reset_completed_candidate_cursor()
                 subtitle_state.prev_completed_sentences = []
                 subtitle_state.tentative_tail = ""
                 subtitle_state.pending_prefix_text = ""
                 subtitle_state.pending_prefix_segment_id = 0
                 subtitle_state.pending_prefix_reason = ""
                 subtitle_state.pending_prefix_miss_count = 0
+                _clear_pending_prefix_boundary_evidence()
                 subtitle_state.boundary_anchor_text = ""
                 subtitle_state.boundary_anchor_segment_id = 0
+                _reset_early_translation_holdback_state()
                 alignment_runtime.committed_seen = {}
                 alignment_runtime.committed_events = 0
                 await _send_json({"type": "sentence_reset", "reason": "final_redecode"})
@@ -6222,12 +8430,24 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 commit_all_completed=False,
                 slice_commit=False,
                 translate_now=True,
+                canonical_segment_correction=bool(stop_context_final_applied),
+                final_reconcile=True,
             )
             _apply_incremental_text_fields(payload)
             payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
             final_text_norm = _normalize_sentence_for_duplicate_compare(str(payload.get("text", "") or ""))
             committed_text_norm = _normalize_sentence_for_duplicate_compare(str(payload.get("committed_text", "") or ""))
             reconcile_allowed = bool(final_text_norm and final_text_norm != committed_text_norm)
+            if reconcile_allowed and committed_text_norm and not canonical_redecode_applied:
+                reconcile_allowed = False
+                _trace_event(
+                    "final_commit_reconcile_skipped_noncanonical",
+                    seq=int(payload.get("seq", 0) or 0),
+                    final_chars=len(str(payload.get("text", "") or "").strip()),
+                    committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
+                    finish_mode=str(finish_mode),
+                    finish_reason=str(finish_reason),
+                )
             if (
                 reconcile_allowed
                 and committed_text_norm
@@ -6254,15 +8474,19 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 subtitle_state.next_sentence_id = 1
                 subtitle_state.committed_sentences = []
                 subtitle_state.sentence_items = []
+                translation_runtime.latest_by_sentence.clear()
                 subtitle_state.commit_base = 0
+                _reset_completed_candidate_cursor()
                 subtitle_state.prev_completed_sentences = []
                 subtitle_state.tentative_tail = ""
                 subtitle_state.pending_prefix_text = ""
                 subtitle_state.pending_prefix_segment_id = 0
                 subtitle_state.pending_prefix_reason = ""
                 subtitle_state.pending_prefix_miss_count = 0
+                _clear_pending_prefix_boundary_evidence()
                 subtitle_state.boundary_anchor_text = ""
                 subtitle_state.boundary_anchor_segment_id = 0
+                _reset_early_translation_holdback_state()
                 alignment_runtime.committed_seen = {}
                 alignment_runtime.committed_events = 0
                 await _send_json({"type": "sentence_reset", "reason": "final_commit_reconcile"})
@@ -6290,15 +8514,36 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 with suppress(asyncio.TimeoutError, Exception):
                     await asyncio.wait_for(asyncio.shield(translation_runtime.task), timeout=1.2)
             payload["translation"] = _committed_translation_text()
+            _attach_stability(
+                payload,
+                is_stable=True,
+                phase="final",
+                reason=str(finish_reason or finish_mode or "final"),
+                tentative_text=str(payload.get("tentative_text", "") or ""),
+            )
             finished = True
             stats.final_msgs += 1
             await _send_json(payload)
 
         try:
             if use_vllm_streaming:
-                state = await asyncio.to_thread(_new_vllm_state, session_force_language)
+                state = await asyncio.to_thread(
+                    _new_vllm_state,
+                    session_force_language,
+                    0.0,
+                    session_context_terms,
+                )
+                _trace_asr_context(
+                    session_force_language,
+                    0.0,
+                    session_context_terms,
+                )
             else:
-                state = _new_transformers_state(session_force_language)
+                state = _new_transformers_state(
+                    session_force_language,
+                    0.0,
+                    session_context_terms,
+                )
 
             await _send_json(
                 {
@@ -6392,48 +8637,106 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                     _trace_event("ws_text_recv", type=msg_type)
                     if msg_type == "start":
                         stats.start_msgs += 1
-                        finish_mode = "stop"
-                        finish_reason = "stop"
-                        finish_requested = False
-                        finished = False
-                        stream_text_state.last_text = ""
-                        stream_text_state.accepted_text = ""
-                        stream_text_state.reset_candidate_text = ""
-                        stream_text_state.reset_candidate_hits = 0
-                        stream_text_state.reset_candidate_since = 0.0
-                        alignment_runtime.model_seen = {}
-                        alignment_runtime.committed_seen = {}
-                        alignment_runtime.model_observed_events = 0
-                        alignment_runtime.committed_events = 0
-                        last_text_snapshot = ""
-                        last_text_advance_at = time.monotonic()
-                        last_idle_commit_at = 0.0
-                        total_consumed_samples = 0
-                        queue_samples = 0
-                        last_partial_emit_at = time.monotonic()
-                        segment_runtime.id = 1
-                        segment_runtime.started_at = time.monotonic()
-                        segment_runtime.last_cut_reason = "start"
-                        _reset_backend_vad_segment(reset_cut_clock=True)
-                        _reset_punct_cut_state("start")
-                        full_audio_parts = []
-                        full_audio_samples = 0
-                        full_audio_overflow = False
-                        _trace_event(
-                            "start_received",
-                            requested_language=str(payload.get("language", "") or ""),
-                            requested_translation_direction=str(payload.get("translation_direction", "") or ""),
-                        )
+                        requested_force_language = session_force_language
                         if "language" in payload:
-                            session_force_language = _normalize_force_language(payload.get("language"))
+                            requested_force_language = _normalize_force_language(payload.get("language"))
                         requested_translation_direction = _normalize_translation_direction(
                             payload.get("translation_direction", translation_runtime.direction)
                         )
+                        requested_context_terms: Optional[Tuple[str, ...]] = None
+                        try:
+                            if "asr_context_terms" in payload:
+                                requested_context_terms = normalize_session_context_terms(
+                                    payload.get("asr_context_terms"),
+                                    max_terms=asr_context_max_terms,
+                                    max_chars=asr_context_max_chars,
+                                )
+                        except ValueError as exc:
+                            stats.last_error = f"start failed: {type(exc).__name__}"
+                            _trace_event(
+                                "start_failed",
+                                **_safe_exception_trace_fields(exc),
+                            )
+                            await _send_json(
+                                {"type": "error", "message": f"start failed: {exc}"}
+                            )
+                            continue
+
+                        requested_effective_terms = _context_terms_for(
+                            requested_force_language,
+                            0.0,
+                            requested_context_terms,
+                        )
+                        context_text = " ".join(requested_effective_terms)
+                        context_metadata = {
+                            "context_source": (
+                                "session" if requested_context_terms is not None else "schedule"
+                            ),
+                            "context_active": bool(requested_effective_terms),
+                            "context_term_count": len(requested_effective_terms),
+                            "context_chars": len(context_text),
+                            "context_sha256": hashlib.sha256(
+                                context_text.encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        _trace_event(
+                            "start_received",
+                            requested_language=str(payload.get("language", "") or ""),
+                            requested_translation_direction=str(
+                                payload.get("translation_direction", "") or ""
+                            ),
+                            **context_metadata,
+                        )
                         try:
                             if use_vllm_streaming:
-                                new_state = await asyncio.to_thread(_new_vllm_state, session_force_language)
+                                new_state = await asyncio.to_thread(
+                                    _new_vllm_state,
+                                    requested_force_language,
+                                    0.0,
+                                    requested_context_terms,
+                                )
+                                _trace_asr_context(
+                                    requested_force_language,
+                                    0.0,
+                                    requested_context_terms,
+                                )
                             else:
-                                new_state = _new_transformers_state(session_force_language)
+                                new_state = _new_transformers_state(
+                                    requested_force_language,
+                                    0.0,
+                                    requested_context_terms,
+                                )
+
+                            session_force_language = requested_force_language
+                            session_context_terms = requested_context_terms
+                            finish_mode = "stop"
+                            finish_reason = "stop"
+                            finish_requested = False
+                            finished = False
+                            stream_text_state.last_text = ""
+                            stream_text_state.accepted_text = ""
+                            stream_text_state.reset_candidate_text = ""
+                            stream_text_state.reset_candidate_hits = 0
+                            stream_text_state.reset_candidate_since = 0.0
+                            alignment_runtime.model_seen = {}
+                            alignment_runtime.committed_seen = {}
+                            alignment_runtime.model_observed_events = 0
+                            alignment_runtime.committed_events = 0
+                            last_text_snapshot = ""
+                            last_text_advance_at = time.monotonic()
+                            last_idle_commit_at = 0.0
+                            total_consumed_samples = 0
+                            queue_samples = 0
+                            last_partial_emit_at = time.monotonic()
+                            segment_runtime.id = 1
+                            segment_runtime.started_at = time.monotonic()
+                            segment_runtime.last_cut_reason = "start"
+                            _reset_backend_vad_segment(reset_cut_clock=True)
+                            _reset_punct_cut_state("start")
+                            full_audio_parts = []
+                            full_audio_samples = 0
+                            full_audio_overflow = False
+                            segment_final_context_applied = False
                             async with state_lock:
                                 state_generation += 1
                                 state = new_state
@@ -6445,6 +8748,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                                     await translation_runtime.task
                             translation_runtime.task = None
                             translation_runtime.queue = asyncio.Queue(maxsize=256)
+                            translation_runtime.latest_by_sentence.clear()
                             translation_runtime.direction = requested_translation_direction
                             (
                                 translation_runtime.source_language,
@@ -6455,14 +8759,17 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                             subtitle_state.committed_sentences = []
                             subtitle_state.sentence_items = []
                             subtitle_state.commit_base = 0
+                            _reset_completed_candidate_cursor()
                             subtitle_state.prev_completed_sentences = []
                             subtitle_state.tentative_tail = ""
                             subtitle_state.pending_prefix_text = ""
                             subtitle_state.pending_prefix_segment_id = 0
                             subtitle_state.pending_prefix_reason = ""
                             subtitle_state.pending_prefix_miss_count = 0
+                            _clear_pending_prefix_boundary_evidence()
                             subtitle_state.boundary_anchor_text = ""
                             subtitle_state.boundary_anchor_segment_id = 0
+                            _reset_early_translation_holdback_state()
                             _trace_text_pool(
                                 "pool_generating_reset",
                                 phase="generating",
@@ -6492,6 +8799,7 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                                 translation_direction=str(translation_runtime.direction or ""),
                                 translation_source_language=str(translation_runtime.source_language or ""),
                                 translation_target_language=str(translation_runtime.target_language or ""),
+                                **context_metadata,
                             )
                             if consumer_task is None or consumer_task.done():
                                 consumer_task = asyncio.create_task(_audio_consumer())
@@ -6502,12 +8810,23 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                                     "translation_direction": str(translation_runtime.direction or "zh2en"),
                                     "translation_source_language": str(translation_runtime.source_language or ""),
                                     "translation_target_language": str(translation_runtime.target_language or ""),
+                                    "asr_context_active": bool(requested_effective_terms),
+                                    "asr_context_term_count": len(requested_effective_terms),
+                                    "asr_context_chars": len(context_text),
                                 }
                             )
-                        except Exception as e:
-                            stats.last_error = f"start failed: {e}"
-                            _trace_event("start_failed", error=str(e))
-                            await _send_json({"type": "error", "message": f"start failed: {e}"})
+                        except Exception as exc:
+                            stats.last_error = f"start failed: {type(exc).__name__}"
+                            _trace_event(
+                                "start_failed",
+                                **_safe_exception_trace_fields(exc),
+                            )
+                            await _send_json(
+                                {
+                                    "type": "error",
+                                    "message": "start failed: backend state initialization failed",
+                                }
+                            )
                         continue
 
                     if msg_type == "set_translation_direction":
@@ -6611,6 +8930,8 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 final_msgs=int(stats.final_msgs),
                 queue_dropped=int(stats.queue_dropped),
                 queue_depth_peak=int(stats.queue_depth_peak),
+                queue_spill_flushes=int(stats.queue_spill_flushes),
+                queue_spill_samples_peak=int(stats.queue_spill_samples_peak),
                 last_error=str(stats.last_error or ""),
             )
             logger.info(
@@ -6629,6 +8950,9 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
                 stats.queue_depth_peak,
                 stats.last_error,
             )
+            if trace_file_handle is not None:
+                with suppress(Exception):
+                    trace_file_handle.close()
 
     return app
 
@@ -6670,6 +8994,38 @@ def parse_args() -> argparse.Namespace:
         help="Force language for decoding (e.g. Chinese or English). Empty means auto",
     )
     p.add_argument(
+        "--asr-context-schedule",
+        default="",
+        help="Optional JSON glossary schedule applied when each streaming state is created",
+    )
+    p.add_argument(
+        "--asr-context-max-terms",
+        type=int,
+        default=24,
+        help="Maximum glossary terms sent as ASR context for one streaming state",
+    )
+    p.add_argument(
+        "--asr-context-max-chars",
+        type=int,
+        default=160,
+        help="Maximum ASR context characters, truncated only at whole-term boundaries",
+    )
+    p.add_argument(
+        "--asr-context-lookaround-sec",
+        type=float,
+        default=30.0,
+        help="Include glossary windows this many seconds before or after current audio time",
+    )
+    p.add_argument(
+        "--asr-context-apply-mode",
+        default="segment_final",
+        choices=["segment_final", "streaming"],
+        help=(
+            "Apply glossary context once to complete segments (safe default), or expose it to every "
+            "streaming decode for compatibility"
+        ),
+    )
+    p.add_argument(
         "--enable-translation",
         action="store_true",
         help="Enable real-time translation for recognized text",
@@ -6698,7 +9054,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--translation-max-new-tokens",
         type=int,
-        default=96,
+        default=128,
         help="Translation max generation tokens",
     )
     p.add_argument(
@@ -6745,6 +9101,42 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Concurrent sentence translation workers for committed subtitles",
+    )
+    p.add_argument(
+        "--early-translation-stable-sec",
+        type=float,
+        default=0.8,
+        help="Seconds a held-back completed sentence must remain unchanged before early commit/translation",
+    )
+    p.add_argument(
+        "--early-translation-stable-hits",
+        type=int,
+        default=3,
+        help="Consecutive observations required before early commit/translation of the newest completed sentence",
+    )
+    p.add_argument(
+        "--early-translation-short-stable-sec",
+        type=float,
+        default=1.2,
+        help="Stricter unchanged duration for early translation of short English terminal sentences",
+    )
+    p.add_argument(
+        "--early-translation-short-stable-hits",
+        type=int,
+        default=4,
+        help="Stricter observation count for early translation of short English terminal sentences",
+    )
+    p.add_argument(
+        "--early-translation-min-english-words",
+        type=int,
+        default=6,
+        help="Do not early-commit English completed sentences shorter than this many words unless they also meet the char threshold",
+    )
+    p.add_argument(
+        "--early-translation-min-english-chars",
+        type=int,
+        default=32,
+        help="Do not early-commit English completed sentences shorter than this many characters unless they also meet the word threshold",
     )
 
     p.add_argument("--client-chunk-ms", type=int, default=200, help="Client capture chunk length in milliseconds")
@@ -6936,10 +9328,39 @@ def parse_args() -> argparse.Namespace:
         help="Emit backend structured subtitle trace logs for state transitions",
     )
     p.add_argument(
+        "--subtitle-trace-log-file",
+        default="",
+        help="Optional JSONL file path for backend subtitle trace rows",
+    )
+    p.add_argument(
         "--subtitle-trace-log-partial-every",
         type=int,
         default=20,
         help="Sample interval for backend partial trace events (1 means every partial)",
+    )
+
+    p.add_argument("--auth-enabled", action="store_true", help="Require login for HTTP page, websocket, and debug file access")
+    p.add_argument("--auth-username", default="admin", help="Single-user login name when auth is enabled")
+    p.add_argument(
+        "--auth-password-hash",
+        default="",
+        help="PBKDF2 password hash for login; can also be set with VOXBRIDGE_AUTH_PASSWORD_HASH",
+    )
+    p.add_argument(
+        "--auth-cookie-secure",
+        action="store_true",
+        help="Set Secure on the session cookie; enable when serving over HTTPS",
+    )
+    p.add_argument(
+        "--auth-session-ttl-sec",
+        type=int,
+        default=12 * 60 * 60,
+        help="Authenticated session lifetime in seconds",
+    )
+    p.add_argument(
+        "--disable-debug-file",
+        action="store_true",
+        help="Disable the /__debug/file endpoint entirely",
     )
 
     p.add_argument("--ssl-certfile", default=None, help="Path to TLS certificate file (enables HTTPS/WSS)")
@@ -6954,6 +9375,16 @@ def main() -> None:
 
     global _INSTANCE_LOCK_HANDLE
     args = parse_args()
+    try:
+        _build_auth_config(args)
+        _load_asr_context_schedule(args)
+    except RuntimeError as exc:
+        logger.error("auth configuration failed: %s", exc)
+        raise SystemExit(2) from exc
+    except ValueError as exc:
+        logger.error("ASR context configuration failed: %s", exc)
+        raise SystemExit(2) from exc
+
     try:
         _INSTANCE_LOCK_HANDLE = _acquire_instance_lock_or_raise(args.port)
         _assert_port_bindable(args.host, args.port)
