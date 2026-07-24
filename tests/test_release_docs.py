@@ -58,3 +58,11 @@ def test_readme_declares_the_supported_runtime_contract():
     assert "Qwen/Qwen3-ASR-0.6B" in readme
     assert "sentence_id" in readme
     assert "revision" in readme
+
+
+def test_install_docs_use_uv_with_the_project_venv():
+    install_docs = (ROOT / "README.md", ROOT / "docs" / "DEPLOYMENT.md")
+    for path in install_docs:
+        text = path.read_text(encoding="utf-8")
+        assert ".venv/bin/python -m pip" not in text, path
+        assert "uv pip install --python .venv/bin/python -e ." in text, path

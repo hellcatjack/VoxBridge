@@ -4,7 +4,7 @@ This guide describes a public-facing VoxBridge deployment while keeping the appl
 
 ## 1. Prerequisites
 
-- Linux and Python `>=3.10`.
+- Linux, Python `>=3.10`, and `uv`.
 - A GPU runtime supported by Qwen3-ASR and vLLM.
 - Torch plus ROCm or CUDA versions selected for the target accelerator.
 - Optional OpenAI-compatible translation API.
@@ -17,9 +17,8 @@ Install accelerator-specific packages according to the hardware vendor and upstr
 ```bash
 git clone https://github.com/hellcatjack/VoxBridge.git
 cd VoxBridge
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e .
+uv venv .venv --python 3.10
+uv pip install --python .venv/bin/python -e .
 ```
 
 Confirm that the selected environment imports the installed package:
@@ -164,7 +163,7 @@ Before an upgrade, stop active browser sessions cleanly. Then:
 cd ~/src/VoxBridge
 git fetch --tags origin
 git pull --ff-only origin main
-.venv/bin/python -m pip install -e .
+uv pip install --python .venv/bin/python -e .
 .venv/bin/python -m pytest -q
 systemctl --user restart voxbridge-8024.service
 ss -lntp | rg ':8024'

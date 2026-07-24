@@ -33,6 +33,7 @@ Browser PCM audio
 
 - Linux。
 - Python `>=3.10`。
+- `uv`，用于创建和维护项目内 `.venv`。
 - Qwen3-ASR 和 vLLM 支持的 GPU/加速环境；请先按硬件厂商与上游项目说明安装匹配的 Torch、ROCm 或 CUDA 组件。
 - 可选 OpenAI 兼容翻译 API。
 - VoxBridge 本地服务固定使用端口 `8024`。
@@ -46,12 +47,12 @@ Browser PCM audio
 ```bash
 git clone https://github.com/hellcatjack/VoxBridge.git
 cd VoxBridge
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e .
+uv venv .venv --python 3.10
+uv pip install --python .venv/bin/python -e .
 ```
 
-如果 VoxBridge 位于现有 Qwen3-ASR 工作区内，可直接使用上级环境 `../.venv/bin/python`，不要重复创建环境。
+如果 VoxBridge 位于现有 Qwen3-ASR 工作区内，可直接执行
+`uv pip install --python ../.venv/bin/python -e .`，不要重复创建环境。
 
 ## 快速启动（8024）
 
