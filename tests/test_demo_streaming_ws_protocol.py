@@ -435,16 +435,20 @@ def test_ws_tts_jobs_follow_source_order_and_precede_final():
 
 
 @pytest.mark.parametrize(
-    ("direction", "expected_target"),
-    (("zh2en", "English"), ("en2zh", "Chinese")),
+    ("direction", "source_label", "target_label", "expected_target"),
+    (
+        ("zh2en", "中文", "英文", "English"),
+        ("en2zh", "中文", "英文", "Chinese"),
+        ("zh2en", "中文", "英语", "English"),
+    ),
 )
 def test_ws_tts_jobs_use_canonical_language_for_localized_translation_labels(
-    direction, expected_target
+    direction, source_label, target_label, expected_target
 ):
     args = _args()
     args.final_redecode_on_stop = False
-    args.translation_source_language = "中文"
-    args.translation_target_language = "英语"
+    args.translation_source_language = source_label
+    args.translation_target_language = target_label
     args.tts_final_translation_drain_sec = 2.0
     app = _create_app(
         args,
@@ -617,6 +621,52 @@ def test_ws_tts_failed_earlier_translation_does_not_block_later_jobs():
 
     jobs = [event for event in events if event.get("type") == "tts_job"]
     assert [event["source_order"] for event in jobs] == [1, 2]
+
+
+def test_ws_tts_final_waits_past_drain_warning_for_stable_translations():
+    first_started = threading.Event()
+
+    class _SlowFirstTranslator(_FakeTranslator):
+        def translate(self, text: str, source_language: str = None, target_language: str = None):
+            if text == _StableTTSSentenceASR.sentences[0]:
+                first_started.set()
+                time.sleep(0.35)
+            return super().translate(text, source_language, target_language)
+
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.translation_workers = 3
+    args.tts_final_translation_drain_sec = 0.05
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_SlowFirstTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "tts_enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        _receive_until_type(ws, "started")
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        for _ in range(6):
+            ws.send_bytes(raw)
+            _receive_until_type(ws, "partial")
+            if first_started.wait(timeout=0.2):
+                break
+        assert first_started.is_set()
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    jobs = [event for event in events if event.get("type") == "tts_job"]
+    assert [event["source_order"] for event in jobs] == [0, 1, 2]
 
 
 def test_ws_disabling_tts_cancels_client_jobs_and_reports_status():

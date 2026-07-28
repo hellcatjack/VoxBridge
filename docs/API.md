@@ -53,10 +53,13 @@ When `--disable-debug-file` is set, this endpoint always returns `404`.
 
 ### `POST /api/tts/jobs/{job_id}/audio`
 
-Returns one backend-issued TTS job as `audio/wav`. The route requires the same
-authenticated cookie session that owns the job, uses `Cache-Control: no-store`,
-and returns `404` for absent, expired, or foreign jobs. Synthesis runs one job at
-a time on the CPU; a generated WAV is cached in memory only until acknowledgement.
+Returns one backend-issued TTS job as `audio/wav`. With `--auth-enabled`, the
+route requires the same authenticated cookie session that owns the job, uses
+`Cache-Control: no-store`, and returns `404` for absent, expired, or foreign jobs.
+Authentication-disabled mode is intended only for trusted local development and
+uses anonymous ownership; public TTS deployments must enable global
+authentication. Synthesis runs one job at a time on the CPU; a generated WAV is
+cached in memory only until acknowledgement.
 
 ### `DELETE /api/tts/jobs/{job_id}`
 
@@ -384,6 +387,10 @@ fetching the next item.
 Reports `enabled`, `disabled`, `unavailable`, `queue_full`, or
 `translation_drain_timeout`, together with `tts_available` and `tts_enabled`.
 ASR and subtitle translation continue if TTS is unavailable or full.
+`translation_drain_timeout` is a slow-drain warning threshold, not a discard:
+the backend continues waiting for pending stable translations and emits their
+ordered `tts_job` events before `final`. It never waits for audio synthesis or
+browser playback.
 
 ### `sentence_reset`
 
@@ -441,7 +448,7 @@ as the canonical subtitle stream.
 
 When TTS is enabled, the backend waits up to
 `--tts-final-translation-drain-sec` for pending stable translations and sends
-all available `tts_job` events before `final`. It does not wait for CPU
+all pending `tts_job` events before `final`. It does not wait for CPU
 synthesis or browser playback. The browser may therefore close the WebSocket on
 `final` and continue consuming authenticated HTTP jobs. Stop preserves the
 browser queue; disabling TTS clears it.

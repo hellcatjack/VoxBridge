@@ -121,7 +121,7 @@ ss -lntp | rg ':8024'
 
 模型来源应使用 [kokoro-onnx 官方 release](https://github.com/thewh1teagle/kokoro-onnx/releases) 和 [Kokoro-82M-v1.1-zh 官方模型页](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)。完整启动参数见 [部署指南](docs/DEPLOYMENT.md)。
 
-Stop 只停止识别，已经进入浏览器 FIFO 的译文会继续读完；取消勾选会立即停止当前朗读并清空待播任务。使用“系统声音”输入时，扬声器输出可能被共享音频再次采集，页面会提示“系统声音可能回采朗读”；建议使用耳机。
+Stop 会先等待尚未完成的稳定译文并发出朗读任务，但不会等待音频合成或播放；已经进入浏览器 FIFO 的译文会继续读完。取消勾选会立即停止当前朗读并清空待播任务。使用“系统声音”输入时，扬声器输出可能被共享音频再次采集，页面会提示“系统声音可能回采朗读”；建议使用耳机。
 
 ## 公网认证
 

@@ -134,7 +134,10 @@ to the same `ExecStart` command:
 
 Translation endpoints and model names are deployment-specific. Keep API keys outside the unit file.
 TTS remains disabled in each browser until the user selects “朗读译文”. Stop
-preserves already queued speech; turning the option off stops and clears it.
+waits for pending stable translations and preserves already queued speech; it
+does not wait for synthesis or playback. Turning the option off stops and clears
+the browser queue immediately. `--tts-final-translation-drain-sec` controls the
+slow-drain warning threshold and does not discard pending translation jobs.
 When capturing system audio, use headphones to avoid feeding synthesized speech
 back into ASR.
 

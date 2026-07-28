@@ -9260,6 +9260,8 @@ def _create_app(
                             "translation_drain_timeout",
                             timeout_ms=int(translation_drain_sec * 1000),
                         )
+                        with suppress(Exception):
+                            await asyncio.shield(translation_task)
                 except Exception:
                     pass
             payload["translation"] = _committed_translation_text()
@@ -10013,7 +10015,7 @@ def parse_args() -> argparse.Namespace:
         "--tts-final-translation-drain-sec",
         type=float,
         default=30.0,
-        help="Wait this long for stable translations before sending final",
+        help="Warn after this long while continuing to wait for stable translations before final",
     )
 
     p.add_argument("--client-chunk-ms", type=int, default=200, help="Client capture chunk length in milliseconds")
