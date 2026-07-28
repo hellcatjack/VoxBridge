@@ -1041,6 +1041,31 @@ def test_parse_args_rejects_negative_tts_revision_stability(monkeypatch):
         parse_args()
 
 
+def test_parse_args_uses_latest_tts_revision_grace_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    assert parse_args().tts_latest_revision_grace_sec == 4.0
+
+
+def test_parse_args_accepts_latest_tts_revision_grace_override(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--tts-latest-revision-grace-sec", "2.25"],
+    )
+
+    assert parse_args().tts_latest_revision_grace_sec == 2.25
+
+
+def test_parse_args_rejects_negative_latest_tts_revision_grace(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--tts-latest-revision-grace-sec", "-0.1"],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_parse_args_accepts_kokoro_tts_options(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",

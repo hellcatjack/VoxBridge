@@ -5279,6 +5279,10 @@ def _create_app(
             0.0,
             float(getattr(args, "tts_revision_stable_sec", 3.0)),
         )
+        tts_latest_revision_grace_sec = max(
+            0.0,
+            float(getattr(args, "tts_latest_revision_grace_sec", 4.0)),
+        )
         tts_runtime = SimpleNamespace(
             available=bool(tts_synthesizer is not None and translator is not None),
             broadcast_enabled=bool(tts_synthesizer is not None and translator is not None),
@@ -5287,7 +5291,10 @@ def _create_app(
             generation=0,
             next_source_order=0,
             sentence_orders={},
-            ordered=RevisionStableTTSBuffer(stable_sec=tts_revision_stable_sec),
+            ordered=RevisionStableTTSBuffer(
+                stable_sec=tts_revision_stable_sec,
+                latest_revision_grace_sec=tts_latest_revision_grace_sec,
+            ),
             stability_task=None,
             stability_wake=asyncio.Event(),
             stability_stopping=False,
@@ -6029,6 +6036,7 @@ def _create_app(
                             str(sentence_id),
                             int(wait.revision),
                             bool(wait.blocked_by_earlier),
+                            bool(wait.waiting_for_latest_grace),
                         )
                         if wait_key != tts_runtime.last_wait_key:
                             tts_runtime.last_wait_key = wait_key
@@ -6041,6 +6049,9 @@ def _create_app(
                                 required_quiet_ms=int(wait.required_quiet_ms),
                                 remaining_ms=int(wait.remaining_ms),
                                 blocked_by_earlier=bool(wait.blocked_by_earlier),
+                                waiting_for_latest_grace=bool(
+                                    wait.waiting_for_latest_grace
+                                ),
                             )
                 return tts_runtime.ordered.drain()
 
@@ -6079,6 +6090,31 @@ def _create_app(
                 ready = tts_runtime.ordered.drain(force=force)
                 if ready:
                     await _publish_tts_ready(ready)
+
+        async def _seal_tts_sources_through_current_segment(*, reason: str) -> None:
+            def _transition() -> List[Any]:
+                if not _tts_output_active() or int(tts_runtime.next_source_order) <= 0:
+                    return []
+                source_order = int(tts_runtime.next_source_order) - 1
+                changed = tts_runtime.ordered.seal_through(source_order)
+                if not changed:
+                    return []
+                tts_runtime.last_wait_key = None
+                tts_runtime.stability_wake.set()
+                _trace_event(
+                    "tts_source_sealed",
+                    source_order=int(source_order),
+                    reason=str(reason or ""),
+                    generation=int(tts_runtime.generation),
+                    pending_count=int(tts_runtime.ordered.pending_count),
+                )
+                return tts_runtime.ordered.drain()
+
+            await _run_ordered_tts_transition(
+                tts_transition_lock,
+                _transition,
+                _publish_tts_ready,
+            )
 
         async def _tts_stability_scheduler() -> None:
             _trace_event(
@@ -7452,6 +7488,7 @@ def _create_app(
                 canonical_segment_correction=bool(context_final_applied),
                 final_reconcile=True,
             )
+            await _seal_tts_sources_through_current_segment(reason=str(reason or ""))
             pending_prefix = ""
             if not commit_tail_on_finalize:
                 pending_prefix = str(tentative_after_finalize or "").strip()
@@ -10205,6 +10242,12 @@ def parse_args() -> argparse.Namespace:
         type=_non_negative_float_arg,
         default=3.0,
         help="Require this long without a source revision before publishing translated speech",
+    )
+    p.add_argument(
+        "--tts-latest-revision-grace-sec",
+        type=_non_negative_float_arg,
+        default=4.0,
+        help="Additional revision protection applied only to the newest unsealed TTS source",
     )
 
     p.add_argument("--client-chunk-ms", type=int, default=200, help="Client capture chunk length in milliseconds")

@@ -106,6 +106,7 @@ def _args():
         idle_timeout_sec=30,
         max_frame_samples=32000,
         tts_revision_stable_sec=0.0,
+        tts_latest_revision_grace_sec=0.0,
     )
 
 
@@ -812,6 +813,103 @@ def test_tts_quiet_window_is_bypassed_only_by_orderly_finalization():
     vad_start = source.index("async def _maybe_vad_silence_cut")
     consumer_start = source.index("async def _audio_consumer")
     assert "_drain_tts_stability(force=True)" not in source[vad_start:consumer_start]
+
+
+def test_segment_finalization_seals_tts_after_final_reconciliation():
+    source = inspect.getsource(demo_streaming_ws._create_app)
+    finalize_start = source.index("async def _finalize_segment_and_rotate")
+    finalize_end = source.index("async def _maybe_vad_silence_cut", finalize_start)
+    finalize_source = source[finalize_start:finalize_end]
+
+    reconcile_pos = finalize_source.index("final_reconcile=True")
+    seal_pos = finalize_source.index("await _seal_tts_sources_through_current_segment")
+    reset_pos = finalize_source.index("_reset_completed_candidate_cursor()")
+
+    assert reconcile_pos < seal_pos < reset_pos
+
+
+def test_ws_segment_seals_newest_tts_source_without_global_delay(tmp_path):
+    class _TwoSentenceSegmentASR(_FakeASR):
+        sentences = (
+            "这是第一句已经稳定完成并且长度足够。",
+            "这是第二句已经稳定完成并且长度足够。",
+        )
+
+        def streaming_transcribe(self, wav, state):
+            state.language = "Chinese"
+            state.text = "".join(self.sentences)
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            state.text = "".join(self.sentences)
+            return state
+
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 1
+    args.tts_revision_stable_sec = 0.0
+    args.tts_latest_revision_grace_sec = 60.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "tts-segment-seal.jsonl")
+    app = _create_app(
+        args,
+        _TwoSentenceSegmentASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    listener = app.state.tts_broadcast.register("anonymous")
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "start"})
+        _receive_until_type(ws, "started")
+        frame = np.array([0, 1000, -1000] * 2400, dtype="<i2").tobytes()
+        ws.send_bytes(frame)
+        _receive_until_type(ws, "partial")
+        ws.send_bytes(frame)
+        _receive_until_type(ws, "sentence_translation")
+        released_before_cut = [
+            event
+            for event in _drain_listener_events(listener)
+            if event.get("type") == "tts_job"
+        ]
+        assert [event["source_order"] for event in released_before_cut] == [0]
+
+        time.sleep(1.1)
+        ws.send_bytes(frame)
+        jobs = list(released_before_cut)
+        for _ in range(40):
+            ws.send_json({"type": "ping"})
+            _receive_until_type(ws, "pong")
+            jobs.extend(
+                event
+                for event in _drain_listener_events(listener)
+                if event.get("type") == "tts_job"
+            )
+            if len(jobs) >= 2:
+                break
+            time.sleep(0.02)
+
+    assert [event["source_order"] for event in jobs] == [0, 1]
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    release_reasons = [
+        row.get("release_reason")
+        for row in trace_rows
+        if row.get("event") == "tts_stability_release"
+    ]
+    assert "source_sealed" in release_reasons
 
 
 def test_ws_translation_direction_change_discards_pending_tts():
