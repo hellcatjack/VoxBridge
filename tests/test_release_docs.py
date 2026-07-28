@@ -92,6 +92,8 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "仅接收连接后" in readme
     assert "多个设备" in readme
     assert "主字幕页不播放" in readme
+    assert "0.75x" in readme
+    assert "2.0x" in readme
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
 
     assert "GET /listen" in api
@@ -105,11 +107,15 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "DELETE /api/tts/clients/{client_id}/jobs" in api
     assert '"type": "tts_job"' in api
     assert '"is_stable": true' in api
+    assert "per-device" in api.lower()
+    assert "localStorage" in api
 
     assert "--enable-tts" in deployment
     assert "--tts-en-model-path" in deployment
     assert "--tts-zh-model-path" in deployment
     assert "--tts-listener-queue-size" in deployment
+    assert "--tts-speed" in deployment
+    assert "listener-side" in deployment.lower()
     assert "CPUExecutionProvider" in deployment
     assert "/listen" in deployment
     assert "Kokoro" in changelog

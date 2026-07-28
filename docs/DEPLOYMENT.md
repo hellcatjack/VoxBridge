@@ -129,6 +129,7 @@ to the same `ExecStart` command:
 --tts-zh-model-path models/kokoro/kokoro-v1.1-zh.onnx
 --tts-zh-voices-path models/kokoro/voices-v1.1-zh.bin
 --tts-zh-vocab-path models/kokoro/config-v1.1-zh.json
+--tts-speed 1.05
 --tts-cpu-threads 4
 --tts-listener-queue-size 128
 --tts-revision-stable-sec 3.0
@@ -141,6 +142,12 @@ Listeners receive future stable translations only; joining does not replay old
 jobs. Device-local Stop clears only that browser's FIFO and does not affect other
 listeners. One WAV is synthesized and cached per translation under the global
 CPU lock, then shared by all listeners assigned to that job.
+
+`--tts-speed` is the backend Kokoro synthesis baseline and remains global for
+the generated shared WAV. The `/listen` selector is a listener-side playback
+multiplier (`0.75x` through `2.0x`) stored per browser; changing it does not
+restart the service, alter another device, or create another synthesis/cache
+variant.
 
 `--tts-listener-queue-size` bounds unread metadata per device. A listener that
 cannot keep up is disconnected without delaying other listeners. The shared job

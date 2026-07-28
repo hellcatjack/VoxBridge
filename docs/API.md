@@ -33,6 +33,11 @@ not synthesize or play audio. When authentication is enabled, an unauthenticated
 request redirects to `/login?next=%2Flisten`, and a successful login returns to
 the listener page. Each browser must explicitly select Start to activate audio.
 
+The page provides a per-device playback-rate choice from `0.75x` through
+`2.0x`. It is stored only in browser `localStorage`, applies immediately to the
+current and queued audio, and is never sent through HTTP or WebSocket. All
+listeners therefore continue receiving the same shared synthesized WAV.
+
 ### `GET /login`
 
 Returns the login page when authentication is enabled.
