@@ -163,3 +163,21 @@ def test_user_service_templates_bound_log_rotation():
     assert "%h/.config/voxbridge/logrotate.conf" in service
     assert "OnUnitActiveSec=1h" in timer
     assert "Persistent=true" in timer
+
+
+def test_docs_publish_runtime_budget_and_tts_finality_contract():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    api = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "--mm-processor-cache-gb 0.5" in readme
+    assert "--mm-processor-cache-gb 0.5" in deployment
+    assert "--tts-latest-revision-grace-sec 4.0" in readme
+    assert "--tts-latest-revision-grace-sec 4.0" in api
+    assert "--tts-latest-revision-grace-sec 4.0" in deployment
+    assert "不是全局 7 秒延时" in readme
+    assert "source_sealed" in api
+    assert "backend segment sealing" in api.lower()
+    assert "voxbridge-logrotate.timer" in deployment
+    assert "voxbridge-logrotate.timer" in changelog

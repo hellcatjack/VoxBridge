@@ -100,6 +100,7 @@ ExecStart=%h/src/VoxBridge/.venv/bin/python -m voxbridge.cli.demo_streaming_ws \
   --backend vllm \
   --host 127.0.0.1 \
   --port 8024 \
+  --mm-processor-cache-gb 0.5 \
   --auth-enabled \
   --auth-username admin \
   --auth-cookie-secure \
@@ -133,6 +134,7 @@ to the same `ExecStart` command:
 --tts-cpu-threads 4
 --tts-listener-queue-size 128
 --tts-revision-stable-sec 3.0
+--tts-latest-revision-grace-sec 4.0
 ```
 
 Translation endpoints and model names are deployment-specific. Keep API keys outside the unit file.
@@ -173,9 +175,19 @@ into ASR.
 
 `--tts-revision-stable-sec` delays spoken publication from the latest source
 sentence revision while leaving visible subtitles responsive. The recommended
-production value is `3.0`. Tune it only from observed
+production value is `3.0`. `--tts-latest-revision-grace-sec 4.0` applies only
+to the newest unsealed source. A successor returns its predecessor to the
+ordinary window, and successful segment final reconciliation seals the segment
+so ready translations can publish without an arbitrary timer. Do not replace
+this source-order policy with a global seven-second delay. Tune it only from observed
 `tts_late_revision_after_release` timing; do not add punctuation,
 language-specific word lists, or frontend timers to infer speech stability.
+
+vLLM may allocate the multimodal processor cache in both the API and EngineCore
+processes. `--mm-processor-cache-gb 0.5` therefore bounds a single-engine
+deployment to roughly 1 GiB of theoretical host cache instead of relying on the
+larger vLLM default. A value of `0` disables this cache but can increase repeated
+audio preprocessing; change it only after comparing RSS and decode latency.
 
 Load and start the service:
 
@@ -187,6 +199,31 @@ ss -lntp | rg ':8024'
 ```
 
 Only one managed backend should own port `8024`. Do not start a second manual backend beside the user service.
+
+### Install bounded user log rotation
+
+The tracked template checks the service log and subtitle trace every hour,
+rotates either file after 512 MiB, retains 21 compressed generations, and uses
+`copytruncate` so the running Python process does not need to reopen a file
+descriptor. Update the two log paths in `deploy/logrotate/voxbridge.conf` if the
+runtime workspace differs from the deployment host.
+
+```bash
+mkdir -p ~/.config/voxbridge ~/.config/systemd/user ~/.local/state/voxbridge
+cp deploy/logrotate/voxbridge.conf ~/.config/voxbridge/logrotate.conf
+cp deploy/systemd/voxbridge-logrotate.service ~/.config/systemd/user/
+cp deploy/systemd/voxbridge-logrotate.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now voxbridge-logrotate.timer
+systemctl --user list-timers voxbridge-logrotate.timer --no-pager
+/usr/sbin/logrotate --debug \
+  --state ~/.local/state/voxbridge/logrotate.status \
+  ~/.config/voxbridge/logrotate.conf
+```
+
+For rollback, disable `voxbridge-logrotate.timer`, restore the previous
+configuration if one existed, and run `systemctl --user daemon-reload`. Debug
+mode parses and reports actions without rotating live logs.
 
 ## 5. Put HTTPS in front of port 8024
 

@@ -551,6 +551,14 @@ unchanged for 3.0 seconds before a TTS job is published. The timer starts at the
 latest source revision, not at translation completion. A translation that
 finishes after the source revision deadline can publish immediately.
 
+`--tts-latest-revision-grace-sec 4.0` adds revision protection only to the
+highest unsealed source order. It is not a global seven-second delay. Registering
+a successor removes the extra grace from its predecessor, which then follows
+the ordinary three-second rule. Successful final ASR reconciliation performs
+backend segment sealing before the streaming state and candidate cursor are
+rotated. Ready sealed sources publish immediately; translations that finish
+after sealing publish as soon as they become ready.
+
 A higher revision inside the quiet window invalidates the older ready
 translation and restarts the source timer. Source order remains strict, so a
 later sentence cannot overtake an unresolved earlier sentence. Set the option
@@ -563,7 +571,9 @@ ready revisions. An abrupt WebSocket disconnect does not force speech and
 discards pending TTS state.
 
 Structured diagnostics are `tts_stability_wait`, `tts_stability_reset`,
-`tts_stability_release`, and `tts_late_revision_after_release`. These events
+`tts_source_sealed`, `tts_stability_release`, and
+`tts_late_revision_after_release`. Release reasons are `quiet_window`,
+`latest_revision_grace`, `source_sealed`, or `final_force`. These events
 contain short fingerprints, revisions, timing, and queue counts, but no source
 text, translated text, raw sentence IDs, or raw TTS job IDs.
 

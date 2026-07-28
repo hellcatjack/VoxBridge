@@ -8,6 +8,8 @@ All notable public changes to VoxBridge are documented here.
 
 - Prevented Kokoro playback from speaking a translated sentence revision that
   is superseded inside the backend revision-stability window.
+- Added newest-source-only TTS revision grace and backend segment sealing so
+  late model corrections are protected without a global seven-second delay.
 
 ### Added
 
@@ -23,6 +25,8 @@ All notable public changes to VoxBridge are documented here.
   Start and Stop now affect only that device.
 - Disabled raw Uvicorn access logging so opaque TTS job identifiers are not
   persisted in request paths; broadcast diagnostics use short hashes instead.
+- Added a bounded vLLM multimodal processor cache option and the user-level
+  `voxbridge-logrotate.timer` deployment templates for long-running sessions.
 
 ## [0.2.0] - 2026-07-23
 
