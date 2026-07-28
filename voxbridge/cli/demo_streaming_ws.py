@@ -4692,6 +4692,17 @@ def _parse_json_message(text: str) -> Dict[str, Any]:
     return payload
 
 
+async def _run_ordered_tts_transition(
+    transition_lock: asyncio.Lock,
+    transition: Any,
+    publish: Any,
+) -> None:
+    async with transition_lock:
+        ready = transition()
+        if ready:
+            await publish(ready)
+
+
 def _create_app(
     args: argparse.Namespace,
     asr: Any,
@@ -5068,6 +5079,7 @@ def _create_app(
         full_audio_overflow = False
         segment_final_context_applied = False
         send_lock = asyncio.Lock()
+        tts_transition_lock = asyncio.Lock()
         state_lock = asyncio.Lock()
         stop_consumer = asyncio.Event()
         consumer_task: Optional[asyncio.Task] = None
@@ -5952,34 +5964,47 @@ def _create_app(
             translated: str,
             target_language: str,
         ) -> None:
-            registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
-            if not tts_runtime.enabled or registered is None:
-                return
-            _, registered_generation = registered
-            if int(registered_generation) != int(tts_runtime.generation):
-                return
-            ready = tts_runtime.ordered.mark_ready(
-                str(sentence_id),
-                int(revision),
-                str(translated),
-                _canonical_tts_language(str(target_language)),
+            def _transition() -> List[Any]:
+                registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
+                if not tts_runtime.enabled or registered is None:
+                    return []
+                _, registered_generation = registered
+                if int(registered_generation) != int(tts_runtime.generation):
+                    return []
+                return tts_runtime.ordered.mark_ready(
+                    str(sentence_id),
+                    int(revision),
+                    str(translated),
+                    _canonical_tts_language(str(target_language)),
+                )
+
+            await _run_ordered_tts_transition(
+                tts_transition_lock,
+                _transition,
+                _publish_tts_ready,
             )
-            await _publish_tts_ready(ready)
 
         async def _mark_tts_translation_failed(sentence_id: str, revision: int) -> None:
-            registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
-            if not tts_runtime.enabled or registered is None:
-                return
-            _, registered_generation = registered
-            if int(registered_generation) != int(tts_runtime.generation):
-                return
-            ready = tts_runtime.ordered.mark_failed(str(sentence_id), int(revision))
-            _trace_event(
-                "tts_translation_skipped",
-                sentence_id=str(sentence_id or ""),
-                revision=int(revision),
+            def _transition() -> List[Any]:
+                registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
+                if not tts_runtime.enabled or registered is None:
+                    return []
+                _, registered_generation = registered
+                if int(registered_generation) != int(tts_runtime.generation):
+                    return []
+                ready = tts_runtime.ordered.mark_failed(str(sentence_id), int(revision))
+                _trace_event(
+                    "tts_translation_skipped",
+                    sentence_id=str(sentence_id or ""),
+                    revision=int(revision),
+                )
+                return ready
+
+            await _run_ordered_tts_transition(
+                tts_transition_lock,
+                _transition,
+                _publish_tts_ready,
             )
-            await _publish_tts_ready(ready)
 
         async def _set_translation_direction(
             direction_raw: Any,

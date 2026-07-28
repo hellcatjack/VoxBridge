@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
+from voxbridge.tts.jobs import OrderedTTSBuffer
 from voxbridge.cli.demo_streaming_ws import (
     INDEX_HTML_TEMPLATE,
     OpenAIAPITranslator,
@@ -41,6 +42,49 @@ from voxbridge.cli.demo_streaming_ws import (
     _verify_auth_password,
     parse_args,
 )
+
+
+def test_ordered_tts_transition_serializes_drain_and_whole_batch_publication():
+    async def scenario():
+        buffer = OrderedTTSBuffer()
+        for order in range(4):
+            buffer.register(f"s{order}", 1, order)
+        assert buffer.mark_ready("s1", 1, "one", "English") == []
+        assert buffer.mark_ready("s2", 1, "two", "English") == []
+
+        transition_lock = asyncio.Lock()
+        first_send_started = asyncio.Event()
+        release_first_send = asyncio.Event()
+        sent = []
+
+        async def publish(items):
+            for item in items:
+                if item.source_order == 0:
+                    first_send_started.set()
+                    await release_first_send.wait()
+                sent.append(item.source_order)
+
+        first = asyncio.create_task(
+            demo_streaming_ws._run_ordered_tts_transition(
+                transition_lock,
+                lambda: buffer.mark_ready("s0", 1, "zero", "English"),
+                publish,
+            )
+        )
+        await first_send_started.wait()
+        second = asyncio.create_task(
+            demo_streaming_ws._run_ordered_tts_transition(
+                transition_lock,
+                lambda: buffer.mark_ready("s3", 1, "three", "English"),
+                publish,
+            )
+        )
+        await asyncio.sleep(0)
+        release_first_send.set()
+        await asyncio.gather(first, second)
+        assert sent == [0, 1, 2, 3]
+
+    asyncio.run(scenario())
 
 
 def test_decode_pcm16le_empty():
