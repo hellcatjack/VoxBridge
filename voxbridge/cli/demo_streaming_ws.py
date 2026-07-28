@@ -6419,6 +6419,36 @@ def _create_app(
                     await asyncio.gather(*active_tasks, return_exceptions=True)
                 translation_runtime.task = None
 
+        async def _drain_tts_translation_task(phase: str) -> None:
+            translation_task = translation_runtime.task
+            if translation_task is None or translation_task.done():
+                return
+            warning_sec = max(
+                0.1,
+                float(getattr(args, "tts_final_translation_drain_sec", 30.0)),
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(translation_task),
+                    timeout=warning_sec,
+                )
+            except asyncio.TimeoutError:
+                _trace_event(
+                    "tts_final_translation_drain_timeout",
+                    phase=str(phase or ""),
+                    timeout_ms=int(warning_sec * 1000),
+                    queue_depth=int(translation_runtime.queue.qsize()),
+                )
+                await _emit_tts_status(
+                    "translation_drain_timeout",
+                    phase=str(phase or ""),
+                    timeout_ms=int(warning_sec * 1000),
+                )
+                with suppress(Exception):
+                    await asyncio.shield(translation_task)
+            except Exception:
+                pass
+
         def _request_sentence_translation(
             sentence_id: str,
             revision: int,
@@ -9012,11 +9042,15 @@ def _create_app(
                         reason=str(finish_reason or finish_mode or "stop"),
                     )
                 if finish_mode == "stop" and final_redecode_on_stop:
-                    if int(tts_runtime.session_issued_job_count) > 0:
+                    if tts_runtime.enabled:
+                        await _drain_tts_translation_task("before_final_redecode")
+                    async with tts_transition_lock:
+                        issued_tts_jobs = int(tts_runtime.session_issued_job_count)
+                    if issued_tts_jobs > 0:
                         _trace_event(
                             "final_redecode_skipped",
                             reason="tts_jobs_already_issued",
-                            issued_jobs=int(tts_runtime.session_issued_job_count),
+                            issued_jobs=issued_tts_jobs,
                             full_audio_samples=int(full_audio_samples),
                             cap_samples=int(final_redecode_max_samples),
                         )
@@ -9237,33 +9271,20 @@ def _create_app(
                     committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
                     committed_count=int(len(subtitle_state.committed_sentences)),
                 )
-            translation_task = translation_runtime.task
-            if translation_task is not None and not translation_task.done():
-                translation_drain_sec = (
-                    max(0.1, float(getattr(args, "tts_final_translation_drain_sec", 30.0)))
-                    if tts_runtime.enabled
-                    else 1.2
-                )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(translation_task),
-                        timeout=translation_drain_sec,
-                    )
-                except asyncio.TimeoutError:
-                    if tts_runtime.enabled:
-                        _trace_event(
-                            "tts_final_translation_drain_timeout",
-                            timeout_ms=int(translation_drain_sec * 1000),
-                            queue_depth=int(translation_runtime.queue.qsize()),
+            if tts_runtime.enabled:
+                await _drain_tts_translation_task("before_final")
+            else:
+                translation_task = translation_runtime.task
+                if translation_task is not None and not translation_task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(translation_task),
+                            timeout=1.2,
                         )
-                        await _emit_tts_status(
-                            "translation_drain_timeout",
-                            timeout_ms=int(translation_drain_sec * 1000),
-                        )
-                        with suppress(Exception):
-                            await asyncio.shield(translation_task)
-                except Exception:
-                    pass
+                    except asyncio.TimeoutError:
+                        pass
+                    except Exception:
+                        pass
             payload["translation"] = _committed_translation_text()
             _attach_stability(
                 payload,

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 import hashlib
 import json
 import threading
@@ -584,6 +585,77 @@ def test_ws_tts_toggle_does_not_replay_earlier_sentences_at_stop():
 
     jobs = [event for event in events if event.get("type") == "tts_job"]
     assert len(jobs) == len(asr.sentences)
+
+
+def test_ws_stop_waits_for_inflight_tts_publication_before_redecode(monkeypatch):
+    class _TwoSentenceASR(_StableTTSSentenceASR):
+        sentences = _StableTTSSentenceASR.sentences[:2]
+
+    send_started = threading.Event()
+    release_send = threading.Event()
+    original_send_json = demo_streaming_ws.WebSocket.send_json
+    blocked_once = False
+
+    async def delayed_send_json(websocket, data, *args, **kwargs):
+        nonlocal blocked_once
+        if (
+            data.get("type") == "tts_job"
+            and data.get("source_order") == 0
+            and not blocked_once
+        ):
+            blocked_once = True
+            send_started.set()
+            await asyncio.to_thread(release_send.wait)
+        return await original_send_json(websocket, data, *args, **kwargs)
+
+    monkeypatch.setattr(demo_streaming_ws.WebSocket, "send_json", delayed_send_json)
+    args = _args()
+    args.final_redecode_on_stop = True
+    args.final_redecode_max_sec = 30.0
+    args.translation_workers = 2
+    args.tts_final_translation_drain_sec = 2.0
+    asr = _TwoSentenceASR()
+    asr.transcribe_language = "Chinese"
+    asr.transcribe_text = "".join(asr.sentences)
+    app = _create_app(
+        args,
+        asr,
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    events = []
+    frame = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+
+    try:
+        with TestClient(app).websocket_connect("/ws") as ws:
+            events.append(ws.receive_json())
+            ws.send_json(
+                {
+                    "type": "start",
+                    "tts_enabled": True,
+                    "tts_client_id": "client-a-12345678",
+                }
+            )
+            while not any(event.get("type") == "started" for event in events):
+                events.append(ws.receive_json())
+            for expected_partials in (1, 2):
+                ws.send_bytes(frame)
+                while len([event for event in events if event.get("type") == "partial"]) < expected_partials:
+                    events.append(ws.receive_json())
+            assert send_started.wait(timeout=3.0)
+            ws.send_json({"type": "finish", "mode": "stop"})
+            release_timer = threading.Timer(1.0, release_send.set)
+            release_timer.start()
+            while not any(event.get("type") == "final" for event in events):
+                events.append(ws.receive_json())
+            release_timer.cancel()
+    finally:
+        release_send.set()
+
+    jobs = [event for event in events if event.get("type") == "tts_job"]
+    assert [event["source_order"] for event in jobs] == [0, 1]
+    assert asr.transcribe_calls == []
+    assert asr.finish_calls == 1
 
 
 def test_ws_tts_failed_earlier_translation_does_not_block_later_jobs():

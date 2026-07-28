@@ -446,12 +446,13 @@ Sent once after `finish`.
 skipped by `--final-redecode-max-sec`. Use `committed_text` and sentence events
 as the canonical subtitle stream.
 
-When TTS is enabled, the backend waits up to
-`--tts-final-translation-drain-sec` for pending stable translations and sends
-all pending `tts_job` events before `final`. It does not wait for CPU
-synthesis or browser playback. The browser may therefore close the WebSocket on
-`final` and continue consuming authenticated HTTP jobs. Stop preserves the
-browser queue; disabling TTS clears it.
+When TTS is enabled, the backend waits for pending stable translations and sends
+all pending `tts_job` events before `final`.
+`--tts-final-translation-drain-sec` is the threshold for a slow-drain status,
+not a hard timeout. The backend does not wait for CPU synthesis or browser
+playback. The browser may therefore close the WebSocket on `final` and continue
+consuming session-owned HTTP jobs, authenticated when `--auth-enabled` is in
+use. Stop preserves the browser queue; disabling TTS clears it.
 
 ### Other Messages
 
