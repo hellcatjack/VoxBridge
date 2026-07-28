@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import _create_app, _hash_auth_password
-from voxbridge.tts.jobs import TTSReadyItem
+from voxbridge.tts.jobs import RevisionStableTTSBuffer, TTSReadyItem
 from voxbridge.tts.kokoro_onnx import SynthesizedAudio
 
 
@@ -567,6 +567,32 @@ class _StableTTSSentenceASR(_FakeASR):
         return state
 
 
+class _FastRevisionASR(_FakeASR):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.s1 = "First sentence is stable and complete."
+        self.s2_short = "Second sentence starts as a complete long sentence."
+        self.s2_long = (
+            "Second sentence starts as a complete long sentence and later receives "
+            "important extra words."
+        )
+        self.s3 = "Third sentence is stable and complete."
+
+    def streaming_transcribe(self, wav, state):
+        self.calls += 1
+        state.language = "English"
+        second = self.s2_short if self.calls <= 2 else self.s2_long
+        state.text = f"{self.s1} {second} {self.s3}"
+        return state
+
+    def finish_streaming_transcribe(self, state):
+        self.finish_calls += 1
+        state.language = "English"
+        state.text = f"{self.s1} {self.s2_long} {self.s3}"
+        return state
+
+
 def _collect_through_final(ws, max_steps=160):
     events = []
     for _ in range(max_steps):
@@ -584,6 +610,20 @@ def _drain_listener_events(subscription):
             events.append(subscription.queue.get_nowait())
         except asyncio.QueueEmpty:
             return events
+
+
+def _poll_ws_with_ping(ws, events, predicate, max_polls=40):
+    for _ in range(max_polls):
+        ws.send_json({"type": "ping"})
+        while True:
+            message = ws.receive_json()
+            events.append(message)
+            if predicate(message):
+                return message
+            if message.get("type") == "pong":
+                break
+        time.sleep(0.01)
+    pytest.fail("expected WebSocket event was not emitted")
 
 
 def test_ws_tts_defaults_off_and_marks_translation_stable():
@@ -3273,37 +3313,14 @@ def test_ws_sentence_update_keeps_previous_translation_until_replacement_is_read
     assert empty_updates == []
 
 
-def test_ws_fast_translation_waits_for_latest_sentence_revision():
-    class _FastUpdateASR(_FakeASR):
-        def __init__(self):
-            super().__init__()
-            self.calls = 0
-            self.s1 = "First sentence is stable and complete."
-            self.s2_short = "Second sentence starts as a complete long sentence."
-            self.s2_long = (
-                "Second sentence starts as a complete long sentence and later receives "
-                "important extra words."
-            )
-            self.s3 = "Third sentence is stable and complete."
-
-        def streaming_transcribe(self, wav, state):
-            self.calls += 1
-            state.language = "English"
-            second = self.s2_short if self.calls <= 2 else self.s2_long
-            state.text = f"{self.s1} {second} {self.s3}"
-            return state
-
-        def finish_streaming_transcribe(self, state):
-            self.finish_calls += 1
-            state.language = "English"
-            state.text = f"{self.s1} {self.s2_long} {self.s3}"
-            return state
-
-    asr = _FastUpdateASR()
+def test_ws_fast_translation_waits_for_latest_sentence_revision(tmp_path):
+    asr = _FastRevisionASR()
     args = _args()
     args.final_redecode_on_stop = False
     args.translation_workers = 3
     args.tts_revision_stable_sec = 60.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "tts-revision-stability.jsonl")
     app = _create_app(
         args,
         asr,
@@ -3312,19 +3329,6 @@ def test_ws_fast_translation_waits_for_latest_sentence_revision():
     )
     listener = app.state.tts_broadcast.register("anonymous")
     events = []
-
-    def poll_with_ping(ws, predicate, max_polls=40):
-        for _ in range(max_polls):
-            ws.send_json({"type": "ping"})
-            while True:
-                message = ws.receive_json()
-                events.append(message)
-                if predicate(message):
-                    return message
-                if message.get("type") == "pong":
-                    break
-            time.sleep(0.01)
-        pytest.fail("expected WebSocket event was not emitted")
 
     with TestClient(app).websocket_connect("/ws") as ws:
         ws.receive_json()
@@ -3347,8 +3351,9 @@ def test_ws_fast_translation_waits_for_latest_sentence_revision():
             and message.get("text") == asr.s2_short
         )
         sentence_id = str(committed["sentence_id"])
-        revision_one = poll_with_ping(
+        revision_one = _poll_ws_with_ping(
             ws,
+            events,
             lambda message: (
                 message.get("type") == "sentence_translation"
                 and str(message.get("sentence_id", "")) == sentence_id
@@ -3381,8 +3386,9 @@ def test_ws_fast_translation_waits_for_latest_sentence_revision():
             time.sleep(0.1)
         assert updated is not None
         latest_revision = int(updated["revision"])
-        poll_with_ping(
+        _poll_ws_with_ping(
             ws,
+            events,
             lambda message: (
                 message.get("type") == "sentence_translation"
                 and str(message.get("sentence_id", "")) == sentence_id
@@ -3400,6 +3406,193 @@ def test_ws_fast_translation_waits_for_latest_sentence_revision():
     ]
     assert len(matching_jobs) == 1
     assert int(matching_jobs[0]["revision"]) == latest_revision
+
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    event_names = {row.get("event") for row in trace_rows}
+    assert "tts_stability_wait" in event_names
+    assert "tts_stability_reset" in event_names
+    assert "tts_stability_release" in event_names
+    private_events = {
+        "tts_stability_wait",
+        "tts_stability_reset",
+        "tts_stability_release",
+        "tts_late_revision_after_release",
+    }
+    for row in trace_rows:
+        if row.get("event") not in private_events:
+            continue
+        assert "text" not in row
+        assert "translation" not in row
+        assert "sentence_id" not in row
+        assert "job_id" not in row
+        assert len(str(row.get("sentence_hash8", ""))) == 8
+
+
+def test_ws_late_revision_after_tts_release_is_traced(tmp_path):
+    asr = _FastRevisionASR()
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.translation_workers = 3
+    args.tts_revision_stable_sec = 0.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "tts-late-revision.jsonl")
+    app = _create_app(
+        args,
+        asr,
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    listener = app.state.tts_broadcast.register("anonymous")
+    events = []
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "start", "translation_direction": "en2zh"})
+        _receive_until_type(ws, "started")
+        frame = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        for _ in range(2):
+            ws.send_bytes(frame)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+
+        committed = next(
+            message
+            for message in events
+            if message.get("type") == "sentence_committed"
+            and message.get("text") == asr.s2_short
+        )
+        sentence_id = str(committed["sentence_id"])
+        _poll_ws_with_ping(
+            ws,
+            events,
+            lambda message: (
+                message.get("type") == "sentence_translation"
+                and str(message.get("sentence_id", "")) == sentence_id
+                and int(message.get("revision", 0)) == 1
+            ),
+        )
+
+        matching_jobs = []
+        for _ in range(40):
+            matching_jobs.extend(
+                event
+                for event in _drain_listener_events(listener)
+                if event.get("type") == "tts_job" and event.get("sentence_id") == sentence_id
+            )
+            if matching_jobs:
+                break
+            _poll_ws_with_ping(ws, events, lambda message: message.get("type") == "pong", max_polls=1)
+        assert len(matching_jobs) == 1
+        assert int(matching_jobs[0]["revision"]) == 1
+
+        updated = None
+        for _ in range(8):
+            ws.send_bytes(frame)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if (
+                    message.get("type") == "sentence_updated"
+                    and str(message.get("sentence_id", "")) == sentence_id
+                    and message.get("text") == asr.s2_long
+                ):
+                    updated = message
+                if message.get("type") == "partial":
+                    break
+            if updated is not None:
+                break
+            time.sleep(0.1)
+        assert updated is not None
+
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    late_rows = [
+        row for row in trace_rows if row.get("event") == "tts_late_revision_after_release"
+    ]
+    assert len(late_rows) == 1
+    assert late_rows[0]["released_revision"] == 1
+    assert late_rows[0]["incoming_revision"] == int(updated["revision"])
+    assert late_rows[0]["elapsed_since_release_ms"] >= 0
+    assert len(str(late_rows[0]["sentence_hash8"])) == 8
+    assert "sentence_id" not in late_rows[0]
+
+
+def test_ws_tts_scheduler_failure_does_not_stop_asr(monkeypatch, tmp_path):
+    original_next_deadline = RevisionStableTTSBuffer.next_deadline
+    failed = False
+
+    def fail_once(buffer):
+        nonlocal failed
+        if buffer.pending_count and not failed:
+            failed = True
+            raise RuntimeError("synthetic scheduler failure")
+        return original_next_deadline(buffer)
+
+    monkeypatch.setattr(RevisionStableTTSBuffer, "next_deadline", fail_once)
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.tts_revision_stable_sec = 1.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "tts-scheduler-failure.jsonl")
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "start"})
+        _receive_until_type(ws, "started")
+        frame = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        ws.send_bytes(frame)
+        unavailable = None
+        while True:
+            message = ws.receive_json()
+            if message.get("type") == "tts_status":
+                unavailable = message
+            if message.get("type") == "sentence_translation":
+                break
+
+        for _ in range(20):
+            if unavailable is not None:
+                break
+            ws.send_json({"type": "ping"})
+            while True:
+                message = ws.receive_json()
+                if message.get("type") == "tts_status":
+                    unavailable = message
+                if message.get("type") == "pong":
+                    break
+            if unavailable is not None:
+                break
+            time.sleep(0.01)
+        assert unavailable is not None
+        assert unavailable["status"] == "unavailable"
+
+        ws.send_bytes(frame)
+        assert _receive_until_type(ws, "partial")["type"] == "partial"
+
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failures = [row for row in trace_rows if row.get("event") == "tts_stability_scheduler_failed"]
+    assert len(failures) == 1
+    assert failures[0]["error_type"] == "RuntimeError"
+    assert "error" not in failures[0]
 
 
 def test_ws_discards_translation_from_superseded_sentence_revision(tmp_path):

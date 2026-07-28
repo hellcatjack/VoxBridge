@@ -5863,6 +5863,26 @@ def _create_app(
                 )
                 if registration.accepted:
                     tts_runtime.stability_wake.set()
+                if registration.reset:
+                    tts_runtime.last_wait_key = None
+                    _trace_event(
+                        "tts_stability_reset",
+                        sentence_hash8=_opaque_identifier_hash8(sid),
+                        source_order=int(registration.source_order),
+                        previous_revision=int(registration.previous_revision or 0),
+                        new_revision=int(registration.revision),
+                        previous_quiet_age_ms=int(registration.previous_quiet_age_ms),
+                        previous_ready=bool(registration.previous_ready),
+                    )
+                elif registration.late_after_release:
+                    _trace_event(
+                        "tts_late_revision_after_release",
+                        sentence_hash8=_opaque_identifier_hash8(sid),
+                        source_order=int(registration.source_order),
+                        released_revision=int(registration.released_revision or 0),
+                        incoming_revision=int(registration.revision),
+                        elapsed_since_release_ms=int(registration.elapsed_since_release_ms),
+                    )
             _trace_event(
                 "tts_source_registered",
                 sentence_id=sid,
@@ -5875,6 +5895,17 @@ def _create_app(
             for item in items:
                 if not _tts_output_active():
                     return
+                tts_runtime.last_wait_key = None
+                _trace_event(
+                    "tts_stability_release",
+                    sentence_hash8=_opaque_identifier_hash8(str(item.sentence_id)),
+                    revision=int(item.revision),
+                    source_order=int(item.source_order),
+                    release_reason=str(item.release_reason),
+                    source_quiet_age_ms=int(item.source_quiet_age_ms),
+                    translation_ready_age_ms=int(item.translation_ready_age_ms),
+                    ordered_backlog_depth=int(tts_runtime.ordered.pending_count),
+                )
                 broadcast_job = None
                 if tts_runtime.broadcast_enabled:
                     pruned_jobs = app.state.tts_broadcast.prune()
@@ -5979,6 +6010,27 @@ def _create_app(
                 )
                 if accepted:
                     tts_runtime.stability_wake.set()
+                    wait = tts_runtime.ordered.wait_state(str(sentence_id))
+                    if wait is not None and (
+                        int(wait.remaining_ms) > 0 or bool(wait.blocked_by_earlier)
+                    ):
+                        wait_key = (
+                            str(sentence_id),
+                            int(wait.revision),
+                            bool(wait.blocked_by_earlier),
+                        )
+                        if wait_key != tts_runtime.last_wait_key:
+                            tts_runtime.last_wait_key = wait_key
+                            _trace_event(
+                                "tts_stability_wait",
+                                sentence_hash8=_opaque_identifier_hash8(str(sentence_id)),
+                                revision=int(wait.revision),
+                                source_order=int(wait.source_order),
+                                quiet_age_ms=int(wait.quiet_age_ms),
+                                required_quiet_ms=int(wait.required_quiet_ms),
+                                remaining_ms=int(wait.remaining_ms),
+                                blocked_by_earlier=bool(wait.blocked_by_earlier),
+                            )
                 return tts_runtime.ordered.drain()
 
             await _run_ordered_tts_transition(
@@ -6018,6 +6070,11 @@ def _create_app(
                     await _publish_tts_ready(ready)
 
         async def _tts_stability_scheduler() -> None:
+            _trace_event(
+                "tts_stability_scheduler_started",
+                generation=int(tts_runtime.generation),
+                pending_count=int(tts_runtime.ordered.pending_count),
+            )
             try:
                 while not bool(tts_runtime.stability_stopping):
                     tts_runtime.stability_wake.clear()
@@ -6036,20 +6093,48 @@ def _create_app(
                     except asyncio.TimeoutError:
                         pass
             except asyncio.CancelledError:
+                _trace_event(
+                    "tts_stability_scheduler_cancelled",
+                    generation=int(tts_runtime.generation),
+                    pending_count=int(tts_runtime.ordered.pending_count),
+                )
                 raise
+            except Exception as exc:
+                tts_runtime.stability_stopping = True
+                _trace_event(
+                    "tts_stability_scheduler_failed",
+                    error_type=type(exc).__name__,
+                    generation=int(tts_runtime.generation),
+                    pending_count=int(tts_runtime.ordered.pending_count),
+                )
+                logger.warning(
+                    "TTS stability scheduler failed peer=%s error_type=%s pending=%d",
+                    peer,
+                    type(exc).__name__,
+                    int(tts_runtime.ordered.pending_count),
+                )
+                with suppress(Exception):
+                    await _emit_tts_status(
+                        "unavailable",
+                        reason="stability_scheduler_failed",
+                    )
 
         tts_runtime.stability_task = asyncio.create_task(_tts_stability_scheduler())
 
         async def _stop_tts_stability_scheduler(*, reason: str) -> None:
-            if bool(tts_runtime.stability_stopping):
-                return
             tts_runtime.stability_stopping = True
             tts_runtime.stability_wake.set()
             task = tts_runtime.stability_task
+            _trace_event(
+                "tts_stability_scheduler_stop",
+                reason=str(reason or ""),
+                generation=int(tts_runtime.generation),
+                pending_count=int(tts_runtime.ordered.pending_count),
+            )
             if task is not None and not task.done():
                 task.cancel()
             if task is not None:
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, Exception):
                     await task
             tts_runtime.stability_task = None
 
