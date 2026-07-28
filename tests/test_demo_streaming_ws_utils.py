@@ -1810,6 +1810,38 @@ def test_listener_page_fetches_only_the_fifo_head_and_stops_locally():
     assert "window.location.reload" not in TTS_LISTENER_HTML
 
 
+def test_listener_page_exposes_allowlisted_per_device_playback_rates():
+    assert 'id="playbackRate"' in TTS_LISTENER_HTML
+    for value in ("0.75", "1", "1.25", "1.5", "2"):
+        assert f'<option value="{value}"' in TTS_LISTENER_HTML
+    assert (
+        'const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";'
+        in TTS_LISTENER_HTML
+    )
+    assert (
+        "const SUPPORTED_PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);"
+        in TTS_LISTENER_HTML
+    )
+
+
+def test_listener_page_normalizes_and_persists_playback_rate_locally():
+    assert "function normalizePlaybackRate(value)" in TTS_LISTENER_HTML
+    assert (
+        "return SUPPORTED_PLAYBACK_RATES.has(parsed) ? parsed : 1;"
+        in TTS_LISTENER_HTML
+    )
+    assert (
+        "window.localStorage.getItem(PLAYBACK_RATE_STORAGE_KEY)"
+        in TTS_LISTENER_HTML
+    )
+    assert (
+        "window.localStorage.setItem(PLAYBACK_RATE_STORAGE_KEY, String(playbackRate))"
+        in TTS_LISTENER_HTML
+    )
+    assert 'playbackRateInput.addEventListener("change"' in TTS_LISTENER_HTML
+    assert 'send({ type: "set_playback_rate"' not in TTS_LISTENER_HTML
+
+
 def test_port_precheck_rejects_occupied_port():
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))

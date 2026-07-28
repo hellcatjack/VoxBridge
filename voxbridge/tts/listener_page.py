@@ -175,6 +175,39 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       gap: 12px;
     }
 
+    .playback-settings {
+      min-height: 64px;
+      margin-bottom: 12px;
+      padding: 10px 12px 10px 18px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(248, 250, 242, 0.74);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .playback-settings label {
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+    }
+
+    .playback-settings select {
+      min-width: 112px;
+      min-height: 42px;
+      padding: 0 34px 0 14px;
+      border: 1px solid rgba(56, 111, 93, 0.3);
+      border-radius: 12px;
+      color: var(--ink);
+      background: #fbfcf6;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
     button, .back-link {
       min-height: 54px;
       border: 1px solid transparent;
@@ -216,6 +249,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       main { min-height: 100svh; border: 0; border-radius: 0; padding: 28px 18px; }
       .status-grid { grid-template-columns: 1fr; }
       .status-card { min-height: 76px; flex-direction: row; align-items: center; }
+      .playback-settings { width: 100%; }
+      .playback-settings select { min-width: 0; width: min(132px, 42vw); }
       .actions { position: sticky; bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
     }
   </style>
@@ -249,6 +284,16 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     </section>
 
     <section>
+      <div class="playback-settings">
+        <label for="playbackRate">朗读速度</label>
+        <select id="playbackRate" aria-label="朗读速度">
+          <option value="0.75">0.75x</option>
+          <option value="1" selected>1.0x</option>
+          <option value="1.25">1.25x</option>
+          <option value="1.5">1.5x</option>
+          <option value="2">2.0x</option>
+        </select>
+      </div>
       <div class="actions">
         <button id="startListening" type="button">开始收听</button>
         <button id="stopListening" type="button" disabled>停止收听</button>
@@ -268,6 +313,27 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const queueStatus = document.getElementById("queueStatus");
     const playbackStatus = document.getElementById("playbackStatus");
     const nowPlaying = document.getElementById("nowPlaying");
+    const playbackRateInput = document.getElementById("playbackRate");
+    const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
+    const SUPPORTED_PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);
+
+    function normalizePlaybackRate(value) {
+      const parsed = Number(value);
+      return SUPPORTED_PLAYBACK_RATES.has(parsed) ? parsed : 1;
+    }
+
+    function readPlaybackRate() {
+      try {
+        return normalizePlaybackRate(
+          window.localStorage.getItem(PLAYBACK_RATE_STORAGE_KEY)
+        );
+      } catch (error) {
+        return 1;
+      }
+    }
+
+    let playbackRate = readPlaybackRate();
+    playbackRateInput.value = String(playbackRate);
 
     let socket = null;
     let listenerId = "";
@@ -496,6 +562,13 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       });
     });
     stopButton.addEventListener("click", stopListening);
+    playbackRateInput.addEventListener("change", () => {
+      playbackRate = normalizePlaybackRate(playbackRateInput.value);
+      playbackRateInput.value = String(playbackRate);
+      try {
+        window.localStorage.setItem(PLAYBACK_RATE_STORAGE_KEY, String(playbackRate));
+      } catch (error) {}
+    });
     window.addEventListener("beforeunload", () => {
       if (socket) socket.close(1000, "page closed");
     });
