@@ -331,6 +331,188 @@ def test_tts_audio_returns_503_when_synthesizer_is_unavailable():
     assert response.json()["detail"] == "TTS is unavailable"
 
 
+class _StableTTSSentenceASR(_FakeASR):
+    sentences = (
+        "这是第一句已经稳定完成并且长度足够。",
+        "这是第二句已经稳定完成并且长度足够。",
+        "这是第三句已经稳定完成并且长度足够。",
+    )
+
+    def streaming_transcribe(self, wav, state):
+        state.language = "Chinese"
+        state.text = "".join(self.sentences)
+        state.audio_accum = np.concatenate([state.audio_accum, np.asarray(wav, dtype=np.float32)])
+        return state
+
+    def finish_streaming_transcribe(self, state):
+        self.finish_calls += 1
+        state.language = "Chinese"
+        state.text = "".join(self.sentences)
+        return state
+
+
+def _collect_through_final(ws, max_steps=160):
+    events = []
+    for _ in range(max_steps):
+        event = ws.receive_json()
+        events.append(event)
+        if event.get("type") == "final":
+            return events
+    pytest.fail(f"did not receive final, seen={[event.get('type') for event in events]}")
+
+
+def test_ws_tts_defaults_off_and_marks_translation_stable():
+    args = _args()
+    args.final_redecode_on_stop = False
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ready = ws.receive_json()
+        assert ready["tts_available"] is True
+        assert ready["tts_enabled"] is False
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    translations = [event for event in events if event.get("type") == "sentence_translation"]
+    assert translations
+    assert all(event.get("is_stable") is True for event in translations)
+    assert not [event for event in events if event.get("type") == "tts_job"]
+
+
+def test_ws_tts_jobs_follow_source_order_and_precede_final():
+    class _OutOfOrderTranslator(_FakeTranslator):
+        def translate(self, text: str, source_language: str = None, target_language: str = None):
+            if text == _StableTTSSentenceASR.sentences[0]:
+                time.sleep(0.15)
+            return super().translate(text, source_language, target_language)
+
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.translation_workers = 3
+    args.tts_final_translation_drain_sec = 2.0
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_OutOfOrderTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ready = ws.receive_json()
+        assert ready["tts_available"] is True
+        ws.send_json(
+            {
+                "type": "start",
+                "tts_enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        started = _receive_until_type(ws, "started")
+        assert started["tts_enabled"] is True
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    jobs = [event for event in events if event.get("type") == "tts_job"]
+    assert len(jobs) == 3
+    assert [event["source_order"] for event in jobs] == [0, 1, 2]
+    assert len({event["sentence_id"] for event in jobs}) == 3
+    assert all(event["target_language"] == "English" for event in jobs)
+    assert all(event["is_stable"] is True for event in jobs)
+    assert max(events.index(event) for event in jobs) < next(
+        index for index, event in enumerate(events) if event.get("type") == "final"
+    )
+
+
+def test_ws_tts_failed_earlier_translation_does_not_block_later_jobs():
+    class _FirstFailsTranslator(_FakeTranslator):
+        def translate(self, text: str, source_language: str = None, target_language: str = None):
+            if text == _StableTTSSentenceASR.sentences[0]:
+                return ""
+            return super().translate(text, source_language, target_language)
+
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.tts_final_translation_drain_sec = 2.0
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FirstFailsTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "tts_enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        _receive_until_type(ws, "started")
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    jobs = [event for event in events if event.get("type") == "tts_job"]
+    assert [event["source_order"] for event in jobs] == [1, 2]
+
+
+def test_ws_disabling_tts_cancels_client_jobs_and_reports_status():
+    app = _create_app(
+        _args(),
+        _FakeASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "tts_enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        _receive_until_type(ws, "started")
+        job = app.state.tts_jobs.create(
+            owner_key="anonymous",
+            client_id="client-a-12345678",
+            sentence_id="s1",
+            revision=1,
+            source_order=0,
+            target_language="English",
+            text="Stable translation.",
+        )
+        ws.send_json(
+            {
+                "type": "set_tts_enabled",
+                "enabled": False,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        status = _receive_until_type(ws, "tts_status")
+
+    assert status["status"] == "disabled"
+    assert status["tts_enabled"] is False
+    assert client.post(f"/api/tts/jobs/{job.job_id}/audio").status_code == 404
+
+
 def test_debug_file_requires_auth_and_can_be_disabled(tmp_path):
     probe = tmp_path / "probe.txt"
     probe.write_text("debug-ok", encoding="utf-8")
@@ -2408,7 +2590,12 @@ def test_ws_discards_translation_from_superseded_sentence_revision(tmp_path):
     args.translation_workers = 3
     args.subtitle_trace_log = True
     args.subtitle_trace_log_file = str(tmp_path / "translation-revisions.jsonl")
-    app = _create_app(args, asr, translator=translator)
+    app = _create_app(
+        args,
+        asr,
+        translator=translator,
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
     client = TestClient(app)
 
     events = []
@@ -2417,6 +2604,14 @@ def test_ws_discards_translation_from_superseded_sentence_revision(tmp_path):
             ws.receive_json()  # ready
             ws.send_text('{"type":"set_translation_direction","translation_direction":"en2zh"}')
             _receive_until_type(ws, "translation_direction")
+            ws.send_json(
+                {
+                    "type": "set_tts_enabled",
+                    "enabled": True,
+                    "tts_client_id": "client-a-12345678",
+                }
+            )
+            _receive_until_type(ws, "tts_status")
 
             raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
             for _ in range(2):
@@ -2476,6 +2671,13 @@ def test_ws_discards_translation_from_superseded_sentence_revision(tmp_path):
     assert published
     assert {int(msg["revision"]) for msg in published} == {latest_revision}
     assert {str(msg.get("translation", "")) for msg in published} == {f"translated:{asr.s2_long}"}
+    spoken = [
+        msg
+        for msg in events
+        if msg.get("type") == "tts_job" and str(msg.get("sentence_id", "")) == sid
+    ]
+    assert spoken
+    assert {int(msg["revision"]) for msg in spoken} == {latest_revision}
     trace_rows = [
         json.loads(line)
         for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()

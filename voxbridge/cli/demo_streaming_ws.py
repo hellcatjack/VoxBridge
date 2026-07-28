@@ -53,7 +53,7 @@ from voxbridge.streaming.context_schedule import (
 )
 from voxbridge.streaming.segment_policy import SegmentPolicy
 from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overlap
-from voxbridge.tts.jobs import TTSJobNotFound, TTSJobRegistry
+from voxbridge.tts.jobs import OrderedTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
 from voxbridge.tts.kokoro_onnx import TTSSynthesisError
 
 SAMPLE_RATE = 16000
@@ -5013,6 +5013,22 @@ def _create_app(
             target_language=initial_translation_target,
             latest_by_sentence={},
         )
+        tts_runtime = SimpleNamespace(
+            available=bool(tts_synthesizer is not None and translator is not None),
+            enabled=False,
+            client_id="",
+            generation=0,
+            next_source_order=0,
+            sentence_orders={},
+            ordered=OrderedTTSBuffer(),
+            owner_key=(
+                "anonymous"
+                if not auth.enabled
+                else hashlib.sha256(
+                    f"auth:{websocket.cookies.get(AUTH_COOKIE_NAME)}".encode("utf-8")
+                ).hexdigest()
+            ),
+        )
         subtitle_trace_log = bool(getattr(args, "subtitle_trace_log", False))
         subtitle_trace_log_partial_every = max(1, int(getattr(args, "subtitle_trace_log_partial_every", 20)))
         subtitle_trace_log_file = str(getattr(args, "subtitle_trace_log_file", "") or "").strip()
@@ -5481,6 +5497,179 @@ def _create_app(
                     break
             return dropped
 
+        def _reset_tts_ordering() -> None:
+            tts_runtime.generation += 1
+            tts_runtime.next_source_order = 0
+            tts_runtime.sentence_orders.clear()
+            tts_runtime.ordered.reset()
+
+        async def _emit_tts_status(status: str, **payload: Any) -> None:
+            message = {
+                "type": "tts_status",
+                "status": str(status or ""),
+                "tts_available": bool(tts_runtime.available),
+                "tts_enabled": bool(tts_runtime.enabled),
+            }
+            if payload:
+                message.update(payload)
+            await _send_json(message)
+
+        async def _configure_tts(
+            enabled: bool,
+            client_id: str,
+            *,
+            emit: bool,
+            force_reset: bool = False,
+        ) -> bool:
+            requested_enabled = bool(enabled)
+            requested_client_id = str(client_id or tts_runtime.client_id or "")
+            if requested_enabled:
+                requested_client_id = _validated_tts_client_id(requested_client_id)
+            elif requested_client_id:
+                requested_client_id = _validated_tts_client_id(requested_client_id)
+
+            previous_enabled = bool(tts_runtime.enabled)
+            previous_client_id = str(tts_runtime.client_id or "")
+            if requested_enabled and not tts_runtime.available:
+                requested_enabled = False
+
+            changed = (
+                requested_enabled != previous_enabled
+                or requested_client_id != previous_client_id
+            )
+            if force_reset or changed:
+                _reset_tts_ordering()
+
+            if previous_enabled and (
+                not requested_enabled or requested_client_id != previous_client_id
+            ):
+                app.state.tts_jobs.cancel_client(
+                    str(tts_runtime.owner_key),
+                    previous_client_id,
+                )
+
+            tts_runtime.enabled = requested_enabled
+            tts_runtime.client_id = requested_client_id
+            status = "enabled" if requested_enabled else "disabled"
+            if bool(enabled) and not tts_runtime.available:
+                status = "unavailable"
+            if emit:
+                await _emit_tts_status(status)
+            _trace_event(
+                "tts_configured",
+                status=status,
+                enabled=bool(tts_runtime.enabled),
+                available=bool(tts_runtime.available),
+                changed=bool(changed),
+                generation=int(tts_runtime.generation),
+            )
+            return bool(tts_runtime.enabled)
+
+        def _register_tts_source(sentence_id: str, revision: int) -> None:
+            if not tts_runtime.enabled:
+                return
+            sid = str(sentence_id or "")
+            if not sid:
+                return
+            generation = int(tts_runtime.generation)
+            registered = tts_runtime.sentence_orders.get(sid)
+            if registered is None:
+                source_order = int(tts_runtime.next_source_order)
+                tts_runtime.next_source_order += 1
+                tts_runtime.sentence_orders[sid] = (source_order, generation)
+            else:
+                source_order, registered_generation = registered
+                if int(registered_generation) != generation:
+                    return
+            tts_runtime.ordered.register(sid, int(revision), int(source_order))
+            _trace_event(
+                "tts_source_registered",
+                sentence_id=sid,
+                revision=int(revision),
+                source_order=int(source_order),
+                generation=generation,
+            )
+
+        async def _publish_tts_ready(items: List[Any]) -> None:
+            for item in items:
+                if not tts_runtime.enabled:
+                    return
+                try:
+                    job = app.state.tts_jobs.create(
+                        owner_key=str(tts_runtime.owner_key),
+                        client_id=str(tts_runtime.client_id),
+                        sentence_id=str(item.sentence_id),
+                        revision=int(item.revision),
+                        source_order=int(item.source_order),
+                        target_language=str(item.target_language),
+                        text=str(item.text),
+                    )
+                except TTSQueueFull:
+                    _trace_event(
+                        "tts_job_rejected",
+                        reason="queue_full",
+                        sentence_id=str(item.sentence_id),
+                        revision=int(item.revision),
+                        source_order=int(item.source_order),
+                    )
+                    await _emit_tts_status("queue_full")
+                    continue
+                await _send_json(
+                    {
+                        "type": "tts_job",
+                        "job_id": job.job_id,
+                        "sentence_id": job.sentence_id,
+                        "revision": int(job.revision),
+                        "source_order": int(job.source_order),
+                        "target_language": job.target_language,
+                        "is_stable": True,
+                    }
+                )
+                _trace_event(
+                    "tts_job_issued",
+                    sentence_id=job.sentence_id,
+                    revision=int(job.revision),
+                    source_order=int(job.source_order),
+                    target_language=job.target_language,
+                    translated_chars=len(job.text),
+                    translated_hash8=_hash8(job.text),
+                )
+
+        async def _mark_tts_translation_ready(
+            sentence_id: str,
+            revision: int,
+            translated: str,
+            target_language: str,
+        ) -> None:
+            registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
+            if not tts_runtime.enabled or registered is None:
+                return
+            _, registered_generation = registered
+            if int(registered_generation) != int(tts_runtime.generation):
+                return
+            ready = tts_runtime.ordered.mark_ready(
+                str(sentence_id),
+                int(revision),
+                str(translated),
+                str(target_language),
+            )
+            await _publish_tts_ready(ready)
+
+        async def _mark_tts_translation_failed(sentence_id: str, revision: int) -> None:
+            registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
+            if not tts_runtime.enabled or registered is None:
+                return
+            _, registered_generation = registered
+            if int(registered_generation) != int(tts_runtime.generation):
+                return
+            ready = tts_runtime.ordered.mark_failed(str(sentence_id), int(revision))
+            _trace_event(
+                "tts_translation_skipped",
+                sentence_id=str(sentence_id or ""),
+                revision=int(revision),
+            )
+            await _publish_tts_ready(ready)
+
         async def _set_translation_direction(
             direction_raw: Any,
             *,
@@ -5508,6 +5697,12 @@ def _create_app(
                 translation_runtime.task = None
                 dropped = await _clear_translation_queue()
                 translation_runtime.latest_by_sentence.clear()
+                if changed and tts_runtime.enabled:
+                    app.state.tts_jobs.cancel_client(
+                        str(tts_runtime.owner_key),
+                        str(tts_runtime.client_id),
+                    )
+                    _reset_tts_ordering()
 
             _trace_event(
                 "translation_direction_set",
@@ -5745,6 +5940,16 @@ def _create_app(
                 revision=int(revision),
             )
             if not translated:
+                current_item = _current_translation_item(
+                    sentence_id,
+                    revision,
+                    sentence_text,
+                    state_gen_hint,
+                    direction,
+                    phase="empty_result",
+                )
+                if current_item is not None:
+                    await _mark_tts_translation_failed(sentence_id, revision)
                 return ""
             current_item = _current_translation_item(
                 sentence_id,
@@ -5777,7 +5982,14 @@ def _create_app(
                     "revision": int(revision),
                     "translation": translated,
                     "seq": int(seq_hint or 0),
+                    "is_stable": True,
                 }
+            )
+            await _mark_tts_translation_ready(
+                sentence_id,
+                revision,
+                translated,
+                target_language,
             )
             return translated
 
@@ -5908,10 +6120,18 @@ def _create_app(
             try:
                 translation_runtime.queue.put_nowait(item)
             except asyncio.QueueFull:
+                dropped_item = None
                 with suppress(asyncio.QueueEmpty):
-                    translation_runtime.queue.get_nowait()
+                    dropped_item = translation_runtime.queue.get_nowait()
                 with suppress(asyncio.QueueFull):
                     translation_runtime.queue.put_nowait(item)
+                if isinstance(dropped_item, tuple) and len(dropped_item) >= 2:
+                    asyncio.create_task(
+                        _mark_tts_translation_failed(
+                            str(dropped_item[0]),
+                            int(dropped_item[1]),
+                        )
+                    )
             _trace_event(
                 "translation_queued",
                 sentence_id=str(sentence_id),
@@ -7547,6 +7767,7 @@ def _create_app(
                 sentence_item["zh"] = upgraded
                 revision = int(sentence_item.get("revision", 1) or 1) + 1
                 sentence_item["revision"] = int(revision)
+                _register_tts_source(sentence_id, revision)
                 _record_completed_candidate(i, upgraded, sentence_id)
                 preserved_translation = str(sentence_item.get("en", "") or "")
                 if small_upgrade_source:
@@ -7730,6 +7951,7 @@ def _create_app(
                         "seq": int(seq_hint or 0),
                     }
                 )
+                _register_tts_source(sentence_id, revision)
                 committed_added += 1
                 _trace_event(
                     "sentence_new_commit",
@@ -8540,6 +8762,7 @@ def _create_app(
                 subtitle_state.committed_sentences = []
                 subtitle_state.sentence_items = []
                 translation_runtime.latest_by_sentence.clear()
+                _reset_tts_ordering()
                 subtitle_state.commit_base = 0
                 _reset_completed_candidate_cursor()
                 subtitle_state.prev_completed_sentences = []
@@ -8635,6 +8858,7 @@ def _create_app(
                 subtitle_state.committed_sentences = []
                 subtitle_state.sentence_items = []
                 translation_runtime.latest_by_sentence.clear()
+                _reset_tts_ordering()
                 subtitle_state.commit_base = 0
                 _reset_completed_candidate_cursor()
                 subtitle_state.prev_completed_sentences = []
@@ -8670,9 +8894,31 @@ def _create_app(
                     committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
                     committed_count=int(len(subtitle_state.committed_sentences)),
                 )
-            if translation_runtime.task is not None and not translation_runtime.task.done():
-                with suppress(asyncio.TimeoutError, Exception):
-                    await asyncio.wait_for(asyncio.shield(translation_runtime.task), timeout=1.2)
+            translation_task = translation_runtime.task
+            if translation_task is not None and not translation_task.done():
+                translation_drain_sec = (
+                    max(0.1, float(getattr(args, "tts_final_translation_drain_sec", 5.0)))
+                    if tts_runtime.enabled
+                    else 1.2
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(translation_task),
+                        timeout=translation_drain_sec,
+                    )
+                except asyncio.TimeoutError:
+                    if tts_runtime.enabled:
+                        _trace_event(
+                            "tts_final_translation_drain_timeout",
+                            timeout_ms=int(translation_drain_sec * 1000),
+                            queue_depth=int(translation_runtime.queue.qsize()),
+                        )
+                        await _emit_tts_status(
+                            "translation_drain_timeout",
+                            timeout_ms=int(translation_drain_sec * 1000),
+                        )
+                except Exception:
+                    pass
             payload["translation"] = _committed_translation_text()
             _attach_stability(
                 payload,
@@ -8712,6 +8958,8 @@ def _create_app(
                     "translation_direction": str(translation_runtime.direction or "zh2en"),
                     "translation_source_language": str(translation_runtime.source_language or ""),
                     "translation_target_language": str(translation_runtime.target_language or ""),
+                    "tts_available": bool(tts_runtime.available),
+                    "tts_enabled": bool(tts_runtime.enabled),
                 }
             )
             consumer_task = asyncio.create_task(_audio_consumer())
@@ -8803,8 +9051,12 @@ def _create_app(
                         requested_translation_direction = _normalize_translation_direction(
                             payload.get("translation_direction", translation_runtime.direction)
                         )
+                        requested_tts_enabled = bool(payload.get("tts_enabled", False))
+                        requested_tts_client_id = str(payload.get("tts_client_id", "") or "")
                         requested_context_terms: Optional[Tuple[str, ...]] = None
                         try:
+                            if requested_tts_enabled:
+                                _validated_tts_client_id(requested_tts_client_id)
                             if "asr_context_terms" in payload:
                                 requested_context_terms = normalize_session_context_terms(
                                     payload.get("asr_context_terms"),
@@ -8914,6 +9166,12 @@ def _create_app(
                                 translation_runtime.source_language,
                                 translation_runtime.target_language,
                             ) = _resolve_direction_languages(requested_translation_direction)
+                            await _configure_tts(
+                                requested_tts_enabled,
+                                requested_tts_client_id,
+                                emit=False,
+                                force_reset=True,
+                            )
                             subtitle_state.stream_uid = f"{int(time.time() * 1000)}-{int(time.monotonic_ns() % 1000000)}"
                             subtitle_state.next_sentence_id = 1
                             subtitle_state.committed_sentences = []
@@ -8970,6 +9228,8 @@ def _create_app(
                                     "translation_direction": str(translation_runtime.direction or "zh2en"),
                                     "translation_source_language": str(translation_runtime.source_language or ""),
                                     "translation_target_language": str(translation_runtime.target_language or ""),
+                                    "tts_available": bool(tts_runtime.available),
+                                    "tts_enabled": bool(tts_runtime.enabled),
                                     "asr_context_active": bool(requested_effective_terms),
                                     "asr_context_term_count": len(requested_effective_terms),
                                     "asr_context_chars": len(context_text),
@@ -8996,6 +9256,19 @@ def _create_app(
                             clear_pending=True,
                             emit=True,
                         )
+                        continue
+
+                    if msg_type == "set_tts_enabled":
+                        try:
+                            await _configure_tts(
+                                bool(payload.get("enabled", False)),
+                                str(payload.get("tts_client_id", "") or ""),
+                                emit=True,
+                            )
+                        except HTTPException as exc:
+                            await _send_json(
+                                {"type": "error", "message": str(exc.detail)}
+                            )
                         continue
 
                     if msg_type == "finish":
