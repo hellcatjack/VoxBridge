@@ -162,7 +162,14 @@ class KokoroOnnxSynthesizer:
                 else:
                     if self._zh_g2p is None:
                         self._zh_g2p = self._zh_g2p_factory()
-                    model_input = self._zh_g2p(text)
+                    phoneme_result = self._zh_g2p(text)
+                    model_input = (
+                        phoneme_result[0]
+                        if isinstance(phoneme_result, tuple)
+                        else phoneme_result
+                    )
+                    if not isinstance(model_input, str) or not model_input:
+                        raise TTSSynthesisError("Chinese G2P returned invalid phonemes")
                     voice = self.config.chinese_voice
                     lang = "cmn"
                     is_phonemes = True

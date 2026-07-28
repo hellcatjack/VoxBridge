@@ -51,9 +51,9 @@ class FakeChineseG2P:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def __call__(self, text: str) -> str:
+    def __call__(self, text: str):
         self.calls.append(text)
-        return "ni↓ xau↓"
+        return "ni↓ xau↓", None
 
 
 def make_config(tmp_path, **overrides) -> KokoroTTSConfig:
