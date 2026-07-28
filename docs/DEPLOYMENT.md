@@ -149,6 +149,13 @@ multiplier (`0.8x` through `1.2x` in `0.1x` steps) stored per browser; changing 
 restart the service, alter another device, or create another synthesis/cache
 variant.
 
+Listener prefetch is bounded to a single future FIFO item. It overlaps lazy
+Kokoro synthesis and WAV transfer with current playback while retaining at most
+one complete unplayed WAV per browser. Stop and disconnect abort outstanding
+preparation. This does not increase Kokoro inference concurrency because the
+backend synthesis lock remains global, and it does not guarantee a gapless
+transition when synthesis is slower than the clip already playing.
+
 `--tts-listener-queue-size` bounds unread metadata per device. A listener that
 cannot keep up is disconnected without delaying other listeners. The shared job
 registry is bounded by `--tts-max-client-jobs` and jobs expire after

@@ -39,6 +39,14 @@ current and queued audio, and is never sent through HTTP or WebSocket. All
 listeners therefore continue receiving the same shared synthesized WAV. A
 stored value outside the current allowlist falls back to `1.0x`.
 
+The listener uses a bounded single-item lookahead: while one FIFO item is
+playing, only the next queued job may fetch and prepare its complete WAV. The
+prepared bytes are reused when that job becomes current, and Stop, disconnect,
+or reload aborts outstanding preparation. `tts_received` still means the full
+WAV reached that browser, so a prefetched job can be acknowledged before local
+playback. No endpoint or WebSocket message changes. If synthesis takes longer
+than the current clip, a residual transition wait remains.
+
 ### `GET /login`
 
 Returns the login page when authentication is enabled.

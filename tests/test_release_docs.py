@@ -96,6 +96,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "1.2x" in readme
     assert "0.75x" not in readme
     assert "2.0x" not in readme
+    assert "单条预取" in readme
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
 
     assert "GET /listen" in api
@@ -111,6 +112,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert '"is_stable": true' in api
     assert "per-device" in api.lower()
     assert "localStorage" in api
+    assert "single-item lookahead" in api
 
     assert "--enable-tts" in deployment
     assert "--tts-en-model-path" in deployment
@@ -118,6 +120,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "--tts-listener-queue-size" in deployment
     assert "--tts-speed" in deployment
     assert "listener-side" in deployment.lower()
+    assert "bounded" in deployment.lower()
     assert "CPUExecutionProvider" in deployment
     assert "/listen" in deployment
     assert "Kokoro" in changelog
