@@ -68,8 +68,10 @@ memory. The translated text never appears in the URL.
 
 ### `DELETE /api/tts/clients/{client_id}/jobs`
 
-Cancels every unread job owned by the current authenticated session and page
-client. The browser calls this when the user disables translated speech.
+Cancels every unread job owned by the current session and page client. The
+session is authenticated when `--auth-enabled` is in use and anonymous only in
+trusted local mode. The browser calls this when the user disables translated
+speech.
 
 ## WebSocket Endpoint
 
@@ -171,8 +173,8 @@ the page client. It does not rewrite subtitle text.
 ### `finish`
 
 Requests graceful stop. The backend drains queued audio for tail accuracy,
-flushes the current ASR state, commits the final safe tail, waits briefly for
-pending translation work, and sends one `final` message.
+flushes the current ASR state, commits the final safe tail, waits for pending
+stable translation work when TTS is enabled, and sends one `final` message.
 
 ```json
 {

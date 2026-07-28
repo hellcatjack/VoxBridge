@@ -613,7 +613,7 @@ def test_ws_stop_waits_for_inflight_tts_publication_before_redecode(monkeypatch)
     args.final_redecode_on_stop = True
     args.final_redecode_max_sec = 30.0
     args.translation_workers = 2
-    args.tts_final_translation_drain_sec = 2.0
+    args.tts_final_translation_drain_sec = 0.1
     asr = _TwoSentenceASR()
     asr.transcribe_language = "Chinese"
     asr.transcribe_text = "".join(asr.sentences)
@@ -653,7 +653,14 @@ def test_ws_stop_waits_for_inflight_tts_publication_before_redecode(monkeypatch)
         release_send.set()
 
     jobs = [event for event in events if event.get("type") == "tts_job"]
+    slow_statuses = [
+        event
+        for event in events
+        if event.get("type") == "tts_status"
+        and event.get("status") == "translation_drain_timeout"
+    ]
     assert [event["source_order"] for event in jobs] == [0, 1]
+    assert [event.get("phase") for event in slow_statuses] == ["before_final_redecode"]
     assert asr.transcribe_calls == []
     assert asr.finish_calls == 1
 
