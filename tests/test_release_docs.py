@@ -77,3 +77,29 @@ def test_public_docs_describe_esv_zh_en_translation_policy():
     assert "ESV" in api
     assert "ESV" in changelog
     assert "不补全" in readme
+
+
+def test_public_docs_describe_optional_kokoro_tts_contract():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    api = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "Kokoro-82M" in readme
+    assert "CPU-only" in readme
+    assert "FIFO" in readme
+    assert "默认关闭" in readme
+    assert "系统声音" in readme
+    assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
+
+    assert "POST /api/tts/jobs/{job_id}/audio" in api
+    assert "DELETE /api/tts/jobs/{job_id}" in api
+    assert "DELETE /api/tts/clients/{client_id}/jobs" in api
+    assert '"type": "tts_job"' in api
+    assert '"is_stable": true' in api
+
+    assert "--enable-tts" in deployment
+    assert "--tts-en-model-path" in deployment
+    assert "--tts-zh-model-path" in deployment
+    assert "CPUExecutionProvider" in deployment
+    assert "Kokoro" in changelog

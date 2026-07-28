@@ -12,6 +12,7 @@ VoxBridge 是一个面向会议、新闻和演讲场景的实时语音识别与�
 - 支持页面输入会话级专业术语 Context，也支持后端加载有界、分时段的 context schedule。
 - 最近 100 条字幕可滚动查询；默认跟随最新内容，用户手动滚动时暂停自动跟随。
 - 支持上下字幕字体调整、移动端布局、控制栏自动隐藏和返回最新字幕按钮。
+- 可选使用 CPU-only Kokoro-82M 按稳定译文顺序实时朗读，浏览器严格 FIFO 播放且不会覆盖正在朗读的内容。
 - 可选单用户登录、Secure Cookie、结构化字幕 trace 和文本池诊断日志。
 
 ## 工作流程
@@ -25,6 +26,8 @@ Browser PCM audio
   -> sentence_id + revision
   -> OpenAI-compatible translation API
   -> bilingual subtitle rows
+  -> stable translation TTS job
+  -> browser FIFO audio playback
 ```
 
 浏览器只负责持续发送 PCM 音频和渲染后端事件。生成中的 `partial` 可以变化；已固化句子通过 `sentence_committed` 创建，通过 `sentence_updated` 更新同一个 `sentence_id`。翻译结果绑定具体 `revision`，过期结果不会覆盖新文本。
@@ -50,6 +53,14 @@ cd VoxBridge
 uv venv .venv --python 3.10
 uv pip install --python .venv/bin/python -e .
 ```
+
+需要译文朗读时，额外安装不含 GPU runtime 的 TTS extra：
+
+```bash
+uv pip install --python .venv/bin/python -e '.[tts]'
+```
+
+安装前建议先加 `--dry-run`，确认求解结果不会卸载或替换已有的 Torch、Triton、ROCm/CUDA 包。
 
 如果 VoxBridge 位于现有 Qwen3-ASR 工作区内，可直接执行
 `uv pip install --python ../.venv/bin/python -e .`，不要重复创建环境。
@@ -98,6 +109,19 @@ ss -lntp | rg ':8024'
 - 日志只记录启用状态、数量、字符数和 SHA-256 指纹，不回显术语正文。
 
 完整字段和 schedule 格式见 [后端 API](docs/API.md)。
+
+## 译文朗读（Kokoro-82M）
+
+译文朗读默认关闭，必须同时启用翻译和 `--enable-tts`，再由用户在页面勾选“朗读译文”。后端只为 `is_stable: true` 的完整译文创建任务；多个翻译 worker 即使乱序完成，也会按源句顺序发出任务。浏览器一次只合成、解码并播放一条，上一条结束后才读取下一条。
+
+模型资产不进入 Git。部署时在 `models/kokoro/` 放置：
+
+- `kokoro-v1.0.onnx` 与 `voices-v1.0.bin`：英语 Kokoro v1.0。
+- `kokoro-v1.1-zh.onnx`、`voices-v1.1-zh.bin` 与 `config-v1.1-zh.json`：中文 Kokoro v1.1-zh。
+
+模型来源应使用 [kokoro-onnx 官方 release](https://github.com/thewh1teagle/kokoro-onnx/releases) 和 [Kokoro-82M-v1.1-zh 官方模型页](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)。完整启动参数见 [部署指南](docs/DEPLOYMENT.md)。
+
+Stop 只停止识别，已经进入浏览器 FIFO 的译文会继续读完；取消勾选会立即停止当前朗读并清空待播任务。使用“系统声音”输入时，扬声器输出可能被共享音频再次采集，页面会提示“系统声音可能回采朗读”；建议使用耳机。
 
 ## 公网认证
 

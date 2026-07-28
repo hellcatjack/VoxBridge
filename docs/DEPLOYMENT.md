@@ -21,6 +21,32 @@ uv venv .venv --python 3.10
 uv pip install --python .venv/bin/python -e .
 ```
 
+For optional Kokoro translated speech, install the isolated CPU TTS extra after
+the accelerator stack is already correct:
+
+```bash
+uv pip install --dry-run --python .venv/bin/python -e '.[tts]'
+uv pip install --python .venv/bin/python -e '.[tts]'
+```
+
+The dry-run must not uninstall or replace Torch, Triton, ROCm/CUDA, or install a
+CUDA-flavored Torch wheel. The TTS extra uses ONNX Runtime
+`CPUExecutionProvider`; it does not share vLLM GPU memory.
+
+Create `models/kokoro/` and obtain these assets from the official
+`thewh1teagle/kokoro-onnx` releases and `hexgrad/Kokoro-82M-v1.1-zh` model page:
+
+```text
+models/kokoro/kokoro-v1.0.onnx
+models/kokoro/voices-v1.0.bin
+models/kokoro/kokoro-v1.1-zh.onnx
+models/kokoro/voices-v1.1-zh.bin
+models/kokoro/config-v1.1-zh.json
+```
+
+Download to a `.part` file, verify the published size/hash, and atomically
+rename it. Model binaries remain outside Git.
+
 Confirm that the selected environment imports the installed package:
 
 ```bash
@@ -93,7 +119,24 @@ Add translation, VAD, context schedule, queue, or model-memory flags to `ExecSta
 .venv/bin/python -m voxbridge.cli.demo_streaming_ws --help
 ```
 
+After a translation backend is configured and verified, append these TTS flags
+to the same `ExecStart` command:
+
+```text
+--enable-tts
+--tts-en-model-path models/kokoro/kokoro-v1.0.onnx
+--tts-en-voices-path models/kokoro/voices-v1.0.bin
+--tts-zh-model-path models/kokoro/kokoro-v1.1-zh.onnx
+--tts-zh-voices-path models/kokoro/voices-v1.1-zh.bin
+--tts-zh-vocab-path models/kokoro/config-v1.1-zh.json
+--tts-cpu-threads 4
+```
+
 Translation endpoints and model names are deployment-specific. Keep API keys outside the unit file.
+TTS remains disabled in each browser until the user selects “朗读译文”. Stop
+preserves already queued speech; turning the option off stops and clears it.
+When capturing system audio, use headphones to avoid feeding synthesized speech
+back into ASR.
 
 Load and start the service:
 
@@ -176,6 +219,7 @@ For rollback, select a previously verified commit or annotated tag, reinstall th
 - Prefer graceful WebSocket `finish` and systemd stop before replacement.
 - Confirm old backend and EngineCore PIDs exit before starting another model process.
 - Monitor `NRestarts`, process RSS, GPU memory, GTT, queue depth, and queue-drop trace fields during long sessions.
+- Monitor CPU load and process RSS after enabling Kokoro. TTS synthesis is globally serialized; high backlog degrades by increasing spoken delay rather than starting concurrent CPU model runs.
 - Treat logs, audio, translations, subtitle traces, and screenshots as sensitive meeting data.
 - Keep credentials in mode `0600` runtime files or a dedicated secret manager.
 - Keep the service on port `8024`; changing the public proxy port does not change the backend contract.

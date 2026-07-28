@@ -51,6 +51,23 @@ Use this endpoint only for local diagnostics. Do not expose it on an untrusted
 network. When authentication is enabled, this endpoint requires a valid session.
 When `--disable-debug-file` is set, this endpoint always returns `404`.
 
+### `POST /api/tts/jobs/{job_id}/audio`
+
+Returns one backend-issued TTS job as `audio/wav`. The route requires the same
+authenticated cookie session that owns the job, uses `Cache-Control: no-store`,
+and returns `404` for absent, expired, or foreign jobs. Synthesis runs one job at
+a time on the CPU; a generated WAV is cached in memory only until acknowledgement.
+
+### `DELETE /api/tts/jobs/{job_id}`
+
+Acknowledges playback preparation and removes the job plus cached WAV from
+memory. The translated text never appears in the URL.
+
+### `DELETE /api/tts/clients/{client_id}/jobs`
+
+Cancels every unread job owned by the current authenticated session and page
+client. The browser calls this when the user disables translated speech.
+
 ## WebSocket Endpoint
 
 ### `WS /ws`
@@ -91,7 +108,9 @@ translations, alignment counters, and audio queues.
   "type": "start",
   "language": "English",
   "translation_direction": "en2zh",
-  "asr_context_terms": ["Elisha", "Jordan"]
+  "asr_context_terms": ["Elisha", "Jordan"],
+  "tts_enabled": true,
+  "tts_client_id": "page-9054a7d8-7f3e-4fd4-a147"
 }
 ```
 
@@ -105,6 +124,10 @@ Fields:
   significant: a non-empty array overrides the configured context schedule, an
   empty array explicitly disables context, and an omitted field preserves the
   configured schedule for legacy clients.
+- `tts_enabled`: optional boolean; defaults to `false`. Enabling affects stable
+  sentences committed after this start and requires server-side TTS support.
+- `tts_client_id`: required when TTS is enabled. It is a page-generated opaque
+  identifier used only for bounded job ownership and cancellation.
 
 `start` validates and constructs the replacement ASR state before resetting the
 active session. Invalid context therefore returns `error` without replacing the
@@ -125,6 +148,22 @@ translation work.
 Recommended UI behavior is to send this before `start` and lock the selector
 during an active session, because the ASR force language and translation
 direction should not drift apart mid-session.
+
+### `set_tts_enabled`
+
+Changes translated speech without changing ASR or translation state:
+
+```json
+{
+  "type": "set_tts_enabled",
+  "enabled": false,
+  "tts_client_id": "page-9054a7d8-7f3e-4fd4-a147"
+}
+```
+
+Enabling applies only to future stable source sentences. Disabling increments
+the TTS generation, clears pending ordering state, and cancels unread jobs for
+the page client. It does not rewrite subtitle text.
 
 ### `finish`
 
@@ -165,7 +204,9 @@ First message after WebSocket accept.
   "sample_rate": 16000,
   "translation_direction": "zh2en",
   "translation_source_language": "中文",
-  "translation_target_language": "English"
+  "translation_target_language": "English",
+  "tts_available": true,
+  "tts_enabled": false
 }
 ```
 
@@ -180,6 +221,8 @@ Sent after `start` is applied.
   "translation_direction": "en2zh",
   "translation_source_language": "English",
   "translation_target_language": "中文",
+  "tts_available": true,
+  "tts_enabled": true,
   "asr_context_active": true,
   "asr_context_term_count": 2,
   "asr_context_chars": 13
@@ -302,7 +345,8 @@ Sent when a committed or updated sentence has a translation.
   "sentence_id": "1781901841676-386666-1",
   "revision": 2,
   "translation": "译文",
-  "seq": 44
+  "seq": 44,
+  "is_stable": true
 }
 ```
 
@@ -311,6 +355,35 @@ highest received `revision`. The backend checks sentence ID, revision, source
 text, stream generation, and translation direction both before inference and
 before publication. A superseded result is discarded and is never sent as a
 `sentence_translation` event.
+
+### `tts_job`
+
+Sent only after the current stable `sentence_id` and `revision` translation has
+passed the backend pre- and post-inference guards. It contains no text or audio:
+
+```json
+{
+  "type": "tts_job",
+  "job_id": "opaque-random-token",
+  "sentence_id": "1781901841676-386666-1",
+  "revision": 2,
+  "source_order": 7,
+  "target_language": "Chinese",
+  "is_stable": true
+}
+```
+
+Parallel translations are reordered by `source_order`. A failed current
+translation is explicitly skipped so it cannot block later jobs; a stale
+revision cannot advance the queue or produce spoken output. The browser must
+append jobs to a strict FIFO and wait for the active audio `ended` event before
+fetching the next item.
+
+### `tts_status`
+
+Reports `enabled`, `disabled`, `unavailable`, `queue_full`, or
+`translation_drain_timeout`, together with `tts_available` and `tts_enabled`.
+ASR and subtitle translation continue if TTS is unavailable or full.
 
 ### `sentence_reset`
 
@@ -365,6 +438,13 @@ Sent once after `finish`.
 `text` can be only the final ASR state, especially when full final re-decode is
 skipped by `--final-redecode-max-sec`. Use `committed_text` and sentence events
 as the canonical subtitle stream.
+
+When TTS is enabled, the backend waits up to
+`--tts-final-translation-drain-sec` for pending stable translations and sends
+all available `tts_job` events before `final`. It does not wait for CPU
+synthesis or browser playback. The browser may therefore close the WebSocket on
+`final` and continue consuming authenticated HTTP jobs. Stop preserves the
+browser queue; disabling TTS clears it.
 
 ### Other Messages
 

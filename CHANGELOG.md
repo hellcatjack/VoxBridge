@@ -8,6 +8,10 @@ All notable public changes to VoxBridge are documented here.
 
 - Applied a shared, anti-hallucination ESV terminology policy to both
   Chinese-to-English translation backends.
+- Added optional CPU-only Kokoro-82M speech for fully stable translated
+  sentences, with backend source-order jobs and strict browser FIFO playback.
+- Added authenticated in-memory TTS audio jobs, acknowledgement/cancellation,
+  TTL cleanup, and default-off browser controls.
 
 ## [0.2.0] - 2026-07-23
 
