@@ -47,3 +47,17 @@ def test_listener_rate_control_fits_mobile_without_horizontal_overflow(listener_
     ) is True
     assert listener_page.locator("#startListening").is_visible()
     assert listener_page.locator("#stopListening").is_visible()
+
+
+def test_rate_change_updates_persistent_media_element(listener_page):
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.5")
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.defaultPlaybackRate"
+    ) == 1.5
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.preservesPitch"
+    ) is True

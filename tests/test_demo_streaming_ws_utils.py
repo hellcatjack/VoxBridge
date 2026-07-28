@@ -1804,7 +1804,7 @@ def test_listener_page_fetches_only_the_fifo_head_and_stops_locally():
     assert "for (let attempt = 0; attempt < 2; attempt += 1)" in TTS_LISTENER_HTML
     assert "await response.arrayBuffer();" in TTS_LISTENER_HTML
     assert "abortController.abort();" in TTS_LISTENER_HTML
-    assert "sourceNode.stop();" in TTS_LISTENER_HTML
+    assert "stopActivePlayback();" in TTS_LISTENER_HTML
     assert "queue = [];" in TTS_LISTENER_HTML
     assert "set_tts_enabled" not in TTS_LISTENER_HTML
     assert "window.location.reload" not in TTS_LISTENER_HTML
@@ -1840,6 +1840,34 @@ def test_listener_page_normalizes_and_persists_playback_rate_locally():
     )
     assert 'playbackRateInput.addEventListener("change"' in TTS_LISTENER_HTML
     assert 'send({ type: "set_playback_rate"' not in TTS_LISTENER_HTML
+
+
+def test_listener_page_applies_rate_to_persistent_pitch_preserving_audio():
+    assert 'id="ttsPlayback"' in TTS_LISTENER_HTML
+    assert "playbackElement.defaultPlaybackRate = playbackRate;" in TTS_LISTENER_HTML
+    assert "playbackElement.playbackRate = playbackRate;" in TTS_LISTENER_HTML
+    assert '"preservesPitch" in playbackElement' in TTS_LISTENER_HTML
+    assert '"mozPreservesPitch" in playbackElement' in TTS_LISTENER_HTML
+    assert '"webkitPreservesPitch" in playbackElement' in TTS_LISTENER_HTML
+
+
+def test_listener_page_uses_one_media_element_and_releases_object_urls():
+    assert 'new Blob([buffer], { type: "audio/wav" })' in TTS_LISTENER_HTML
+    assert "window.URL.createObjectURL(audioBlob)" in TTS_LISTENER_HTML
+    assert "window.URL.revokeObjectURL(activeObjectUrl);" in TTS_LISTENER_HTML
+    assert 'playbackElement.addEventListener("ended"' in TTS_LISTENER_HTML
+    assert "playbackElement.pause();" in TTS_LISTENER_HTML
+    assert "sourceNode" not in TTS_LISTENER_HTML
+    assert "createBufferSource" not in TTS_LISTENER_HTML
+
+
+def test_listener_page_unlocks_media_before_opening_listener_socket():
+    assert "const SILENT_WAV_DATA_URL =" in TTS_LISTENER_HTML
+    assert "async function unlockPlaybackElement()" in TTS_LISTENER_HTML
+    assert "await unlockPlaybackElement();" in TTS_LISTENER_HTML
+    assert TTS_LISTENER_HTML.index(
+        "await unlockPlaybackElement();"
+    ) < TTS_LISTENER_HTML.index('new WebSocket(wsUrl("/ws/tts"))')
 
 
 def test_port_precheck_rejects_occupied_port():

@@ -283,6 +283,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       <div class="pulse" aria-hidden="true"></div>
     </section>
 
+    <audio id="ttsPlayback" preload="auto" hidden></audio>
+
     <section>
       <div class="playback-settings">
         <label for="playbackRate">朗读速度</label>
@@ -314,8 +316,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const playbackStatus = document.getElementById("playbackStatus");
     const nowPlaying = document.getElementById("nowPlaying");
     const playbackRateInput = document.getElementById("playbackRate");
+    const playbackElement = document.getElementById("ttsPlayback");
     const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
     const SUPPORTED_PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);
+    const SILENT_WAV_DATA_URL =
+      "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
 
     function normalizePlaybackRate(value) {
       const parsed = Number(value);
@@ -337,11 +342,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     let socket = null;
     let listenerId = "";
-    let audioContext = null;
     let queue = [];
     let currentJob = null;
     let abortController = null;
-    let sourceNode = null;
+    let activeObjectUrl = "";
+    let cancelActivePlayback = null;
     let generation = 0;
     let heartbeat = null;
     const seenJobIds = new Set();
@@ -365,16 +370,49 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       }
     }
 
-    async function ensureAudioContext() {
-      if (!audioContext || audioContext.state === "closed") {
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        audioContext = new AudioContextClass();
+    function applyPlaybackRate() {
+      playbackElement.defaultPlaybackRate = playbackRate;
+      playbackElement.playbackRate = playbackRate;
+      if ("preservesPitch" in playbackElement) playbackElement.preservesPitch = true;
+      if ("mozPreservesPitch" in playbackElement) playbackElement.mozPreservesPitch = true;
+      if ("webkitPreservesPitch" in playbackElement) {
+        playbackElement.webkitPreservesPitch = true;
       }
-      if (audioContext.state === "suspended") {
-        await audioContext.resume();
-      }
-      return audioContext;
     }
+
+    function releaseActiveObjectUrl() {
+      if (!activeObjectUrl) return;
+      window.URL.revokeObjectURL(activeObjectUrl);
+      activeObjectUrl = "";
+    }
+
+    function stopActivePlayback() {
+      if (cancelActivePlayback) {
+        const cancel = cancelActivePlayback;
+        cancelActivePlayback = null;
+        cancel();
+      }
+      playbackElement.pause();
+      playbackElement.removeAttribute("src");
+      playbackElement.load();
+      releaseActiveObjectUrl();
+    }
+
+    async function unlockPlaybackElement() {
+      playbackElement.muted = true;
+      playbackElement.src = SILENT_WAV_DATA_URL;
+      try {
+        await playbackElement.play();
+      } finally {
+        playbackElement.pause();
+        playbackElement.muted = false;
+        playbackElement.removeAttribute("src");
+        playbackElement.load();
+        applyPlaybackRate();
+      }
+    }
+
+    applyPlaybackRate();
 
     async function fetchAudio(job, signal) {
       let lastError = null;
@@ -402,21 +440,39 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     }
 
     async function playAudioBuffer(buffer, localGeneration) {
-      const context = await ensureAudioContext();
-      const decoded = await context.decodeAudioData(buffer.slice(0));
       if (localGeneration !== generation) return;
-      await new Promise((resolve, reject) => {
-        const node = context.createBufferSource();
-        sourceNode = node;
-        node.buffer = decoded;
-        node.connect(context.destination);
-        node.addEventListener("ended", resolve, { once: true });
-        try {
-          node.start();
-        } catch (error) {
-          reject(error);
-        }
-      });
+      const audioBlob = new Blob([buffer], { type: "audio/wav" });
+      activeObjectUrl = window.URL.createObjectURL(audioBlob);
+      playbackElement.src = activeObjectUrl;
+      playbackElement.load();
+      applyPlaybackRate();
+      try {
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const settle = (error) => {
+            if (settled) return;
+            settled = true;
+            playbackElement.removeEventListener("ended", onEnded);
+            playbackElement.removeEventListener("error", onError);
+            cancelActivePlayback = null;
+            if (error) reject(error);
+            else resolve();
+          };
+          const onEnded = () => settle();
+          const onError = () => settle(new Error("audio playback failed"));
+          cancelActivePlayback = () => {
+            settle(new DOMException("playback stopped", "AbortError"));
+          };
+          playbackElement.addEventListener("ended", onEnded, { once: true });
+          playbackElement.addEventListener("error", onError, { once: true });
+          const playPromise = playbackElement.play();
+          if (playPromise) playPromise.catch(onError);
+        });
+      } finally {
+        playbackElement.removeAttribute("src");
+        playbackElement.load();
+        releaseActiveObjectUrl();
+      }
     }
 
     async function pumpQueue() {
@@ -436,7 +492,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         }
       } finally {
         if (localGeneration !== generation) return;
-        sourceNode = null;
         abortController = null;
         currentJob = null;
         nowPlaying.dataset.playing = "false";
@@ -459,10 +514,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         abortController.abort();
         abortController = null;
       }
-      if (sourceNode) {
-        try { sourceNode.stop(); } catch (error) {}
-        sourceNode = null;
-      }
+      stopActivePlayback();
       queue = [];
       currentJob = null;
       seenJobIds.clear();
@@ -490,8 +542,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     async function startListening() {
       if (socket) return;
-      await ensureAudioContext();
       resetLocalPlayback();
+      await unlockPlaybackElement();
       startButton.disabled = true;
       stopButton.disabled = false;
       connectionStatus.textContent = "正在连接";
@@ -568,9 +620,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       try {
         window.localStorage.setItem(PLAYBACK_RATE_STORAGE_KEY, String(playbackRate));
       } catch (error) {}
+      applyPlaybackRate();
     });
     window.addEventListener("beforeunload", () => {
       if (socket) socket.close(1000, "page closed");
+      stopActivePlayback();
     });
   })();
   </script>
