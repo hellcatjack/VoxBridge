@@ -525,6 +525,63 @@ def test_ws_tts_canonical_stop_redecode_does_not_repeat_issued_sentences():
     assert len(jobs) == len(asr.sentences)
 
 
+def test_ws_tts_toggle_does_not_replay_earlier_sentences_at_stop():
+    args = _args()
+    args.final_redecode_on_stop = True
+    args.final_redecode_max_sec = 30.0
+    args.translation_workers = 3
+    args.tts_final_translation_drain_sec = 2.0
+    asr = _StableTTSSentenceASR()
+    asr.transcribe_language = "Chinese"
+    asr.transcribe_text = "".join(asr.sentences)
+    app = _create_app(
+        args,
+        asr,
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "tts_enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        _receive_until_type(ws, "started")
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        events = []
+        while len([event for event in events if event.get("type") == "tts_job"]) < 3:
+            events.append(ws.receive_json())
+
+        ws.send_json(
+            {
+                "type": "set_tts_enabled",
+                "enabled": False,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        disabled = _receive_until_type(ws, "tts_status")
+        assert disabled["status"] == "disabled"
+        ws.send_json(
+            {
+                "type": "set_tts_enabled",
+                "enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        enabled = _receive_until_type(ws, "tts_status")
+        assert enabled["status"] == "enabled"
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events.extend(_collect_through_final(ws))
+
+    jobs = [event for event in events if event.get("type") == "tts_job"]
+    assert len(jobs) == len(asr.sentences)
+
+
 def test_ws_tts_failed_earlier_translation_does_not_block_later_jobs():
     class _FirstFailsTranslator(_FakeTranslator):
         def translate(self, text: str, source_language: str = None, target_language: str = None):
