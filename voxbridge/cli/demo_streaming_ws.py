@@ -5758,16 +5758,20 @@ def _create_app(
                     break
             return dropped
 
-        def _reset_tts_ordering() -> None:
-            tts_runtime.generation += 1
-            tts_runtime.next_source_order = 0
-            tts_runtime.sentence_orders.clear()
-            tts_runtime.ordered.reset()
-            tts_runtime.last_wait_key = None
-            tts_runtime.stability_wake.set()
+        async def _reset_tts_ordering() -> None:
+            async with tts_transition_lock:
+                tts_runtime.generation += 1
+                tts_runtime.next_source_order = 0
+                tts_runtime.sentence_orders.clear()
+                tts_runtime.ordered.reset()
+                tts_runtime.last_wait_key = None
+                tts_runtime.stability_wake.set()
 
         def _tts_output_active() -> bool:
-            return bool(tts_runtime.broadcast_enabled or tts_runtime.enabled)
+            return bool(
+                not tts_runtime.stability_stopping
+                and (tts_runtime.broadcast_enabled or tts_runtime.enabled)
+            )
 
         def _set_tts_producer_active(active: bool) -> None:
             if app.state.tts_broadcast.set_producer_active(active):
@@ -5808,7 +5812,7 @@ def _create_app(
                 or requested_client_id != previous_client_id
             )
             if force_reset or changed:
-                _reset_tts_ordering()
+                await _reset_tts_ordering()
 
             if previous_enabled and (
                 not requested_enabled or requested_client_id != previous_client_id
@@ -5835,25 +5839,30 @@ def _create_app(
             )
             return bool(tts_runtime.enabled)
 
-        def _register_tts_source(sentence_id: str, revision: int) -> None:
+        async def _register_tts_source(sentence_id: str, revision: int) -> None:
             if not _tts_output_active():
                 return
             sid = str(sentence_id or "")
             if not sid:
                 return
-            generation = int(tts_runtime.generation)
-            registered = tts_runtime.sentence_orders.get(sid)
-            if registered is None:
-                source_order = int(tts_runtime.next_source_order)
-                tts_runtime.next_source_order += 1
-                tts_runtime.sentence_orders[sid] = (source_order, generation)
-            else:
-                source_order, registered_generation = registered
-                if int(registered_generation) != generation:
-                    return
-            registration = tts_runtime.ordered.register(sid, int(revision), int(source_order))
-            if registration.accepted:
-                tts_runtime.stability_wake.set()
+            async with tts_transition_lock:
+                generation = int(tts_runtime.generation)
+                registered = tts_runtime.sentence_orders.get(sid)
+                if registered is None:
+                    source_order = int(tts_runtime.next_source_order)
+                    tts_runtime.next_source_order += 1
+                    tts_runtime.sentence_orders[sid] = (source_order, generation)
+                else:
+                    source_order, registered_generation = registered
+                    if int(registered_generation) != generation:
+                        return
+                registration = tts_runtime.ordered.register(
+                    sid,
+                    int(revision),
+                    int(source_order),
+                )
+                if registration.accepted:
+                    tts_runtime.stability_wake.set()
             _trace_event(
                 "tts_source_registered",
                 sentence_id=sid,
@@ -6031,6 +6040,19 @@ def _create_app(
 
         tts_runtime.stability_task = asyncio.create_task(_tts_stability_scheduler())
 
+        async def _stop_tts_stability_scheduler(*, reason: str) -> None:
+            if bool(tts_runtime.stability_stopping):
+                return
+            tts_runtime.stability_stopping = True
+            tts_runtime.stability_wake.set()
+            task = tts_runtime.stability_task
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await task
+            tts_runtime.stability_task = None
+
         async def _set_translation_direction(
             direction_raw: Any,
             *,
@@ -6064,7 +6086,7 @@ def _create_app(
                             str(tts_runtime.owner_key),
                             str(tts_runtime.client_id),
                         )
-                    _reset_tts_ordering()
+                    await _reset_tts_ordering()
 
             _trace_event(
                 "translation_direction_set",
@@ -8159,7 +8181,7 @@ def _create_app(
                 sentence_item["zh"] = upgraded
                 revision = int(sentence_item.get("revision", 1) or 1) + 1
                 sentence_item["revision"] = int(revision)
-                _register_tts_source(sentence_id, revision)
+                await _register_tts_source(sentence_id, revision)
                 _record_completed_candidate(i, upgraded, sentence_id)
                 preserved_translation = str(sentence_item.get("en", "") or "")
                 if small_upgrade_source:
@@ -8343,7 +8365,7 @@ def _create_app(
                         "seq": int(seq_hint or 0),
                     }
                 )
-                _register_tts_source(sentence_id, revision)
+                await _register_tts_source(sentence_id, revision)
                 committed_added += 1
                 _trace_event(
                     "sentence_new_commit",
@@ -9166,7 +9188,7 @@ def _create_app(
                 subtitle_state.committed_sentences = []
                 subtitle_state.sentence_items = []
                 translation_runtime.latest_by_sentence.clear()
-                _reset_tts_ordering()
+                await _reset_tts_ordering()
                 subtitle_state.commit_base = 0
                 _reset_completed_candidate_cursor()
                 subtitle_state.prev_completed_sentences = []
@@ -9262,7 +9284,7 @@ def _create_app(
                 subtitle_state.committed_sentences = []
                 subtitle_state.sentence_items = []
                 translation_runtime.latest_by_sentence.clear()
-                _reset_tts_ordering()
+                await _reset_tts_ordering()
                 subtitle_state.commit_base = 0
                 _reset_completed_candidate_cursor()
                 subtitle_state.prev_completed_sentences = []
@@ -9300,6 +9322,7 @@ def _create_app(
                 )
             if _tts_output_active():
                 await _drain_tts_translation_task("before_final")
+                await _drain_tts_stability(force=True)
             else:
                 translation_task = translation_runtime.task
                 if translation_task is not None and not translation_task.done():
@@ -9714,6 +9737,7 @@ def _create_app(
             except Exception:
                 pass
         finally:
+            await _stop_tts_stability_scheduler(reason="ws_close")
             _set_tts_producer_active(False)
             stop_consumer.set()
             if consumer_task is not None and not consumer_task.done():
