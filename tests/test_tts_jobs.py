@@ -1,6 +1,11 @@
 import pytest
 
-from voxbridge.tts.jobs import OrderedTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
+from voxbridge.tts.jobs import (
+    RevisionStableTTSBuffer,
+    TTSJobNotFound,
+    TTSJobRegistry,
+    TTSQueueFull,
+)
 
 
 class FakeClock:
@@ -9,6 +14,9 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def create_job(registry: TTSJobRegistry, **overrides):
@@ -90,53 +98,149 @@ def test_registry_caches_audio_without_mutating_text_snapshot():
     assert job.audio_bytes is None
 
 
-def test_order_buffer_waits_for_earlier_translation():
-    buffer = OrderedTTSBuffer()
-    buffer.register("s1", revision=1, source_order=0)
-    buffer.register("s2", revision=1, source_order=1)
+def test_stability_buffer_withholds_ready_revision_until_quiet_window():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
 
-    assert buffer.mark_ready("s2", 1, "second", "English") == []
-    ready = buffer.mark_ready("s1", 1, "first", "English")
+    result = buffer.register("s1", revision=1, source_order=0)
+    assert result.accepted is True
+    assert buffer.mark_ready("s1", 1, "first", "English") is True
+    assert buffer.drain() == []
+    assert buffer.next_deadline() == pytest.approx(103.0)
 
-    assert [item.sentence_id for item in ready] == ["s1", "s2"]
+    clock.advance(2.999)
+    assert buffer.drain() == []
+    clock.advance(0.001)
+    ready = buffer.drain()
+
+    assert [(item.sentence_id, item.revision, item.text) for item in ready] == [
+        ("s1", 1, "first")
+    ]
+    assert ready[0].release_reason == "quiet_window"
+    assert ready[0].source_quiet_age_ms == 3000
+    assert ready[0].translation_ready_age_ms == 3000
 
 
-def test_order_buffer_skips_failed_earlier_translation():
-    buffer = OrderedTTSBuffer()
+def test_revision_update_discards_old_translation_and_restarts_window():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
+    buffer.register("s1", 1, 0)
+    assert buffer.mark_ready("s1", 1, "old", "English") is True
+
+    clock.advance(2.9)
+    update = buffer.register("s1", 2, 0)
+
+    assert update.reset is True
+    assert update.previous_revision == 1
+    assert update.previous_ready is True
+    assert update.previous_quiet_age_ms == 2900
+    assert buffer.mark_ready("s1", 1, "stale", "English") is False
+    assert buffer.mark_ready("s1", 2, "new", "English") is True
+    clock.advance(2.9)
+    assert buffer.drain() == []
+    clock.advance(0.1)
+    assert [item.text for item in buffer.drain()] == ["new"]
+
+
+def test_translation_finishing_after_source_deadline_releases_immediately():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
+    buffer.register("s1", 1, 0)
+
+    clock.advance(4.0)
+    assert buffer.mark_ready("s1", 1, "late translation", "English") is True
+
+    ready = buffer.drain()
+    assert [item.text for item in ready] == ["late translation"]
+    assert ready[0].source_quiet_age_ms == 4000
+    assert ready[0].translation_ready_age_ms == 0
+
+
+def test_stability_buffer_preserves_order_and_skips_failed_head():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
     buffer.register("s1", 1, 0)
     buffer.register("s2", 1, 1)
+    assert buffer.mark_ready("s2", 1, "second", "English") is True
 
-    assert buffer.mark_ready("s2", 1, "second", "English") == []
-    ready = buffer.mark_failed("s1", 1)
+    clock.advance(3.0)
+    assert buffer.drain() == []
+    assert buffer.mark_failed("s1", 1) is True
 
+    ready = buffer.drain()
     assert [item.sentence_id for item in ready] == ["s2"]
 
 
-def test_order_buffer_rejects_stale_revision_before_emit():
-    buffer = OrderedTTSBuffer()
-    buffer.register("s1", 1, 0)
-    buffer.register("s1", 2, 0)
-
-    assert buffer.mark_ready("s1", 1, "old", "English") == []
-    assert buffer.mark_ready("s1", 2, "new", "English")[0].text == "new"
-
-
-def test_order_buffer_never_emits_a_sentence_twice():
-    buffer = OrderedTTSBuffer()
-    buffer.register("s1", 1, 0)
-
-    assert len(buffer.mark_ready("s1", 1, "first", "English")) == 1
-    buffer.register("s1", 2, 0)
-    assert buffer.mark_ready("s1", 2, "changed", "English") == []
-
-
-def test_order_buffer_reset_discards_pending_items():
-    buffer = OrderedTTSBuffer()
+def test_wait_state_reports_quiet_time_and_order_blocking():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
     buffer.register("s1", 1, 0)
     buffer.register("s2", 1, 1)
-    assert buffer.mark_ready("s2", 1, "second", "English") == []
+    buffer.mark_ready("s2", 1, "second", "English")
+
+    clock.advance(1.25)
+    wait = buffer.wait_state("s2")
+
+    assert wait is not None
+    assert wait.quiet_age_ms == 1250
+    assert wait.required_quiet_ms == 3000
+    assert wait.remaining_ms == 1750
+    assert wait.blocked_by_earlier is True
+
+
+def test_force_drain_releases_only_current_ready_revisions():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=60.0, clock=clock)
+    buffer.register("s1", 1, 0)
+    buffer.register("s2", 1, 1)
+    buffer.register("s2", 2, 1)
+    assert buffer.mark_ready("s1", 1, "first", "English") is True
+    assert buffer.mark_ready("s2", 1, "stale", "English") is False
+    assert buffer.mark_ready("s2", 2, "second", "English") is True
+
+    ready = buffer.drain(force=True)
+
+    assert [(item.revision, item.text) for item in ready] == [(1, "first"), (2, "second")]
+    assert {item.release_reason for item in ready} == {"final_force"}
+
+
+def test_revision_after_release_is_reported_and_never_emitted_twice():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=0.0, clock=clock)
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "spoken", "English")
+    assert len(buffer.drain()) == 1
+
+    clock.advance(1.25)
+    late = buffer.register("s1", 2, 0)
+
+    assert late.accepted is False
+    assert late.late_after_release is True
+    assert late.released_revision == 1
+    assert late.elapsed_since_release_ms == 1250
+    assert buffer.mark_ready("s1", 2, "changed", "English") is False
+    assert buffer.drain() == []
+
+
+def test_stability_buffer_rejects_identity_changes():
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0)
+    buffer.register("s1", 1, 0)
+
+    with pytest.raises(ValueError, match="cannot change source_order"):
+        buffer.register("s1", 2, 1)
+    with pytest.raises(ValueError, match="already registered"):
+        buffer.register("s2", 1, 0)
+
+
+def test_stability_buffer_reset_discards_all_session_state():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "old", "English")
 
     buffer.reset()
-    buffer.register("s3", 1, 0)
+    buffer.register("s2", 1, 0)
+    buffer.mark_ready("s2", 1, "new", "English")
+    clock.advance(3.0)
 
-    assert [item.sentence_id for item in buffer.mark_ready("s3", 1, "third", "English")] == ["s3"]
+    assert [item.sentence_id for item in buffer.drain()] == ["s2"]

@@ -43,46 +43,172 @@ class TTSReadyItem:
     source_order: int
     target_language: str
     text: str
+    release_reason: str = "quiet_window"
+    source_quiet_age_ms: int = 0
+    translation_ready_age_ms: int = 0
 
 
-@dataclass(slots=True)
-class _OrderedEntry:
+@dataclass(frozen=True, slots=True)
+class TTSRevisionRegistration:
+    accepted: bool
+    reset: bool
+    late_after_release: bool
     sentence_id: str
     revision: int
     source_order: int
+    previous_revision: int | None = None
+    previous_quiet_age_ms: int = 0
+    previous_ready: bool = False
+    released_revision: int | None = None
+    elapsed_since_release_ms: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TTSWaitState:
+    sentence_id: str
+    revision: int
+    source_order: int
+    quiet_age_ms: int
+    required_quiet_ms: int
+    remaining_ms: int
+    blocked_by_earlier: bool
+
+
+@dataclass(slots=True)
+class _RevisionStableEntry:
+    sentence_id: str
+    revision: int
+    source_order: int
+    changed_at: float
     status: str = "waiting"
     target_language: str | None = None
     text: str | None = None
+    translation_ready_at: float | None = None
 
 
-class OrderedTTSBuffer:
-    """Release completed translations in source order exactly once."""
+class RevisionStableTTSBuffer:
+    """Release current translated revisions after a monotonic quiet window."""
 
-    def __init__(self) -> None:
-        self._entries: dict[int, _OrderedEntry] = {}
+    def __init__(
+        self,
+        *,
+        stable_sec: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if stable_sec < 0:
+            raise ValueError("stable_sec must not be negative")
+        self._stable_sec = float(stable_sec)
+        self._clock = clock
+        self._entries: dict[int, _RevisionStableEntry] = {}
         self._sentence_orders: dict[str, int] = {}
-        self._emitted_sentence_ids: set[str] = set()
+        self._order_sentences: dict[int, str] = {}
+        self._released: dict[str, tuple[int, int, float]] = {}
         self._next_order = 0
         self._lock = threading.RLock()
 
-    def register(self, sentence_id: str, revision: int, source_order: int) -> None:
-        if not isinstance(sentence_id, str) or not sentence_id.strip():
+    @staticmethod
+    def _require_sentence_id(sentence_id: str) -> str:
+        sid = str(sentence_id or "").strip()
+        if not sid:
             raise ValueError("sentence_id must be a non-empty string")
+        return sid
+
+    @staticmethod
+    def _elapsed_ms(start: float, end: float) -> int:
+        return int(round(max(0.0, float(end) - float(start)) * 1000.0))
+
+    def register(
+        self,
+        sentence_id: str,
+        revision: int,
+        source_order: int,
+    ) -> TTSRevisionRegistration:
+        sid = self._require_sentence_id(sentence_id)
         if revision < 0 or source_order < 0:
             raise ValueError("revision and source_order must not be negative")
+        now = self._clock()
         with self._lock:
-            if sentence_id in self._emitted_sentence_ids or source_order < self._next_order:
-                return
-            previous_order = self._sentence_orders.get(sentence_id)
-            if previous_order is not None and previous_order != source_order:
+            known_order = self._sentence_orders.get(sid)
+            if known_order is not None and known_order != source_order:
                 raise ValueError("sentence_id cannot change source_order")
-            current = self._entries.get(source_order)
-            if current is not None and current.sentence_id != sentence_id:
+            known_sentence = self._order_sentences.get(source_order)
+            if known_sentence is not None and known_sentence != sid:
                 raise ValueError("source_order is already registered")
+
+            released = self._released.get(sid)
+            if released is not None:
+                released_revision, released_order, released_at = released
+                return TTSRevisionRegistration(
+                    accepted=False,
+                    reset=False,
+                    late_after_release=revision > released_revision,
+                    sentence_id=sid,
+                    revision=int(revision),
+                    source_order=int(released_order),
+                    released_revision=int(released_revision),
+                    elapsed_since_release_ms=self._elapsed_ms(released_at, now),
+                )
+
+            if source_order < self._next_order:
+                return TTSRevisionRegistration(
+                    accepted=False,
+                    reset=False,
+                    late_after_release=False,
+                    sentence_id=sid,
+                    revision=int(revision),
+                    source_order=int(source_order),
+                )
+
+            current = self._entries.get(source_order)
             if current is not None and revision <= current.revision:
-                return
-            self._sentence_orders[sentence_id] = source_order
-            self._entries[source_order] = _OrderedEntry(sentence_id, int(revision), int(source_order))
+                return TTSRevisionRegistration(
+                    accepted=False,
+                    reset=False,
+                    late_after_release=False,
+                    sentence_id=sid,
+                    revision=int(revision),
+                    source_order=int(source_order),
+                    previous_revision=int(current.revision),
+                )
+
+            self._sentence_orders[sid] = int(source_order)
+            self._order_sentences[int(source_order)] = sid
+            if current is None:
+                self._entries[source_order] = _RevisionStableEntry(
+                    sid,
+                    int(revision),
+                    int(source_order),
+                    float(now),
+                )
+                return TTSRevisionRegistration(
+                    accepted=True,
+                    reset=False,
+                    late_after_release=False,
+                    sentence_id=sid,
+                    revision=int(revision),
+                    source_order=int(source_order),
+                )
+
+            previous_revision = int(current.revision)
+            previous_ready = current.status == "ready"
+            previous_quiet_age_ms = self._elapsed_ms(current.changed_at, now)
+            self._entries[source_order] = _RevisionStableEntry(
+                sid,
+                int(revision),
+                int(source_order),
+                float(now),
+            )
+            return TTSRevisionRegistration(
+                accepted=True,
+                reset=True,
+                late_after_release=False,
+                sentence_id=sid,
+                revision=int(revision),
+                source_order=int(source_order),
+                previous_revision=previous_revision,
+                previous_quiet_age_ms=previous_quiet_age_ms,
+                previous_ready=previous_ready,
+            )
 
     def mark_ready(
         self,
@@ -90,31 +216,46 @@ class OrderedTTSBuffer:
         revision: int,
         text: str,
         target_language: str,
-    ) -> list[TTSReadyItem]:
-        if not isinstance(text, str) or not text.strip():
-            return self.mark_failed(sentence_id, revision)
-        if not isinstance(target_language, str) or not target_language.strip():
+    ) -> bool:
+        sid = self._require_sentence_id(sentence_id)
+        translated = str(text or "").strip()
+        language = str(target_language or "").strip()
+        if translated and not language:
             raise ValueError("target_language must be a non-empty string")
+        now = self._clock()
         with self._lock:
-            entry = self._current_entry(sentence_id, revision)
+            entry = self._current_entry(sid, int(revision))
             if entry is None:
-                return []
+                return False
+            if not translated:
+                entry.status = "failed"
+                entry.text = None
+                entry.target_language = None
+                entry.translation_ready_at = None
+                return True
             entry.status = "ready"
-            entry.text = text
-            entry.target_language = target_language
-            return self._drain_locked()
+            entry.text = translated
+            entry.target_language = language
+            entry.translation_ready_at = float(now)
+            return True
 
-    def mark_failed(self, sentence_id: str, revision: int) -> list[TTSReadyItem]:
+    def mark_failed(self, sentence_id: str, revision: int) -> bool:
+        sid = self._require_sentence_id(sentence_id)
         with self._lock:
-            entry = self._current_entry(sentence_id, revision)
+            entry = self._current_entry(sid, int(revision))
             if entry is None:
-                return []
+                return False
             entry.status = "failed"
             entry.text = None
             entry.target_language = None
-            return self._drain_locked()
+            entry.translation_ready_at = None
+            return True
 
-    def _current_entry(self, sentence_id: str, revision: int) -> _OrderedEntry | None:
+    def _current_entry(
+        self,
+        sentence_id: str,
+        revision: int,
+    ) -> _RevisionStableEntry | None:
         order = self._sentence_orders.get(sentence_id)
         if order is None:
             return None
@@ -123,36 +264,82 @@ class OrderedTTSBuffer:
             return None
         return entry
 
-    def _drain_locked(self) -> list[TTSReadyItem]:
-        ready: list[TTSReadyItem] = []
-        while True:
-            entry = self._entries.get(self._next_order)
-            if entry is None or entry.status == "waiting":
-                break
-            del self._entries[self._next_order]
-            self._sentence_orders.pop(entry.sentence_id, None)
-            self._next_order += 1
-            if entry.status == "failed":
-                continue
-            if entry.sentence_id in self._emitted_sentence_ids:
-                continue
-            self._emitted_sentence_ids.add(entry.sentence_id)
-            ready.append(
-                TTSReadyItem(
-                    sentence_id=entry.sentence_id,
-                    revision=entry.revision,
-                    source_order=entry.source_order,
-                    target_language=entry.target_language or "",
-                    text=entry.text or "",
-                )
+    def wait_state(self, sentence_id: str) -> TTSWaitState | None:
+        sid = self._require_sentence_id(sentence_id)
+        now = self._clock()
+        with self._lock:
+            order = self._sentence_orders.get(sid)
+            entry = self._entries.get(order) if order is not None else None
+            if entry is None or entry.status != "ready":
+                return None
+            quiet_age_ms = self._elapsed_ms(entry.changed_at, now)
+            required_ms = int(round(self._stable_sec * 1000.0))
+            return TTSWaitState(
+                sentence_id=sid,
+                revision=int(entry.revision),
+                source_order=int(entry.source_order),
+                quiet_age_ms=quiet_age_ms,
+                required_quiet_ms=required_ms,
+                remaining_ms=max(0, required_ms - quiet_age_ms),
+                blocked_by_earlier=entry.source_order != self._next_order,
             )
+
+    def next_deadline(self) -> float | None:
+        with self._lock:
+            entry = self._entries.get(self._next_order)
+            if entry is None or entry.status != "ready":
+                return None
+            return float(entry.changed_at + self._stable_sec)
+
+    def drain(self, *, force: bool = False) -> list[TTSReadyItem]:
+        now = self._clock()
+        ready: list[TTSReadyItem] = []
+        with self._lock:
+            while True:
+                entry = self._entries.get(self._next_order)
+                if entry is None or entry.status == "waiting":
+                    break
+                if entry.status == "failed":
+                    del self._entries[self._next_order]
+                    self._next_order += 1
+                    continue
+                if not force and now < entry.changed_at + self._stable_sec:
+                    break
+                del self._entries[self._next_order]
+                self._next_order += 1
+                self._released[entry.sentence_id] = (
+                    int(entry.revision),
+                    int(entry.source_order),
+                    float(now),
+                )
+                ready.append(
+                    TTSReadyItem(
+                        sentence_id=entry.sentence_id,
+                        revision=int(entry.revision),
+                        source_order=int(entry.source_order),
+                        target_language=str(entry.target_language or ""),
+                        text=str(entry.text or ""),
+                        release_reason="final_force" if force else "quiet_window",
+                        source_quiet_age_ms=self._elapsed_ms(entry.changed_at, now),
+                        translation_ready_age_ms=self._elapsed_ms(
+                            entry.translation_ready_at or now,
+                            now,
+                        ),
+                    )
+                )
         return ready
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
     def reset(self) -> None:
         with self._lock:
             self._entries.clear()
             self._sentence_orders.clear()
-            self._emitted_sentence_ids.clear()
+            self._order_sentences.clear()
+            self._released.clear()
             self._next_order = 0
 
 

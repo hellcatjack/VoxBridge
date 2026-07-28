@@ -9,12 +9,14 @@ from .broadcast import (
     TTSListenerSubscription,
 )
 from .jobs import (
-    OrderedTTSBuffer,
+    RevisionStableTTSBuffer,
     TTSJob,
     TTSJobNotFound,
     TTSJobRegistry,
     TTSQueueFull,
     TTSReadyItem,
+    TTSRevisionRegistration,
+    TTSWaitState,
 )
 from .kokoro_onnx import (
     KokoroOnnxSynthesizer,
@@ -26,7 +28,7 @@ from .kokoro_onnx import (
 
 __all__ = [
     "BroadcastTTSJob",
-    "OrderedTTSBuffer",
+    "RevisionStableTTSBuffer",
     "TTSBroadcastError",
     "TTSBroadcastHub",
     "TTSBroadcastNotFound",
@@ -37,6 +39,8 @@ __all__ = [
     "TTSJobRegistry",
     "TTSQueueFull",
     "TTSReadyItem",
+    "TTSRevisionRegistration",
+    "TTSWaitState",
     "KokoroOnnxSynthesizer",
     "KokoroTTSConfig",
     "SynthesizedAudio",
