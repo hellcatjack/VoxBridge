@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from voxbridge.streaming.backpressure import QueueBackpressureController
 from voxbridge.streaming.context_schedule import (
     ContextSchedule,
@@ -53,6 +53,8 @@ from voxbridge.streaming.context_schedule import (
 )
 from voxbridge.streaming.segment_policy import SegmentPolicy
 from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overlap
+from voxbridge.tts.jobs import TTSJobNotFound, TTSJobRegistry
+from voxbridge.tts.kokoro_onnx import TTSSynthesisError
 
 SAMPLE_RATE = 16000
 logger = logging.getLogger(__name__)
@@ -67,6 +69,7 @@ AUTH_COOKIE_NAME = "voxbridge_session"
 AUTH_HASH_SCHEME = "pbkdf2_sha256"
 AUTH_HASH_ITERATIONS = 260_000
 AUTH_SESSION_TOKEN_BYTES = 32
+TTS_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -4388,9 +4391,20 @@ def _parse_json_message(text: str) -> Dict[str, Any]:
     return payload
 
 
-def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTranslator] = None) -> FastAPI:
+def _create_app(
+    args: argparse.Namespace,
+    asr: Any,
+    translator: Optional[LocalTranslator] = None,
+    tts_synthesizer: Any = None,
+) -> FastAPI:
     app = FastAPI(title="VoxBridge Streaming WebSocket Demo")
     infer_lock = asyncio.Lock()
+    tts_synthesis_lock = asyncio.Lock()
+    app.state.tts_jobs = TTSJobRegistry(
+        ttl_sec=max(1.0, float(getattr(args, "tts_job_ttl_sec", 600.0))),
+        max_client_jobs=max(1, int(getattr(args, "tts_max_client_jobs", 4096))),
+    )
+    app.state.tts_synthesizer = tts_synthesizer
     runtime = SimpleNamespace(active_connections=0)
     translator_accepts_direction = False
     if translator is not None:
@@ -4450,6 +4464,20 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
 
     def _websocket_is_authenticated(websocket: WebSocket) -> bool:
         return _is_valid_auth_session(websocket.cookies.get(AUTH_COOKIE_NAME))
+
+    def _request_tts_owner_key(request: Request) -> str:
+        token = request.cookies.get(AUTH_COOKIE_NAME)
+        if not _is_valid_auth_session(token):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if not auth.enabled:
+            return "anonymous"
+        return hashlib.sha256(f"auth:{token}".encode("utf-8")).hexdigest()
+
+    def _validated_tts_client_id(client_id: str) -> str:
+        value = str(client_id or "")
+        if not TTS_CLIENT_ID_PATTERN.fullmatch(value):
+            raise HTTPException(status_code=400, detail="invalid TTS client ID")
+        return value
 
     def _set_auth_cookie(response: RedirectResponse, token: str) -> None:
         response.set_cookie(
@@ -4596,6 +4624,68 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
         html = html.replace("__ASR_CONTEXT_MAX_TERMS__", str(asr_context_max_terms))
         html = html.replace("__ASR_CONTEXT_MAX_CHARS__", str(asr_context_max_chars))
         return HTMLResponse(html)
+
+    @app.post("/api/tts/jobs/{job_id}/audio")
+    async def tts_audio(job_id: str, request: Request) -> Response:
+        owner_key = _request_tts_owner_key(request)
+        try:
+            job = app.state.tts_jobs.get(job_id, owner_key)
+        except TTSJobNotFound as exc:
+            raise HTTPException(status_code=404, detail="TTS job not found") from exc
+        if app.state.tts_synthesizer is None:
+            raise HTTPException(status_code=503, detail="TTS is unavailable")
+
+        async with tts_synthesis_lock:
+            try:
+                job = app.state.tts_jobs.get(job_id, owner_key)
+            except TTSJobNotFound as exc:
+                raise HTTPException(status_code=404, detail="TTS job not found") from exc
+            if job.audio_bytes is None:
+                try:
+                    audio = await asyncio.to_thread(
+                        app.state.tts_synthesizer.synthesize,
+                        job.text,
+                        job.target_language,
+                    )
+                    job = app.state.tts_jobs.cache_audio(
+                        job.job_id,
+                        owner_key,
+                        audio.wav_bytes,
+                        sample_rate=audio.sample_rate,
+                        duration_ms=audio.duration_ms,
+                    )
+                except TTSJobNotFound as exc:
+                    raise HTTPException(status_code=404, detail="TTS job not found") from exc
+                except TTSSynthesisError as exc:
+                    logger.warning("TTS synthesis failed job_id=%s", job.job_id)
+                    raise HTTPException(status_code=502, detail="TTS synthesis failed") from exc
+                except Exception as exc:
+                    logger.exception("Unexpected TTS synthesis failure job_id=%s", job.job_id)
+                    raise HTTPException(status_code=502, detail="TTS synthesis failed") from exc
+
+        headers = {
+            "Cache-Control": "no-store",
+            "X-TTS-Sample-Rate": str(job.sample_rate or ""),
+            "X-TTS-Duration-Ms": str(job.duration_ms or 0),
+        }
+        return Response(content=job.audio_bytes or b"", media_type="audio/wav", headers=headers)
+
+    @app.delete("/api/tts/jobs/{job_id}")
+    async def tts_ack(job_id: str, request: Request) -> JSONResponse:
+        owner_key = _request_tts_owner_key(request)
+        try:
+            app.state.tts_jobs.get(job_id, owner_key)
+        except TTSJobNotFound as exc:
+            raise HTTPException(status_code=404, detail="TTS job not found") from exc
+        removed = app.state.tts_jobs.acknowledge(job_id, owner_key)
+        return JSONResponse({"ok": removed})
+
+    @app.delete("/api/tts/clients/{client_id}/jobs")
+    async def tts_cancel_client(client_id: str, request: Request) -> JSONResponse:
+        owner_key = _request_tts_owner_key(request)
+        validated_client_id = _validated_tts_client_id(client_id)
+        removed = app.state.tts_jobs.cancel_client(owner_key, validated_client_id)
+        return JSONResponse({"ok": True, "removed": removed})
 
     def _resolve_debug_file(path_text: str) -> Path:
         raw = str(path_text or "").strip()

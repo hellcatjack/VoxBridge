@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import hashlib
 import json
 import threading
 import time
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import _create_app, _hash_auth_password
+from voxbridge.tts.kokoro_onnx import SynthesizedAudio
 
 
 class _FakeASR:
@@ -74,6 +76,15 @@ class _FakeTranslator:
         return f"[{src}->{tgt}] {text}"
 
 
+class _FakeTTSSynthesizer:
+    def __init__(self):
+        self.calls = []
+
+    def synthesize(self, text: str, target_language: str):
+        self.calls.append((text, target_language))
+        return SynthesizedAudio(b"RIFF-fake-wav", sample_rate=24000, duration_ms=750)
+
+
 def _args():
     return SimpleNamespace(
         backend="vllm",
@@ -102,6 +113,18 @@ def _receive_until_type(ws, expected_type: str, max_steps: int = 40):
             return msg
         seen.append(msg.get("type"))
     pytest.fail(f"did not receive {expected_type}, seen={seen}")
+
+
+def _login_tts_owner(client: TestClient) -> str:
+    login = client.post(
+        "/login",
+        data={"username": "admin", "password": "secret"},
+        follow_redirects=False,
+    )
+    assert login.status_code in {302, 303, 307}
+    token = client.cookies.get("voxbridge_session")
+    assert token
+    return hashlib.sha256(f"auth:{token}".encode()).hexdigest()
 
 
 def test_ws_ready_partial_final_flow():
@@ -202,6 +225,110 @@ def test_auth_login_sets_cookie_allows_access_and_logout_blocks_again():
     assert logout.status_code in {302, 303, 307}
     assert logout.headers["location"] == "/login"
     assert client.get("/", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_tts_audio_is_authenticated_cached_and_acknowledged():
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    synth = _FakeTTSSynthesizer()
+    app = _create_app(args, _FakeASR(), tts_synthesizer=synth)
+    client = TestClient(app)
+    owner_key = _login_tts_owner(client)
+    job = app.state.tts_jobs.create(
+        owner_key=owner_key,
+        client_id="client-a-12345678",
+        sentence_id="s1",
+        revision=1,
+        source_order=0,
+        target_language="English",
+        text="Stable translation.",
+    )
+
+    response = client.post(f"/api/tts/jobs/{job.job_id}/audio")
+    retry = client.post(f"/api/tts/jobs/{job.job_id}/audio")
+
+    assert response.status_code == 200
+    assert response.content == b"RIFF-fake-wav"
+    assert response.headers["content-type"].startswith("audio/wav")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-tts-sample-rate"] == "24000"
+    assert response.headers["x-tts-duration-ms"] == "750"
+    assert retry.content == response.content
+    assert synth.calls == [("Stable translation.", "English")]
+    assert client.delete(f"/api/tts/jobs/{job.job_id}").json() == {"ok": True}
+    assert client.post(f"/api/tts/jobs/{job.job_id}/audio").status_code == 404
+
+
+def test_tts_job_owner_isolation_returns_not_found():
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    app = _create_app(args, _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
+    owner_client = TestClient(app)
+    other_client = TestClient(app)
+    owner_key = _login_tts_owner(owner_client)
+    _login_tts_owner(other_client)
+    job = app.state.tts_jobs.create(
+        owner_key=owner_key,
+        client_id="client-a-12345678",
+        sentence_id="s1",
+        revision=1,
+        source_order=0,
+        target_language="English",
+        text="Private translation.",
+    )
+
+    assert other_client.post(f"/api/tts/jobs/{job.job_id}/audio").status_code == 404
+    assert other_client.delete(f"/api/tts/jobs/{job.job_id}").status_code == 404
+    assert owner_client.post(f"/api/tts/jobs/{job.job_id}/audio").status_code == 200
+
+
+def test_tts_client_cancellation_preserves_other_clients():
+    app = _create_app(_args(), _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
+    client = TestClient(app)
+    jobs = [
+        app.state.tts_jobs.create(
+            owner_key="anonymous",
+            client_id=client_id,
+            sentence_id=f"s{index}",
+            revision=1,
+            source_order=index,
+            target_language="English",
+            text=f"Translation {index}.",
+        )
+        for index, client_id in enumerate(
+            ["client-a-12345678", "client-a-12345678", "client-b-12345678"]
+        )
+    ]
+
+    response = client.delete("/api/tts/clients/client-a-12345678/jobs")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "removed": 2}
+    assert client.post(f"/api/tts/jobs/{jobs[0].job_id}/audio").status_code == 404
+    assert client.post(f"/api/tts/jobs/{jobs[2].job_id}/audio").status_code == 200
+
+
+def test_tts_audio_returns_503_when_synthesizer_is_unavailable():
+    app = _create_app(_args(), _FakeASR())
+    client = TestClient(app)
+    job = app.state.tts_jobs.create(
+        owner_key="anonymous",
+        client_id="client-a-12345678",
+        sentence_id="s1",
+        revision=1,
+        source_order=0,
+        target_language="English",
+        text="Stable translation.",
+    )
+
+    response = client.post(f"/api/tts/jobs/{job.job_id}/audio")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "TTS is unavailable"
 
 
 def test_debug_file_requires_auth_and_can_be_disabled(tmp_path):
