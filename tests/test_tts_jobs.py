@@ -156,6 +156,18 @@ def test_translation_finishing_after_source_deadline_releases_immediately():
     assert ready[0].translation_ready_age_ms == 0
 
 
+def test_release_age_preserves_zero_monotonic_timestamp():
+    clock = FakeClock(0.0)
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "translated", "English")
+
+    clock.advance(3.0)
+    ready = buffer.drain()
+
+    assert ready[0].translation_ready_age_ms == 3000
+
+
 def test_stability_buffer_preserves_order_and_skips_failed_head():
     clock = FakeClock(100.0)
     buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)

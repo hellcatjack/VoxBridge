@@ -322,7 +322,9 @@ class RevisionStableTTSBuffer:
                         release_reason="final_force" if force else "quiet_window",
                         source_quiet_age_ms=self._elapsed_ms(entry.changed_at, now),
                         translation_ready_age_ms=self._elapsed_ms(
-                            entry.translation_ready_at or now,
+                            entry.translation_ready_at
+                            if entry.translation_ready_at is not None
+                            else now,
                             now,
                         ),
                     )
