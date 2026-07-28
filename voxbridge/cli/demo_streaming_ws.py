@@ -1375,11 +1375,7 @@ class LocalTranslator:
     def _build_prompt(self, text: str, source_language: Optional[str] = None, target_language: Optional[str] = None) -> str:
         source = str(source_language or self.source_language or "Chinese")
         target = str(target_language or self.target_language or "English")
-        return (
-            f"请将以下{source}文本翻译为{target}。\n"
-            f"要求：忠实原文，不增删；保留专有名词；只输出译文本身，不要解释。\n\n"
-            f"原文：\n{text}"
-        )
+        return _build_translation_prompt(text, source, target)
 
     def translate(
         self,
@@ -1464,11 +1460,7 @@ class OpenAIAPITranslator:
     def _build_prompt(self, text: str, source_language: Optional[str] = None, target_language: Optional[str] = None) -> str:
         source = str(source_language or self.source_language or "Chinese")
         target = str(target_language or self.target_language or "English")
-        return (
-            f"请将以下{source}文本翻译为{target}。\n"
-            f"要求：忠实原文，不增删；保留专有名词；只输出译文本身，不要解释。\n\n"
-            f"原文：\n{text}"
-        )
+        return _build_translation_prompt(text, source, target)
 
     def _extract_content(self, payload: Dict[str, Any]) -> str:
         choices = payload.get("choices")

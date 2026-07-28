@@ -411,6 +411,64 @@ def test_translation_prompt_does_not_apply_esv_policy_to_en_zh():
     assert "不得补写、扩写" not in prompt
 
 
+def test_translator_backends_share_esv_prompt_policy_without_loading_model():
+    local = object.__new__(demo_streaming_ws.LocalTranslator)
+    local.source_language = "Chinese"
+    local.target_language = "English"
+    remote = OpenAIAPITranslator(
+        "http://127.0.0.1:8001",
+        "fake-model",
+        source_language="Chinese",
+        target_language="English",
+    )
+
+    local_prompt = local._build_prompt("这是讲道内容。")
+    remote_prompt = remote._build_prompt("这是讲道内容。")
+
+    assert local_prompt == remote_prompt
+    assert "English Standard Version (ESV)" in local_prompt
+
+
+def test_openai_api_translator_sends_esv_policy_for_zh_en(monkeypatch):
+    captured = []
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": "Translated sentence."},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    translator = OpenAIAPITranslator(
+        "http://127.0.0.1:8001",
+        "fake-model",
+        source_language="Chinese",
+        target_language="English",
+    )
+
+    assert translator.translate("这是讲道内容。") == "Translated sentence."
+    prompt = captured[0]["messages"][0]["content"]
+    assert "English Standard Version (ESV)" in prompt
+    assert "不得补写、扩写" in prompt
+
+
 def test_openai_api_translator_retries_when_generation_hits_token_limit(monkeypatch):
     calls = []
 
