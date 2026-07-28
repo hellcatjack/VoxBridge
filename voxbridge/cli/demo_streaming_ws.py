@@ -5322,6 +5322,7 @@ def _create_app(
             next_source_order=0,
             sentence_orders={},
             ordered=OrderedTTSBuffer(),
+            issued_job_count=0,
             owner_key=(
                 "anonymous"
                 if not auth.enabled
@@ -5803,6 +5804,7 @@ def _create_app(
             tts_runtime.next_source_order = 0
             tts_runtime.sentence_orders.clear()
             tts_runtime.ordered.reset()
+            tts_runtime.issued_job_count = 0
 
         async def _emit_tts_status(status: str, **payload: Any) -> None:
             message = {
@@ -5926,6 +5928,7 @@ def _create_app(
                         "is_stable": True,
                     }
                 )
+                tts_runtime.issued_job_count += 1
                 _trace_event(
                     "tts_job_issued",
                     sentence_id=job.sentence_id,
@@ -8978,7 +8981,15 @@ def _create_app(
                         reason=str(finish_reason or finish_mode or "stop"),
                     )
                 if finish_mode == "stop" and final_redecode_on_stop:
-                    if segment_final_context_applied or stop_context_final_applied:
+                    if tts_runtime.enabled and int(tts_runtime.issued_job_count) > 0:
+                        _trace_event(
+                            "final_redecode_skipped",
+                            reason="tts_jobs_already_issued",
+                            issued_jobs=int(tts_runtime.issued_job_count),
+                            full_audio_samples=int(full_audio_samples),
+                            cap_samples=int(final_redecode_max_samples),
+                        )
+                    elif segment_final_context_applied or stop_context_final_applied:
                         _trace_event(
                             "final_redecode_skipped",
                             reason="segment_final_context_active",
