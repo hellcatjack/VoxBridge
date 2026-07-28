@@ -482,6 +482,69 @@ def test_tts_audio_returns_503_when_synthesizer_is_unavailable():
     assert response.json()["detail"] == "TTS is unavailable"
 
 
+def test_broadcast_stress_preserves_order_and_shares_synthesis_across_listeners():
+    args = _args()
+    args.tts_listener_queue_size = 256
+    synthesizer = _FakeTTSSynthesizer()
+    app = _create_app(
+        args,
+        _FakeASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=synthesizer,
+    )
+    first = app.state.tts_broadcast.register("anonymous")
+    second = app.state.tts_broadcast.register("anonymous")
+    jobs = [
+        app.state.tts_broadcast.publish(
+            TTSReadyItem(
+                sentence_id=f"sentence-{index}",
+                revision=1,
+                source_order=index,
+                target_language="English",
+                text=f"Stable translation {index}.",
+            )
+        )
+        for index in range(200)
+    ]
+    first_events = [first.queue.get_nowait() for _ in jobs]
+    second_events = [second.queue.get_nowait() for _ in jobs]
+
+    assert [event["source_order"] for event in first_events] == list(range(200))
+    assert [event["source_order"] for event in second_events] == list(range(200))
+
+    with TestClient(app) as client:
+        for job in jobs:
+            endpoint = f"/api/tts/broadcast/jobs/{job.job_id}/audio"
+            first_audio = client.post(
+                endpoint,
+                headers={"X-TTS-Listener-ID": first.listener_id},
+            )
+            second_audio = client.post(
+                endpoint,
+                headers={"X-TTS-Listener-ID": second.listener_id},
+            )
+            assert first_audio.status_code == 200
+            assert second_audio.status_code == 200
+            assert first_audio.content == second_audio.content
+            assert app.state.tts_broadcast.acknowledge(
+                job.job_id,
+                first.listener_id,
+                "anonymous",
+            )
+
+        for job in jobs[:100]:
+            assert app.state.tts_broadcast.acknowledge(
+                job.job_id,
+                second.listener_id,
+                "anonymous",
+            )
+
+    assert len(synthesizer.calls) == 200
+    assert app.state.tts_broadcast.job_count == 100
+    assert app.state.tts_broadcast.unregister(second.listener_id, "anonymous") == 100
+    assert app.state.tts_broadcast.job_count == 0
+
+
 class _StableTTSSentenceASR(_FakeASR):
     sentences = (
         "这是第一句已经稳定完成并且长度足够。",
@@ -536,6 +599,74 @@ def test_ws_tts_defaults_off_and_marks_translation_stable():
     assert translations
     assert all(event.get("is_stable") is True for event in translations)
     assert not [event for event in events if event.get("type") == "tts_job"]
+
+
+def test_ws_broadcasts_stable_translations_without_legacy_tts_fields():
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.translation_workers = 3
+    args.tts_final_translation_drain_sec = 2.0
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    listener = app.state.tts_broadcast.register("anonymous")
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "start"})
+        started = _receive_until_type(ws, "started")
+        assert started["tts_enabled"] is False
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    broadcast_events = []
+    while True:
+        try:
+            broadcast_events.append(listener.queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    jobs = [event for event in broadcast_events if event.get("type") == "tts_job"]
+    statuses = [
+        event for event in broadcast_events if event.get("type") == "producer_status"
+    ]
+    assert [event["source_order"] for event in jobs] == [0, 1, 2]
+    assert statuses == [
+        {"type": "producer_status", "active": True},
+        {"type": "producer_status", "active": False},
+    ]
+    assert max(broadcast_events.index(event) for event in jobs) < broadcast_events.index(
+        statuses[-1]
+    )
+    assert app.state.tts_broadcast.job_count == 3
+    assert not [event for event in events if event.get("type") == "tts_job"]
+
+
+def test_ws_does_not_retain_broadcast_jobs_without_listeners():
+    args = _args()
+    args.final_redecode_on_stop = False
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "start"})
+        _receive_until_type(ws, "started")
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        _collect_through_final(ws)
+
+    assert app.state.tts_broadcast.job_count == 0
 
 
 def test_ws_tts_jobs_follow_source_order_and_precede_final():

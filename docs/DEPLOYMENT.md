@@ -130,16 +130,25 @@ to the same `ExecStart` command:
 --tts-zh-voices-path models/kokoro/voices-v1.1-zh.bin
 --tts-zh-vocab-path models/kokoro/config-v1.1-zh.json
 --tts-cpu-threads 4
+--tts-listener-queue-size 128
 ```
 
 Translation endpoints and model names are deployment-specific. Keep API keys outside the unit file.
-TTS remains disabled in each browser until the user selects “朗读译文”. Stop
-waits for pending stable translations and preserves already queued speech; it
-does not wait for synthesis or playback. Turning the option off stops and clears
-the browser queue immediately. `--tts-final-translation-drain-sec` controls the
-slow-drain warning threshold and does not discard pending translation jobs.
-When capturing system audio, use headphones to avoid feeding synthesized speech
-back into ASR.
+The subtitle page never plays TTS. Each authenticated listener opens `/listen`
+on a phone, tablet, or other browser and explicitly selects Start on that device.
+Listeners receive future stable translations only; joining does not replay old
+jobs. Device-local Stop clears only that browser's FIFO and does not affect other
+listeners. One WAV is synthesized and cached per translation under the global
+CPU lock, then shared by all listeners assigned to that job.
+
+`--tts-listener-queue-size` bounds unread metadata per device. A listener that
+cannot keep up is disconnected without delaying other listeners. The shared job
+registry is bounded by `--tts-max-client-jobs` and jobs expire after
+`--tts-job-ttl-sec`; unread jobs are never silently evicted to admit newer work.
+`--tts-final-translation-drain-sec` controls the slow-drain warning threshold and
+does not discard pending stable translations. When capturing system audio, use a
+separate listener device or headphones to avoid feeding synthesized speech back
+into ASR.
 
 Load and start the service:
 

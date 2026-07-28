@@ -26,6 +26,13 @@ Returns the browser UI as HTML.
 
 When authentication is enabled, unauthenticated requests redirect to `/login`.
 
+### `GET /listen`
+
+Returns the standalone translated-speech listener. The main subtitle page does
+not synthesize or play audio. When authentication is enabled, an unauthenticated
+request redirects to `/login?next=%2Flisten`, and a successful login returns to
+the listener page. Each browser must explicitly select Start to activate audio.
+
 ### `GET /login`
 
 Returns the login page when authentication is enabled.
@@ -51,7 +58,25 @@ Use this endpoint only for local diagnostics. Do not expose it on an untrusted
 network. When authentication is enabled, this endpoint requires a valid session.
 When `--disable-debug-file` is set, this endpoint always returns `404`.
 
-### `POST /api/tts/jobs/{job_id}/audio`
+### `POST /api/tts/broadcast/jobs/{job_id}/audio`
+
+Returns the shared `audio/wav` for one job assigned to the authenticated
+listener in `X-TTS-Listener-ID`. Missing, expired, unassigned, and foreign jobs
+all return `404`; unavailable or failed synthesis returns `503`. The response is
+`Cache-Control: no-store` and includes `X-TTS-Sample-Rate` and
+`X-TTS-Duration-Ms`.
+
+Kokoro synthesis is globally serialized on CPU and cached once per stable
+translation. Multiple assigned listeners fetch the same cached WAV. A job is
+released only after all intended listeners acknowledge receipt or disconnect,
+and no audio request still holds a lease.
+
+### Deprecated private TTS endpoints
+
+The following owner/client-scoped routes remain for one compatibility cycle.
+New clients must use `/listen`, `WS /ws/tts`, and the broadcast audio route.
+
+#### `POST /api/tts/jobs/{job_id}/audio`
 
 Returns one backend-issued TTS job as `audio/wav`. With `--auth-enabled`, the
 route requires the same authenticated cookie session that owns the job, uses
@@ -61,19 +86,65 @@ uses anonymous ownership; public TTS deployments must enable global
 authentication. Synthesis runs one job at a time on the CPU; a generated WAV is
 cached in memory only until acknowledgement.
 
-### `DELETE /api/tts/jobs/{job_id}`
+#### `DELETE /api/tts/jobs/{job_id}`
 
 Acknowledges playback preparation and removes the job plus cached WAV from
 memory. The translated text never appears in the URL.
 
-### `DELETE /api/tts/clients/{client_id}/jobs`
+#### `DELETE /api/tts/clients/{client_id}/jobs`
 
 Cancels every unread job owned by the current session and page client. The
 session is authenticated when `--auth-enabled` is in use and anonymous only in
 trusted local mode. The browser calls this when the user disables translated
 speech.
 
-## WebSocket Endpoint
+## WebSocket Endpoints
+
+### `WS /ws/tts`
+
+Authenticated standalone translated-speech listener protocol. Listener sockets
+do not count against the ASR `--max-connections` limit. After connection the
+server returns:
+
+```json
+{
+  "type": "tts_listener_ready",
+  "listener_id": "opaque-random-token",
+  "tts_available": true,
+  "producer_active": true
+}
+```
+
+The listener is future-only: it receives no job history and only participates in
+stable translation jobs published after registration. Each job event contains
+metadata only, never translated text:
+
+```json
+{
+  "type": "tts_job",
+  "job_id": "opaque-random-token",
+  "sentence_id": "1781901841676-386666-1",
+  "revision": 2,
+  "source_order": 7,
+  "target_language": "Chinese",
+  "is_stable": true
+}
+```
+
+After the browser has fetched the complete WAV, it acknowledges receipt:
+
+```json
+{
+  "type": "tts_received",
+  "job_id": "opaque-random-token"
+}
+```
+
+`producer_status` reports whether the main ASR session is active. An inactive
+event is sent after the last stable job at graceful stop and does not clear the
+device FIFO. `ping` receives `pong`. Start and Stop are local UI actions: Stop
+closes only that listener socket, aborts its current fetch/playback, and clears
+only its local queue. Queue overflow disconnects only the slow listener.
 
 ### `WS /ws`
 
@@ -113,9 +184,7 @@ translations, alignment counters, and audio queues.
   "type": "start",
   "language": "English",
   "translation_direction": "en2zh",
-  "asr_context_terms": ["Elisha", "Jordan"],
-  "tts_enabled": true,
-  "tts_client_id": "page-9054a7d8-7f3e-4fd4-a147"
+  "asr_context_terms": ["Elisha", "Jordan"]
 }
 ```
 
@@ -129,10 +198,9 @@ Fields:
   significant: a non-empty array overrides the configured context schedule, an
   empty array explicitly disables context, and an omitted field preserves the
   configured schedule for legacy clients.
-- `tts_enabled`: optional boolean; defaults to `false`. Enabling affects stable
-  sentences committed after this start and requires server-side TTS support.
-- `tts_client_id`: required when TTS is enabled. It is a page-generated opaque
-  identifier used only for bounded job ownership and cancellation.
+- `tts_enabled` and `tts_client_id`: deprecated private-TTS compatibility fields.
+  The main VoxBridge page no longer sends them. New listener devices use
+  `/listen`; stable translation broadcast does not depend on these fields.
 
 `start` validates and constructs the replacement ASR state before resetting the
 active session. Invalid context therefore returns `error` without replacing the
@@ -154,7 +222,7 @@ Recommended UI behavior is to send this before `start` and lock the selector
 during an active session, because the ASR force language and translation
 direction should not drift apart mid-session.
 
-### `set_tts_enabled`
+### `set_tts_enabled` (deprecated)
 
 Changes translated speech without changing ASR or translation state:
 
@@ -166,15 +234,15 @@ Changes translated speech without changing ASR or translation state:
 }
 ```
 
-Enabling applies only to future stable source sentences. Disabling increments
-the TTS generation, clears pending ordering state, and cancels unread jobs for
-the page client. It does not rewrite subtitle text.
+This message controls only the legacy owner/client-scoped TTS stream. It does
+not enable or disable `/ws/tts` listeners. It does not rewrite subtitle text.
 
 ### `finish`
 
 Requests graceful stop. The backend drains queued audio for tail accuracy,
 flushes the current ASR state, commits the final safe tail, waits for pending
-stable translation work when TTS is enabled, and sends one `final` message.
+stable translation work needed by active broadcast or legacy output, and sends
+one `final` message.
 
 ```json
 {
@@ -361,7 +429,7 @@ text, stream generation, and translation direction both before inference and
 before publication. A superseded result is discarded and is never sent as a
 `sentence_translation` event.
 
-### `tts_job`
+### `tts_job` (deprecated on `WS /ws`)
 
 Sent only after the current stable `sentence_id` and `revision` translation has
 passed the backend pre- and post-inference guards. It contains no text or audio:
@@ -378,11 +446,10 @@ passed the backend pre- and post-inference guards. It contains no text or audio:
 }
 ```
 
-Parallel translations are reordered by `source_order`. A failed current
+The main page no longer requests or consumes this legacy event. Parallel
+translations are reordered by `source_order`. A failed current
 translation is explicitly skipped so it cannot block later jobs; a stale
-revision cannot advance the queue or produce spoken output. The browser must
-append jobs to a strict FIFO and wait for the active audio `ended` event before
-fetching the next item.
+revision cannot advance the queue or produce spoken output.
 
 ### `tts_status`
 
@@ -448,13 +515,12 @@ Sent once after `finish`.
 skipped by `--final-redecode-max-sec`. Use `committed_text` and sentence events
 as the canonical subtitle stream.
 
-When TTS is enabled, the backend waits for pending stable translations and sends
-all pending `tts_job` events before `final`.
+When broadcast TTS is available, the backend waits for pending stable
+translations and publishes all pending listener jobs before `final`.
 `--tts-final-translation-drain-sec` is the threshold for a slow-drain status,
 not a hard timeout. The backend does not wait for CPU synthesis or browser
-playback. The browser may therefore close the WebSocket on `final` and continue
-consuming session-owned HTTP jobs, authenticated when `--auth-enabled` is in
-use. Stop preserves the browser queue; disabling TTS clears it.
+playback. Listener FIFOs therefore continue independently after the producer
+becomes inactive.
 
 ### Other Messages
 

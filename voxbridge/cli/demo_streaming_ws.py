@@ -58,6 +58,7 @@ from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overla
 from voxbridge.tts.broadcast import (
     TTSBroadcastHub,
     TTSBroadcastNotFound,
+    TTSBroadcastQueueFull,
 )
 from voxbridge.tts.jobs import OrderedTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
 from voxbridge.tts.listener_page import TTS_LISTENER_HTML
@@ -82,6 +83,13 @@ AUTH_HASH_SCHEME = "pbkdf2_sha256"
 AUTH_HASH_ITERATIONS = 260_000
 AUTH_SESSION_TOKEN_BYTES = 32
 TTS_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -1790,23 +1798,17 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       color:var(--muted);
     }
 
-    .tts-toggle{
+    .listener-link{
       display: inline-flex;
       align-items: center;
-      gap: 7px;
       border:1px solid var(--line);
       border-radius: 10px;
-      background:var(--surface-soft);
-      padding: 7px 10px;
+      background:#f7faf3;
+      padding: 8px 12px;
       font-size: 12px;
-      color:var(--muted);
-      cursor: pointer;
-      user-select: none;
-    }
-
-    .tts-toggle input{
-      margin: 0;
-      accent-color: var(--accent);
+      color:#29372e;
+      font-weight:700;
+      text-decoration:none;
     }
 
     .source-toggle select{
@@ -2025,8 +2027,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         align-items: stretch;
         gap: 8px;
       }
-      .control-bar button{
+      .control-bar button,
+      .control-bar .listener-link{
         flex: 1 1 calc(50% - 8px);
+        justify-content: center;
       }
       .badge{
         flex: 1 0 100%;
@@ -2101,11 +2105,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             <option value="en2zh">英文 -> 中文</option>
           </select>
         </label>
-        <label class="tts-toggle" for="ttsEnabledInput">
-          <input id="ttsEnabledInput" type="checkbox" />
-          <span>朗读译文</span>
-        </label>
-        <span id="ttsStatus" class="badge">朗读关闭</span>
+        <a class="listener-link" href="/listen" target="_blank" rel="noopener">译文朗读</a>
         <label class="font-size-control" for="subtitleTopFontInput">
           <span>上方字号</span>
           <input id="subtitleTopFontInput" aria-label="上方字幕字号" type="number" min="18" max="72" step="1" inputmode="numeric" placeholder="自动" />
@@ -2181,8 +2181,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const subtitleTopFontInput = $("subtitleTopFontInput");
   const subtitleBottomFontInput = $("subtitleBottomFontInput");
   const asrContextInput = $("asrContextInput");
-  const ttsEnabledInput = $("ttsEnabledInput");
-  const ttsStatus = $("ttsStatus");
   const rawTextEl = $("rawText");
   const languageSelect = $("languageSelect");
   const toggleEchoCancellation = $("toggleEchoCancellation");
@@ -2230,16 +2228,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let inputSource = "mic";
   let translationDirection = "zh2en";
   let activeContextMetadata = null;
-  let ttsAvailable = false;
-  let ttsQueue = [];
-  let ttsCurrent = null;
-  let ttsAudioCtx = null;
-  let ttsAbortController = null;
-  let ttsSourceNode = null;
-  let ttsGeneration = 0;
-  let ttsPumpPromise = null;
-  const ttsSeenJobIds = new Set();
-  const ttsClientId = createTTSClientId();
   const autoScrollRaf = new WeakMap();
   const scrollFollowState = {
     zh: { follow: true, autoScrolling: false },
@@ -2247,203 +2235,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  function createTTSClientId(){
-    try {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return `page-${window.crypto.randomUUID()}`;
-      }
-    } catch (err) {}
-    return `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
-  }
-
-  function updateTTSStatus(message = "", cls = ""){
-    if (!ttsStatus) return;
-    const enabled = !!(ttsEnabledInput && ttsEnabledInput.checked);
-    const feedbackRisk = enabled && selectedInputSource() === "system";
-    let text = String(message || "");
-    let statusClass = String(cls || "");
-    if (!text) {
-      if (!enabled) {
-        text = "朗读关闭";
-      } else if (!ttsAvailable) {
-        text = "朗读等待服务";
-        statusClass = "warn";
-      } else if (ttsCurrent) {
-        text = `朗读中 · 待播 ${ttsQueue.length}`;
-        statusClass = "ok";
-      } else if (ttsQueue.length > 0) {
-        text = `待播 ${ttsQueue.length}`;
-        statusClass = "warn";
-      } else {
-        text = "朗读就绪";
-        statusClass = "ok";
-      }
-    }
-    if (feedbackRisk) {
-      text = `系统声音可能回采朗读 · ${text}`;
-      if (!statusClass) statusClass = "warn";
-    }
-    ttsStatus.textContent = text;
-    ttsStatus.className = "badge " + statusClass;
-  }
-
-  async function ensureTTSAudioContext(){
-    if (!ttsAudioCtx || ttsAudioCtx.state === "closed") {
-      ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (ttsAudioCtx.state === "suspended") {
-      await ttsAudioCtx.resume();
-    }
-    return ttsAudioCtx;
-  }
-
-  async function acknowledgeTTSJob(jobId){
-    try {
-      await fetch(`/api/tts/jobs/${encodeURIComponent(jobId)}`, {
-        method: "DELETE",
-        credentials: "same-origin",
-        cache: "no-store",
-      });
-    } catch (err) {
-      traceSubtitle("tts_ack_failed", { jobId: String(jobId || "") });
-    }
-  }
-
-  async function fetchTTSAudio(job, signal){
-    let lastError = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await fetch(
-          `/api/tts/jobs/${encodeURIComponent(job.job_id)}/audio`,
-          {
-            method: "POST",
-            credentials: "same-origin",
-            cache: "no-store",
-            signal,
-          }
-        );
-        if (!response.ok) throw new Error(`TTS audio request failed (${response.status})`);
-        return await response.arrayBuffer();
-      } catch (err) {
-        if (signal.aborted) throw err;
-        lastError = err;
-        if (attempt === 0) await sleep(250);
-      }
-    }
-    throw lastError || new Error("TTS audio request failed");
-  }
-
-  async function playTTSAudioBuffer(audioBuffer, generation){
-    if (generation !== ttsGeneration) return;
-    const ctx = await ensureTTSAudioContext();
-    if (generation !== ttsGeneration) return;
-    await new Promise((resolve) => {
-      const sourceNode = ctx.createBufferSource();
-      ttsSourceNode = sourceNode;
-      sourceNode.buffer = audioBuffer;
-      sourceNode.connect(ctx.destination);
-      sourceNode.addEventListener("ended", resolve, { once: true });
-      sourceNode.start();
-    });
-  }
-
-  async function pumpTTSQueue(){
-    if (ttsPumpPromise) return ttsPumpPromise;
-    ttsPumpPromise = (async () => {
-      while (ttsQueue.length > 0 && ttsEnabledInput && ttsEnabledInput.checked) {
-        ttsCurrent = ttsQueue.shift();
-        const job = ttsCurrent;
-        const generation = ttsGeneration;
-        ttsAbortController = new AbortController();
-        updateTTSStatus();
-        try {
-          const encoded = await fetchTTSAudio(job, ttsAbortController.signal);
-          if (generation !== ttsGeneration) continue;
-          const ctx = await ensureTTSAudioContext();
-          const audioBuffer = await ctx.decodeAudioData(encoded.slice(0));
-          await acknowledgeTTSJob(job.job_id);
-          if (generation !== ttsGeneration) continue;
-          await playTTSAudioBuffer(audioBuffer, generation);
-        } catch (err) {
-          if (generation === ttsGeneration && !(err && err.name === "AbortError")) {
-            traceSubtitle("tts_play_failed", {
-              jobId: String(job.job_id || ""),
-              error: String((err && err.message) || err || "unknown"),
-            });
-            await acknowledgeTTSJob(job.job_id);
-            updateTTSStatus("朗读失败，继续下一条", "err");
-          }
-        } finally {
-          if (ttsSourceNode) {
-            try { ttsSourceNode.disconnect(); } catch (err) {}
-          }
-          ttsSourceNode = null;
-          ttsAbortController = null;
-          if (ttsCurrent === job) ttsCurrent = null;
-          updateTTSStatus();
-        }
-      }
-    })().finally(() => {
-      ttsPumpPromise = null;
-      updateTTSStatus();
-      if (ttsQueue.length > 0 && ttsEnabledInput && ttsEnabledInput.checked) {
-        void pumpTTSQueue();
-      }
-    });
-    return ttsPumpPromise;
-  }
-
-  async function cancelTTSPlayback({ notifyBackend = true } = {}){
-    ttsGeneration += 1;
-    ttsQueue = [];
-    ttsSeenJobIds.clear();
-    if (ttsAbortController) {
-      try { ttsAbortController.abort(); } catch (err) {}
-    }
-    if (ttsSourceNode) {
-      try { ttsSourceNode.stop(); } catch (err) {}
-      try { ttsSourceNode.disconnect(); } catch (err) {}
-    }
-    ttsAbortController = null;
-    ttsSourceNode = null;
-    ttsCurrent = null;
-    if (notifyBackend) {
-      try {
-        await fetch(`/api/tts/clients/${encodeURIComponent(ttsClientId)}/jobs`, {
-          method: "DELETE",
-          credentials: "same-origin",
-          cache: "no-store",
-        });
-      } catch (err) {
-        traceSubtitle("tts_cancel_failed", {});
-      }
-    }
-    updateTTSStatus();
-  }
-
-  function queueTTSJob(message){
-    if (!ttsEnabledInput || !ttsEnabledInput.checked) return;
-    if (!message || message.is_stable !== true) return;
-    const jobId = String(message.job_id || "").trim();
-    if (!jobId || ttsSeenJobIds.has(jobId)) return;
-    const job = {
-      job_id: jobId,
-      sentence_id: String(message.sentence_id || ""),
-      revision: Number(message.revision || 0),
-      source_order: Number(message.source_order || 0),
-      target_language: String(message.target_language || ""),
-    };
-    ttsSeenJobIds.add(jobId);
-    ttsQueue.push(job);
-    traceSubtitle("tts_job_queued", {
-      jobId,
-      sourceOrder: job.source_order,
-      queueDepth: ttsQueue.length,
-    });
-    updateTTSStatus();
-    void pumpTTSQueue();
-  }
 
   (() => {
     let enabled = !!SUBTITLE_TRACE_DEFAULT;
@@ -3730,7 +3521,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     if (msg.type === "ready") {
-      ttsAvailable = !!msg.tts_available;
       const localDirectionBeforeStart = selectedTranslationDirection();
       if (msg.translation_direction) {
         const serverDirection = normalizeTranslationDirection(msg.translation_direction);
@@ -3745,11 +3535,9 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         translationDirection: localDirectionBeforeStart,
       });
       setStatus("Connected / 已连接", "ok");
-      updateTTSStatus();
       return;
     }
     if (msg.type === "started") {
-      ttsAvailable = !!msg.tts_available;
       activeContextMetadata = {
         asr_context_active: !!msg.asr_context_active,
         asr_context_term_count: Number(msg.asr_context_term_count || 0),
@@ -3778,30 +3566,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       currentTranslationTail = "";
       renderTranscript();
       renderTranslation();
-      updateTTSStatus();
       return;
     }
     if (msg.type === "translation_direction") {
       const direction = applyTranslationDirection(msg.translation_direction);
       traceSubtitle("ws_translation_direction", { direction });
-      return;
-    }
-    if (msg.type === "tts_status") {
-      ttsAvailable = !!msg.tts_available;
-      const status = String(msg.status || "");
-      if (status === "unavailable") {
-        updateTTSStatus("朗读服务不可用", "err");
-      } else if (status === "queue_full") {
-        updateTTSStatus("朗读队列已满", "err");
-      } else if (status === "translation_drain_timeout") {
-        updateTTSStatus("部分译文尚未完成", "warn");
-      } else {
-        updateTTSStatus();
-      }
-      return;
-    }
-    if (msg.type === "tts_job") {
-      queueTTSJob(msg);
       return;
     }
     if (msg.type === "sentence_committed") {
@@ -4061,39 +3830,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     inputSourceSelect.addEventListener("change", () => {
       const next = selectedInputSource();
       applyInputSource(next);
-      updateTTSStatus();
-    });
-  }
-
-  if (ttsEnabledInput) {
-    ttsEnabledInput.addEventListener("change", async () => {
-      const enabled = !!ttsEnabledInput.checked;
-      if (!enabled) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "set_tts_enabled",
-            enabled: false,
-            tts_client_id: ttsClientId,
-          }));
-        }
-        await cancelTTSPlayback({ notifyBackend: true });
-        return;
-      }
-      try {
-        await ensureTTSAudioContext();
-      } catch (err) {
-        updateTTSStatus("浏览器无法播放朗读", "err");
-        return;
-      }
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: "set_tts_enabled",
-          enabled: true,
-          tts_client_id: ttsClientId,
-        }));
-      }
-      updateTTSStatus();
-      void pumpTTSQueue();
     });
   }
 
@@ -4186,9 +3922,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
     try {
       const sourceMode = selectedInputSource();
-      if (ttsEnabledInput && ttsEnabledInput.checked) {
-        await ensureTTSAudioContext();
-      }
       traceSubtitle("capture_source_starting", { source: sourceMode });
       if (sourceMode === "system") {
         setStatus("Share full screen + system audio / 请选择整屏共享并勾选系统音频", "warn");
@@ -4206,8 +3939,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           language: selectedAsrLanguage(),
           translation_direction: selectedTranslationDirection(),
           asr_context_terms: asrContextTerms,
-          tts_enabled: !!ttsEnabledInput.checked,
-          tts_client_id: ttsClientId,
         })
       );
       const started = await startedPromise;
@@ -4468,8 +4199,6 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             language,
             translation_direction: selectedTranslationDirection(),
             asr_context_terms: asrContextTerms,
-            tts_enabled: false,
-            tts_client_id: ttsClientId,
           })
         );
         const startOk = await _waitUntil(
@@ -4728,7 +4457,6 @@ def _create_app(
         max_jobs=max(1, int(getattr(args, "tts_max_client_jobs", 4096))),
         listener_queue_size=max(1, int(getattr(args, "tts_listener_queue_size", 128))),
     )
-    app.state.tts_producer_active = False
     app.state.tts_synthesizer = tts_synthesizer
     runtime = SimpleNamespace(active_connections=0)
     translator_accepts_direction = False
@@ -5000,19 +4728,31 @@ def _create_app(
 
         owner_key = _websocket_tts_owner_key(websocket)
         subscription = app.state.tts_broadcast.register(owner_key)
+        listener_hash = hashlib.sha256(subscription.listener_id.encode("utf-8")).hexdigest()[:8]
+        logger.info(
+            "tts listener connected listener_hash=%s listeners=%d producer_active=%s",
+            listener_hash,
+            app.state.tts_broadcast.listener_count,
+            app.state.tts_broadcast.producer_active,
+        )
         await websocket.accept()
         await websocket.send_json(
             {
                 "type": "tts_listener_ready",
                 "listener_id": subscription.listener_id,
                 "tts_available": bool(app.state.tts_synthesizer is not None),
-                "producer_active": bool(app.state.tts_producer_active),
+                "producer_active": bool(app.state.tts_broadcast.producer_active),
             }
         )
 
         async def _send_listener_events() -> None:
             while True:
                 if subscription.overflowed.is_set():
+                    logger.warning(
+                        "tts listener overflow listener_hash=%s listeners=%d",
+                        listener_hash,
+                        app.state.tts_broadcast.listener_count,
+                    )
                     await websocket.send_json(
                         {"type": "error", "message": "listener queue overloaded"}
                     )
@@ -5033,10 +4773,18 @@ def _create_app(
                     await websocket.send_json({"type": "pong"})
                     continue
                 if message_type == "tts_received":
+                    job_id = str(payload.get("job_id", "") or "")
                     acknowledged = app.state.tts_broadcast.acknowledge(
-                        str(payload.get("job_id", "") or ""),
+                        job_id,
                         subscription.listener_id,
                         owner_key,
+                    )
+                    logger.info(
+                        "tts listener received listener_hash=%s job_hash=%s accepted=%s retained_jobs=%d",
+                        listener_hash,
+                        hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:8],
+                        acknowledged,
+                        app.state.tts_broadcast.job_count,
                     )
                     if not acknowledged:
                         await websocket.send_json(
@@ -5053,6 +4801,12 @@ def _create_app(
             with suppress(asyncio.CancelledError, Exception):
                 await sender
             app.state.tts_broadcast.unregister(subscription.listener_id, owner_key)
+            logger.info(
+                "tts listener disconnected listener_hash=%s listeners=%d retained_jobs=%d",
+                listener_hash,
+                app.state.tts_broadcast.listener_count,
+                app.state.tts_broadcast.job_count,
+            )
 
     @app.post("/api/tts/broadcast/jobs/{job_id}/audio")
     async def tts_broadcast_audio(job_id: str, request: Request) -> Response:
@@ -5501,6 +5255,7 @@ def _create_app(
         )
         tts_runtime = SimpleNamespace(
             available=bool(tts_synthesizer is not None and translator is not None),
+            broadcast_enabled=bool(tts_synthesizer is not None and translator is not None),
             enabled=False,
             client_id="",
             generation=0,
@@ -5990,6 +5745,13 @@ def _create_app(
             tts_runtime.sentence_orders.clear()
             tts_runtime.ordered.reset()
 
+        def _tts_output_active() -> bool:
+            return bool(tts_runtime.broadcast_enabled or tts_runtime.enabled)
+
+        def _set_tts_producer_active(active: bool) -> None:
+            if app.state.tts_broadcast.set_producer_active(active):
+                _trace_event("tts_producer_status", active=bool(active))
+
         async def _emit_tts_status(status: str, **payload: Any) -> None:
             message = {
                 "type": "tts_status",
@@ -6053,7 +5815,7 @@ def _create_app(
             return bool(tts_runtime.enabled)
 
         def _register_tts_source(sentence_id: str, revision: int) -> None:
-            if not tts_runtime.enabled:
+            if not _tts_output_active():
                 return
             sid = str(sentence_id or "")
             if not sid:
@@ -6079,48 +5841,89 @@ def _create_app(
 
         async def _publish_tts_ready(items: List[Any]) -> None:
             for item in items:
-                if not tts_runtime.enabled:
+                if not _tts_output_active():
                     return
-                try:
-                    job = app.state.tts_jobs.create(
-                        owner_key=str(tts_runtime.owner_key),
-                        client_id=str(tts_runtime.client_id),
-                        sentence_id=str(item.sentence_id),
-                        revision=int(item.revision),
-                        source_order=int(item.source_order),
-                        target_language=str(item.target_language),
-                        text=str(item.text),
-                    )
-                except TTSQueueFull:
-                    _trace_event(
-                        "tts_job_rejected",
-                        reason="queue_full",
-                        sentence_id=str(item.sentence_id),
-                        revision=int(item.revision),
-                        source_order=int(item.source_order),
-                    )
-                    await _emit_tts_status("queue_full")
+                broadcast_job = None
+                if tts_runtime.broadcast_enabled:
+                    pruned_jobs = app.state.tts_broadcast.prune()
+                    if pruned_jobs:
+                        logger.info(
+                            "tts broadcast pruned jobs=%d retained_jobs=%d listeners=%d",
+                            pruned_jobs,
+                            app.state.tts_broadcast.job_count,
+                            app.state.tts_broadcast.listener_count,
+                        )
+                    try:
+                        broadcast_job = app.state.tts_broadcast.publish(item)
+                    except TTSBroadcastQueueFull:
+                        logger.warning(
+                            "tts broadcast queue full retained_jobs=%d listeners=%d",
+                            app.state.tts_broadcast.job_count,
+                            app.state.tts_broadcast.listener_count,
+                        )
+                        _trace_event(
+                            "tts_broadcast_rejected",
+                            reason="queue_full",
+                            sentence_id=str(item.sentence_id),
+                            revision=int(item.revision),
+                            source_order=int(item.source_order),
+                        )
+                    if broadcast_job is not None:
+                        logger.info(
+                            "tts broadcast published job_hash=%s source_order=%d listeners=%d retained_jobs=%d",
+                            _hash8(broadcast_job.job_id),
+                            int(broadcast_job.source_order),
+                            app.state.tts_broadcast.listener_count,
+                            app.state.tts_broadcast.job_count,
+                        )
+
+                private_job = None
+                if tts_runtime.enabled:
+                    try:
+                        private_job = app.state.tts_jobs.create(
+                            owner_key=str(tts_runtime.owner_key),
+                            client_id=str(tts_runtime.client_id),
+                            sentence_id=str(item.sentence_id),
+                            revision=int(item.revision),
+                            source_order=int(item.source_order),
+                            target_language=str(item.target_language),
+                            text=str(item.text),
+                        )
+                    except TTSQueueFull:
+                        _trace_event(
+                            "tts_job_rejected",
+                            reason="queue_full",
+                            sentence_id=str(item.sentence_id),
+                            revision=int(item.revision),
+                            source_order=int(item.source_order),
+                        )
+                        await _emit_tts_status("queue_full")
+                    else:
+                        await _send_json(
+                            {
+                                "type": "tts_job",
+                                "job_id": private_job.job_id,
+                                "sentence_id": private_job.sentence_id,
+                                "revision": int(private_job.revision),
+                                "source_order": int(private_job.source_order),
+                                "target_language": private_job.target_language,
+                                "is_stable": True,
+                            }
+                        )
+
+                if broadcast_job is None and private_job is None:
                     continue
-                await _send_json(
-                    {
-                        "type": "tts_job",
-                        "job_id": job.job_id,
-                        "sentence_id": job.sentence_id,
-                        "revision": int(job.revision),
-                        "source_order": int(job.source_order),
-                        "target_language": job.target_language,
-                        "is_stable": True,
-                    }
-                )
                 tts_runtime.session_issued_job_count += 1
                 _trace_event(
                     "tts_job_issued",
-                    sentence_id=job.sentence_id,
-                    revision=int(job.revision),
-                    source_order=int(job.source_order),
-                    target_language=job.target_language,
-                    translated_chars=len(job.text),
-                    translated_hash8=_hash8(job.text),
+                    sentence_id=str(item.sentence_id),
+                    revision=int(item.revision),
+                    source_order=int(item.source_order),
+                    target_language=str(item.target_language),
+                    translated_chars=len(str(item.text)),
+                    translated_hash8=_hash8(str(item.text)),
+                    broadcast=bool(broadcast_job is not None),
+                    private=bool(private_job is not None),
                 )
 
         async def _mark_tts_translation_ready(
@@ -6131,7 +5934,7 @@ def _create_app(
         ) -> None:
             def _transition() -> List[Any]:
                 registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
-                if not tts_runtime.enabled or registered is None:
+                if not _tts_output_active() or registered is None:
                     return []
                 _, registered_generation = registered
                 if int(registered_generation) != int(tts_runtime.generation):
@@ -6152,7 +5955,7 @@ def _create_app(
         async def _mark_tts_translation_failed(sentence_id: str, revision: int) -> None:
             def _transition() -> List[Any]:
                 registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
-                if not tts_runtime.enabled or registered is None:
+                if not _tts_output_active() or registered is None:
                     return []
                 _, registered_generation = registered
                 if int(registered_generation) != int(tts_runtime.generation):
@@ -6198,11 +6001,12 @@ def _create_app(
                 translation_runtime.task = None
                 dropped = await _clear_translation_queue()
                 translation_runtime.latest_by_sentence.clear()
-                if changed and tts_runtime.enabled:
-                    app.state.tts_jobs.cancel_client(
-                        str(tts_runtime.owner_key),
-                        str(tts_runtime.client_id),
-                    )
+                if changed and _tts_output_active():
+                    if tts_runtime.enabled:
+                        app.state.tts_jobs.cancel_client(
+                            str(tts_runtime.owner_key),
+                            str(tts_runtime.client_id),
+                        )
                     _reset_tts_ordering()
 
             _trace_event(
@@ -9208,7 +9012,7 @@ def _create_app(
                         reason=str(finish_reason or finish_mode or "stop"),
                     )
                 if finish_mode == "stop" and final_redecode_on_stop:
-                    if tts_runtime.enabled:
+                    if _tts_output_active():
                         await _drain_tts_translation_task("before_final_redecode")
                     async with tts_transition_lock:
                         issued_tts_jobs = int(tts_runtime.session_issued_job_count)
@@ -9437,7 +9241,7 @@ def _create_app(
                     committed_chars=len(str(payload.get("committed_text", "") or "").strip()),
                     committed_count=int(len(subtitle_state.committed_sentences)),
                 )
-            if tts_runtime.enabled:
+            if _tts_output_active():
                 await _drain_tts_translation_task("before_final")
             else:
                 translation_task = translation_runtime.task
@@ -9462,6 +9266,7 @@ def _create_app(
             finished = True
             stats.final_msgs += 1
             await _send_json(payload)
+            _set_tts_producer_active(False)
 
         try:
             if use_vllm_streaming:
@@ -9705,6 +9510,7 @@ def _create_app(
                                 emit=False,
                                 force_reset=True,
                             )
+                            _set_tts_producer_active(True)
                             subtitle_state.stream_uid = f"{int(time.time() * 1000)}-{int(time.monotonic_ns() % 1000000)}"
                             subtitle_state.next_sentence_id = 1
                             subtitle_state.committed_sentences = []
@@ -9851,6 +9657,7 @@ def _create_app(
             except Exception:
                 pass
         finally:
+            _set_tts_producer_active(False)
             stop_consumer.set()
             if consumer_task is not None and not consumer_task.done():
                 consumer_task.cancel()
@@ -10197,6 +10004,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4096,
         help="Maximum unread TTS jobs retained for one browser client",
+    )
+    p.add_argument(
+        "--tts-listener-queue-size",
+        type=_positive_int_arg,
+        default=128,
+        help="Maximum unread TTS metadata events buffered per listener device",
     )
     p.add_argument(
         "--tts-final-translation-drain-sec",

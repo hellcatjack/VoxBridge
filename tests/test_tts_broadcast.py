@@ -87,6 +87,25 @@ def test_publish_without_listener_retains_nothing():
     assert hub.job_count == 0
 
 
+def test_producer_status_is_broadcast_to_current_listeners_only():
+    hub = create_hub()
+    first = hub.register("owner-a")
+
+    hub.set_producer_active(True)
+
+    assert hub.producer_active is True
+    assert first.queue.get_nowait() == {"type": "producer_status", "active": True}
+    late = hub.register("owner-b")
+    with pytest.raises(asyncio.QueueEmpty):
+        late.queue.get_nowait()
+
+    hub.set_producer_active(False)
+
+    expected = {"type": "producer_status", "active": False}
+    assert first.queue.get_nowait() == expected
+    assert late.queue.get_nowait() == expected
+
+
 def test_acknowledgement_is_per_listener_and_last_ack_deletes_job():
     hub = create_hub()
     first = hub.register("owner-a")

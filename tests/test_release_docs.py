@@ -88,10 +88,18 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "Kokoro-82M" in readme
     assert "CPU-only" in readme
     assert "FIFO" in readme
-    assert "默认关闭" in readme
-    assert "系统声音" in readme
+    assert "/listen" in readme
+    assert "仅接收连接后" in readme
+    assert "多个设备" in readme
+    assert "主字幕页不播放" in readme
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
 
+    assert "GET /listen" in api
+    assert "WS /ws/tts" in api
+    assert "POST /api/tts/broadcast/jobs/{job_id}/audio" in api
+    assert '"type": "tts_received"' in api
+    assert "future-only" in api
+    assert "deprecated" in api
     assert "POST /api/tts/jobs/{job_id}/audio" in api
     assert "DELETE /api/tts/jobs/{job_id}" in api
     assert "DELETE /api/tts/clients/{client_id}/jobs" in api
@@ -101,5 +109,8 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "--enable-tts" in deployment
     assert "--tts-en-model-path" in deployment
     assert "--tts-zh-model-path" in deployment
+    assert "--tts-listener-queue-size" in deployment
     assert "CPUExecutionProvider" in deployment
+    assert "/listen" in deployment
     assert "Kokoro" in changelog
+    assert "multi-listener" in changelog

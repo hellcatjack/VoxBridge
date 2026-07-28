@@ -77,6 +77,7 @@ class TTSBroadcastHub:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(24))
         self._listeners: dict[str, TTSListenerSubscription] = {}
         self._jobs: dict[str, _BroadcastJobState] = {}
+        self._producer_active = False
         self._lock = threading.RLock()
 
     @staticmethod
@@ -129,6 +130,11 @@ class TTSBroadcastHub:
             return len(self._listeners)
 
     @property
+    def producer_active(self) -> bool:
+        with self._lock:
+            return self._producer_active
+
+    @property
     def job_count(self) -> int:
         with self._lock:
             self._prune_locked(self._clock())
@@ -153,6 +159,27 @@ class TTSBroadcastHub:
         owner = self._require_text(owner_key, "owner_key")
         with self._lock:
             return self._unregister_locked(listener, owner)
+
+    def set_producer_active(self, active: bool) -> bool:
+        normalized = bool(active)
+        with self._lock:
+            if normalized == self._producer_active:
+                return False
+            self._producer_active = normalized
+            event: dict[str, object] = {
+                "type": "producer_status",
+                "active": normalized,
+            }
+            overflowed: list[TTSListenerSubscription] = []
+            for subscription in list(self._listeners.values()):
+                try:
+                    subscription.queue.put_nowait(dict(event))
+                except asyncio.QueueFull:
+                    subscription.overflowed.set()
+                    overflowed.append(subscription)
+            for subscription in overflowed:
+                self._unregister_locked(subscription.listener_id, subscription.owner_key)
+            return True
 
     def publish(self, item: TTSReadyItem) -> BroadcastTTSJob | None:
         sentence_id = self._require_text(item.sentence_id, "sentence_id")

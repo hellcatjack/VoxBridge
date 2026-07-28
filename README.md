@@ -12,7 +12,7 @@ VoxBridge 是一个面向会议、新闻和演讲场景的实时语音识别与�
 - 支持页面输入会话级专业术语 Context，也支持后端加载有界、分时段的 context schedule。
 - 最近 100 条字幕可滚动查询；默认跟随最新内容，用户手动滚动时暂停自动跟随。
 - 支持上下字幕字体调整、移动端布局、控制栏自动隐藏和返回最新字幕按钮。
-- 可选使用 CPU-only Kokoro-82M 按稳定译文顺序实时朗读，浏览器严格 FIFO 播放且不会覆盖正在朗读的内容。
+- 可选使用 CPU-only Kokoro-82M，在独立 `/listen` 页面向多个设备广播稳定译文并各自严格 FIFO 朗读。
 - 可选单用户登录、Secure Cookie、结构化字幕 trace 和文本池诊断日志。
 
 ## 工作流程
@@ -26,8 +26,10 @@ Browser PCM audio
   -> sentence_id + revision
   -> OpenAI-compatible translation API
   -> bilingual subtitle rows
-  -> stable translation TTS job
-  -> browser FIFO audio playback
+  -> stable translation broadcast job
+  -> /ws/tts listener snapshot
+  -> shared Kokoro WAV synthesis
+  -> independent device FIFO playback
 ```
 
 浏览器只负责持续发送 PCM 音频和渲染后端事件。生成中的 `partial` 可以变化；已固化句子通过 `sentence_committed` 创建，通过 `sentence_updated` 更新同一个 `sentence_id`。翻译结果绑定具体 `revision`，过期结果不会覆盖新文本。
@@ -112,7 +114,9 @@ ss -lntp | rg ':8024'
 
 ## 译文朗读（Kokoro-82M）
 
-译文朗读默认关闭，必须同时启用翻译和 `--enable-tts`，再由用户在页面勾选“朗读译文”。后端只为 `is_stable: true` 的完整译文创建任务；多个翻译 worker 即使乱序完成，也会按源句顺序发出任务。浏览器一次只合成、解码并播放一条，上一条结束后才读取下一条。
+译文朗读必须同时启用翻译和 `--enable-tts`。主字幕页不播放音频，只提供独立 `/listen` 页面入口；手机、平板或其他电脑通过同一 HTTPS 地址登录后打开 `/listen`，点击该设备自己的 Start 即可监听。多个设备可以同时连接，彼此的 Start、Stop、下载和播放进度互不干扰。
+
+监听连接是 future-only：仅接收连接后产生的稳定译文，不回放连接前的历史任务。后端只为 `is_stable: true` 的完整译文创建广播任务；多个翻译 worker 即使乱序完成，也会按源句顺序发布。每条译文只合成一次共享 WAV，每个设备都按严格 FIFO 下载完整音频、确认接收、等待播放结束，再处理下一条。慢设备只增加自己的待播延迟；队列溢出时只断开该监听者。
 
 模型资产不进入 Git。部署时在 `models/kokoro/` 放置：
 
@@ -121,7 +125,7 @@ ss -lntp | rg ':8024'
 
 模型来源应使用 [kokoro-onnx 官方 release](https://github.com/thewh1teagle/kokoro-onnx/releases) 和 [Kokoro-82M-v1.1-zh 官方模型页](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)。完整启动参数见 [部署指南](docs/DEPLOYMENT.md)。
 
-Stop 会先等待尚未完成的稳定译文并发出朗读任务，但不会等待音频合成或播放；已经进入浏览器 FIFO 的译文会继续读完。取消勾选会立即停止当前朗读并清空待播任务。使用“系统声音”输入时，扬声器输出可能被共享音频再次采集，页面会提示“系统声音可能回采朗读”；建议使用耳机。
+主字幕页 Stop 会先等待尚未完成的稳定译文并发布朗读任务，但不会等待音频合成或设备播放。监听页 Stop 只停止当前设备并清空它的本地待播队列，不影响其他设备；重新 Start 后仍只接收后续译文。公开部署必须启用登录认证，避免未授权设备接入译文广播。使用系统音频输入时，建议让朗读设备与采集设备分离或使用耳机，避免回采。
 
 ## 公网认证
 

@@ -12,6 +12,10 @@ All notable public changes to VoxBridge are documented here.
   sentences, with backend source-order jobs and strict browser FIFO playback.
 - Added authenticated in-memory TTS audio jobs, acknowledgement/cancellation,
   TTL cleanup, and default-off browser controls.
+- Added an authenticated, future-only, multi-listener `/listen` broadcast page
+  with per-device FIFO playback and one shared Kokoro synthesis per translation.
+- Decoupled translated-speech playback from the main subtitle page; listener
+  Start and Stop now affect only that device.
 
 ## [0.2.0] - 2026-07-23
 
