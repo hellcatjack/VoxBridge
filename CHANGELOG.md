@@ -16,6 +16,8 @@ All notable public changes to VoxBridge are documented here.
   with per-device FIFO playback and one shared Kokoro synthesis per translation.
 - Decoupled translated-speech playback from the main subtitle page; listener
   Start and Stop now affect only that device.
+- Disabled raw Uvicorn access logging so opaque TTS job identifiers are not
+  persisted in request paths; broadcast diagnostics use short hashes instead.
 
 ## [0.2.0] - 2026-07-23
 

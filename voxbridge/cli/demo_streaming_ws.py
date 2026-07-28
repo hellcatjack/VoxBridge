@@ -92,6 +92,10 @@ def _positive_int_arg(value: str) -> int:
     return parsed
 
 
+def _opaque_identifier_hash8(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:8]
+
+
 def _b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -4728,7 +4732,7 @@ def _create_app(
 
         owner_key = _websocket_tts_owner_key(websocket)
         subscription = app.state.tts_broadcast.register(owner_key)
-        listener_hash = hashlib.sha256(subscription.listener_id.encode("utf-8")).hexdigest()[:8]
+        listener_hash = _opaque_identifier_hash8(subscription.listener_id)
         logger.info(
             "tts listener connected listener_hash=%s listeners=%d producer_active=%s",
             listener_hash,
@@ -4782,7 +4786,7 @@ def _create_app(
                     logger.info(
                         "tts listener received listener_hash=%s job_hash=%s accepted=%s retained_jobs=%d",
                         listener_hash,
-                        hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:8],
+                        _opaque_identifier_hash8(job_id),
                         acknowledged,
                         app.state.tts_broadcast.job_count,
                     )
@@ -5871,7 +5875,7 @@ def _create_app(
                     if broadcast_job is not None:
                         logger.info(
                             "tts broadcast published job_hash=%s source_order=%d listeners=%d retained_jobs=%d",
-                            _hash8(broadcast_job.job_id),
+                            _opaque_identifier_hash8(broadcast_job.job_id),
                             int(broadcast_job.source_order),
                             app.state.tts_broadcast.listener_count,
                             app.state.tts_broadcast.job_count,
@@ -10248,6 +10252,17 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _uvicorn_run_options(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "host": args.host,
+        "port": args.port,
+        "log_level": args.log_level,
+        "ssl_certfile": args.ssl_certfile,
+        "ssl_keyfile": args.ssl_keyfile,
+        "access_log": False,
+    }
+
+
 def main() -> None:
     from qwen_asr import Qwen3ASRModel
     import torch
@@ -10348,14 +10363,7 @@ def main() -> None:
             tts_synthesizer=tts_synthesizer,
         )
 
-        uvicorn.run(
-            app,
-            host=args.host,
-            port=args.port,
-            log_level=args.log_level,
-            ssl_certfile=args.ssl_certfile,
-            ssl_keyfile=args.ssl_keyfile,
-        )
+        uvicorn.run(app, **_uvicorn_run_options(args))
     finally:
         _release_instance_lock(_INSTANCE_LOCK_HANDLE)
         _INSTANCE_LOCK_HANDLE = None

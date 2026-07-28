@@ -210,6 +210,11 @@ Review logs without publishing subtitle content:
 journalctl --user -u voxbridge-8024.service --since '-10 min' --no-pager
 ```
 
+VoxBridge disables Uvicorn's raw HTTP access log because TTS audio paths contain
+opaque job identifiers. Application TTS logs retain only short SHA-256
+fingerprints and queue counts; do not replace this with a proxy access log that
+records unredacted `/api/tts/` paths.
+
 ## 7. Upgrade and rollback
 
 Before an upgrade, stop active browser sessions cleanly. Then:

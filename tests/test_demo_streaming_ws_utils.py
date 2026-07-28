@@ -1030,6 +1030,32 @@ def test_parse_args_accepts_kokoro_tts_options(monkeypatch):
     assert args.tts_final_translation_drain_sec == 12.0
 
 
+def test_opaque_identifier_hash_is_stable_and_never_echoes_identifier():
+    identifier = "raw-listener-or-job-token"
+
+    first = demo_streaming_ws._opaque_identifier_hash8(identifier)
+    second = demo_streaming_ws._opaque_identifier_hash8(identifier)
+
+    assert first == second
+    assert len(first) == 8
+    assert identifier not in first
+
+
+def test_uvicorn_options_disable_access_log_to_protect_tts_job_ids():
+    args = SimpleNamespace(
+        host="127.0.0.1",
+        port=8024,
+        log_level="info",
+        ssl_certfile=None,
+        ssl_keyfile=None,
+    )
+
+    options = demo_streaming_ws._uvicorn_run_options(args)
+
+    assert options["access_log"] is False
+    assert options["port"] == 8024
+
+
 def test_build_tts_synthesizer_is_optional_and_maps_cli_config(monkeypatch):
     disabled = SimpleNamespace(enable_tts=False)
     assert demo_streaming_ws._build_tts_synthesizer(disabled, translator=object()) is None
