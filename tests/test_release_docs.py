@@ -66,3 +66,14 @@ def test_install_docs_use_uv_with_the_project_venv():
         text = path.read_text(encoding="utf-8")
         assert ".venv/bin/python -m pip" not in text, path
         assert "uv pip install --python .venv/bin/python -e ." in text, path
+
+
+def test_public_docs_describe_esv_zh_en_translation_policy():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    api = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "ESV" in readme
+    assert "ESV" in api
+    assert "ESV" in changelog
+    assert "不补全" in readme

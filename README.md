@@ -85,6 +85,8 @@ ss -lntp | rg ':8024'
 --translation-api-model <model-name>
 ```
 
+中文→英文翻译会强制采用 ESV 的基督教、圣经与神学专业英文用语。该策略只规范术语和可确认的经文措辞，不补全、扩写或用模型记忆改写演讲者原文。
+
 如果兼容 API 需要鉴权，再通过运行时参数提供 `--translation-api-key`；不要把真实 Token 写入仓库、systemd unit 或 shell 历史。
 
 页面中的“专业术语 Context”只接受少量人名、地名或专业术语：

@@ -2,6 +2,13 @@
 
 All notable public changes to VoxBridge are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Applied a shared, anti-hallucination ESV terminology policy to both
+  Chinese-to-English translation backends.
+
 ## [0.2.0] - 2026-07-23
 
 ### Added

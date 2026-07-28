@@ -414,6 +414,15 @@ Important behavior updates:
 - Backend trace logging can write structured subtitle and text-pool rows to a
   JSONL file through `--subtitle-trace-log-file`.
 
+### ESV terminology policy for Chinese-to-English
+
+Chinese-to-English requests instruct both translation backends to use standard
+English Standard Version (ESV) conventions for Christian, biblical, and
+theological terminology. The policy may prefer ESV wording for a clearly
+identifiable quotation, but it must not complete fragments, add omitted text, or
+replace the supplied source with a memorized verse. Other translation directions
+retain the general fidelity-only prompt.
+
 ### Bounded ASR Context Schedule
 
 `--asr-context-schedule <path>` optionally supplies a short, time-windowed
