@@ -41,6 +41,7 @@ from voxbridge.cli.demo_streaming_ws import (
     _hash_auth_password,
     _trim_leading_boundary_overlap,
     _verify_auth_password,
+    _vllm_model_kwargs,
     parse_args,
 )
 
@@ -748,6 +749,43 @@ def test_parse_args_accepts_force_language_and_max_new_tokens(monkeypatch):
     args = parse_args()
     assert args.force_language == "English"
     assert args.max_new_tokens == 48
+
+
+def test_parse_args_uses_bounded_vllm_mm_processor_cache_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    assert parse_args().mm_processor_cache_gb == 0.5
+
+
+def test_parse_args_accepts_vllm_mm_processor_cache_override(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--mm-processor-cache-gb", "0.25"],
+    )
+
+    assert parse_args().mm_processor_cache_gb == 0.25
+
+
+def test_parse_args_rejects_negative_vllm_mm_processor_cache(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--mm-processor-cache-gb", "-0.1"],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_vllm_model_kwargs_include_bounded_processor_cache():
+    args = SimpleNamespace(
+        gpu_memory_utilization=0.08,
+        max_model_len=8192,
+        max_num_batched_tokens=8192,
+        max_new_tokens=32,
+        mm_processor_cache_gb=0.5,
+    )
+
+    assert _vllm_model_kwargs(args)["mm_processor_cache_gb"] == 0.5
 
 
 def test_parse_args_uses_safe_asr_context_defaults(monkeypatch):

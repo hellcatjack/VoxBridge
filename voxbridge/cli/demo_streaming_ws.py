@@ -99,6 +99,17 @@ def _non_negative_float_arg(value: str) -> float:
     return parsed
 
 
+def _vllm_model_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "gpu_memory_utilization": float(args.gpu_memory_utilization),
+        "max_model_len": int(args.max_model_len),
+        "max_num_batched_tokens": int(args.max_num_batched_tokens),
+        "enforce_eager": True,
+        "max_new_tokens": int(args.max_new_tokens),
+        "mm_processor_cache_gb": float(args.mm_processor_cache_gb),
+    }
+
+
 def _opaque_identifier_hash8(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:8]
 
@@ -9940,6 +9951,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
     p.add_argument("--port", type=int, default=8024, help="Bind port")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory utilization")
+    p.add_argument(
+        "--mm-processor-cache-gb",
+        type=_non_negative_float_arg,
+        default=0.5,
+        help="vLLM multimodal processor cache budget per process in GiB",
+    )
     p.add_argument("--max-model-len", type=int, default=8192, help="vLLM max_model_len")
     p.add_argument("--max-new-tokens", type=int, default=32, help="vLLM max_new_tokens")
     p.add_argument(
@@ -10465,11 +10482,7 @@ def main() -> None:
         if args.backend == "vllm":
             asr = Qwen3ASRModel.LLM(
                 model=args.asr_model_path,
-                gpu_memory_utilization=args.gpu_memory_utilization,
-                max_model_len=args.max_model_len,
-                max_num_batched_tokens=args.max_num_batched_tokens,
-                enforce_eager=True,
-                max_new_tokens=args.max_new_tokens,
+                **_vllm_model_kwargs(args),
             )
         else:
             asr = Qwen3ASRModel.from_pretrained(
