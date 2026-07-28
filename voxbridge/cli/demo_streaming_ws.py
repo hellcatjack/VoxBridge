@@ -213,7 +213,7 @@ def _looks_like_asr_context_echo(context: str, text: str, previous_text: str = "
         return False
     context_compact = _compact_asr_compare_text(context)
     text_compact = _compact_asr_compare_text(text)
-    if len(context_compact) < 12 or not text_compact:
+    if len(context_compact) < 6 or not text_compact:
         return False
     length_ratio = len(text_compact) / float(len(context_compact))
     if length_ratio < 0.8 or length_ratio > 1.25:

@@ -109,6 +109,10 @@ def test_context_echo_guard_rejects_glossary_copy_but_not_natural_speech():
     context = "流便 扫罗 迦南女子 暗兰 约基别 亚伦 摩西 近亲婚姻"
 
     assert _looks_like_asr_context_echo(context, context + "。") is True
+    assert _looks_like_asr_context_echo(
+        "南区 服侍 属灵 尼希米",
+        "南区 服侍 属灵 尼希米。",
+    ) is True
     assert _looks_like_asr_context_echo(context, "流便和扫罗都出现在这一段家谱中。") is False
     assert _looks_like_asr_context_echo("出埃及记", "出埃及记。") is False
     assert _looks_like_asr_context_echo(

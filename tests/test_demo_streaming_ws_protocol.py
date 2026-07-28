@@ -1222,7 +1222,7 @@ def test_ws_selects_context_by_consumed_audio_time_after_hard_cut(tmp_path):
 
 
 def test_ws_filters_streaming_context_glossary_echo_before_partial_output(tmp_path):
-    context_terms = ["Reuben", "Saul", "Canaanite", "Amram", "Jochebed", "Aaron", "Moses"]
+    context_terms = ["南区", "服侍", "属灵", "尼希米"]
     context = " ".join(context_terms)
 
     class ContextEchoASR(_FakeASR):
