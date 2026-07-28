@@ -21,6 +21,7 @@ import asyncio
 import base64
 import difflib
 import fcntl
+import html
 import hashlib
 import hmac
 import inspect
@@ -54,7 +55,12 @@ from voxbridge.streaming.context_schedule import (
 )
 from voxbridge.streaming.segment_policy import SegmentPolicy
 from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overlap
+from voxbridge.tts.broadcast import (
+    TTSBroadcastHub,
+    TTSBroadcastNotFound,
+)
 from voxbridge.tts.jobs import OrderedTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
+from voxbridge.tts.listener_page import TTS_LISTENER_HTML
 from voxbridge.tts.kokoro_onnx import (
     KokoroOnnxSynthesizer,
     KokoroTTSConfig,
@@ -4657,6 +4663,7 @@ LOGIN_HTML_TEMPLATE = r"""<!doctype html>
     <p>请输入访问凭据后继续使用语音识别与翻译。</p>
     __MESSAGE__
     <form method="post" action="/login" autocomplete="on">
+      __NEXT_FIELD__
       <label for="username">用户名</label>
       <input id="username" name="username" type="text" autocomplete="username" required autofocus />
       <label for="password">密码</label>
@@ -4716,6 +4723,12 @@ def _create_app(
         ttl_sec=max(1.0, float(getattr(args, "tts_job_ttl_sec", 1800.0))),
         max_client_jobs=max(1, int(getattr(args, "tts_max_client_jobs", 4096))),
     )
+    app.state.tts_broadcast = TTSBroadcastHub(
+        ttl_sec=max(1.0, float(getattr(args, "tts_job_ttl_sec", 1800.0))),
+        max_jobs=max(1, int(getattr(args, "tts_max_client_jobs", 4096))),
+        listener_queue_size=max(1, int(getattr(args, "tts_listener_queue_size", 128))),
+    )
+    app.state.tts_producer_active = False
     app.state.tts_synthesizer = tts_synthesizer
     runtime = SimpleNamespace(active_connections=0)
     translator_accepts_direction = False
@@ -4738,9 +4751,32 @@ def _create_app(
     )
     auth_sessions: Dict[str, float] = {}
 
-    def _render_login_html(error: bool = False) -> str:
+    def _safe_login_next(value: Any) -> str:
+        target = str(value or "").strip()
+        if (
+            not target.startswith("/")
+            or target.startswith("//")
+            or "\\" in target
+            or any(ord(char) < 32 for char in target)
+        ):
+            return "/"
+        parsed = urllib.parse.urlsplit(target)
+        if parsed.scheme or parsed.netloc:
+            return "/"
+        return target
+
+    def _render_login_html(error: bool = False, next_target: str = "/") -> str:
         message = '<div class="error">用户名或密码错误。</div>' if error else ""
-        return LOGIN_HTML_TEMPLATE.replace("__MESSAGE__", message)
+        safe_target = _safe_login_next(next_target)
+        next_field = (
+            '<input type="hidden" name="next" value="'
+            + html.escape(safe_target, quote=True)
+            + '" />'
+        )
+        return LOGIN_HTML_TEMPLATE.replace("__MESSAGE__", message).replace(
+            "__NEXT_FIELD__",
+            next_field,
+        )
 
     def _prune_auth_sessions(now: Optional[float] = None) -> None:
         current = time.time() if now is None else float(now)
@@ -4777,13 +4813,18 @@ def _create_app(
     def _websocket_is_authenticated(websocket: WebSocket) -> bool:
         return _is_valid_auth_session(websocket.cookies.get(AUTH_COOKIE_NAME))
 
-    def _request_tts_owner_key(request: Request) -> str:
-        token = request.cookies.get(AUTH_COOKIE_NAME)
+    def _tts_owner_key_for_token(token: Optional[str]) -> str:
         if not _is_valid_auth_session(token):
             raise HTTPException(status_code=401, detail="unauthorized")
         if not auth.enabled:
             return "anonymous"
         return hashlib.sha256(f"auth:{token}".encode("utf-8")).hexdigest()
+
+    def _request_tts_owner_key(request: Request) -> str:
+        return _tts_owner_key_for_token(request.cookies.get(AUTH_COOKIE_NAME))
+
+    def _websocket_tts_owner_key(websocket: WebSocket) -> str:
+        return _tts_owner_key_for_token(websocket.cookies.get(AUTH_COOKIE_NAME))
 
     def _validated_tts_client_id(client_id: str) -> str:
         value = str(client_id or "")
@@ -4895,11 +4936,12 @@ def _create_app(
 
     @app.get("/login")
     async def login_page(request: Request):
+        next_target = _safe_login_next(request.query_params.get("next"))
         if not auth.enabled:
-            return RedirectResponse("/", status_code=303)
+            return RedirectResponse(next_target, status_code=303)
         if _request_is_authenticated(request):
-            return RedirectResponse("/", status_code=303)
-        return HTMLResponse(_render_login_html())
+            return RedirectResponse(next_target, status_code=303)
+        return HTMLResponse(_render_login_html(next_target=next_target))
 
     @app.post("/login")
     async def login_submit(request: Request):
@@ -4909,11 +4951,15 @@ def _create_app(
         form = urllib.parse.parse_qs(body, keep_blank_values=True)
         username = str((form.get("username") or [""])[0] or "")
         password = str((form.get("password") or [""])[0] or "")
+        next_target = _safe_login_next((form.get("next") or [""])[0])
         username_ok = hmac.compare_digest(username, str(auth.username))
         password_ok = _verify_auth_password(password, str(auth.password_hash))
         if not (username_ok and password_ok):
-            return HTMLResponse(_render_login_html(error=True), status_code=401)
-        response = RedirectResponse("/", status_code=303)
+            return HTMLResponse(
+                _render_login_html(error=True, next_target=next_target),
+                status_code=401,
+            )
+        response = RedirectResponse(next_target, status_code=303)
         _set_auth_cookie(response, _new_auth_session())
         return response
 
@@ -4936,6 +4982,126 @@ def _create_app(
         html = html.replace("__ASR_CONTEXT_MAX_TERMS__", str(asr_context_max_terms))
         html = html.replace("__ASR_CONTEXT_MAX_CHARS__", str(asr_context_max_chars))
         return HTMLResponse(html)
+
+    @app.get("/listen")
+    async def tts_listener_page(request: Request):
+        if not _request_is_authenticated(request):
+            login_target = "/login?" + urllib.parse.urlencode({"next": "/listen"})
+            return RedirectResponse(login_target, status_code=303)
+        return HTMLResponse(TTS_LISTENER_HTML)
+
+    @app.websocket("/ws/tts")
+    async def ws_tts_listener(websocket: WebSocket) -> None:
+        if not _websocket_is_authenticated(websocket):
+            await websocket.accept()
+            await websocket.send_json({"type": "error", "message": "unauthorized"})
+            await websocket.close(code=1008)
+            return
+
+        owner_key = _websocket_tts_owner_key(websocket)
+        subscription = app.state.tts_broadcast.register(owner_key)
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "tts_listener_ready",
+                "listener_id": subscription.listener_id,
+                "tts_available": bool(app.state.tts_synthesizer is not None),
+                "producer_active": bool(app.state.tts_producer_active),
+            }
+        )
+
+        async def _send_listener_events() -> None:
+            while True:
+                if subscription.overflowed.is_set():
+                    await websocket.send_json(
+                        {"type": "error", "message": "listener queue overloaded"}
+                    )
+                    await websocket.close(code=1013)
+                    return
+                try:
+                    event = await asyncio.wait_for(subscription.queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                await websocket.send_json(event)
+
+        sender = asyncio.create_task(_send_listener_events())
+        try:
+            while True:
+                payload = _parse_json_message(await websocket.receive_text())
+                message_type = str(payload.get("type", "") or "")
+                if message_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    continue
+                if message_type == "tts_received":
+                    acknowledged = app.state.tts_broadcast.acknowledge(
+                        str(payload.get("job_id", "") or ""),
+                        subscription.listener_id,
+                        owner_key,
+                    )
+                    if not acknowledged:
+                        await websocket.send_json(
+                            {"type": "error", "message": "TTS job not found"}
+                        )
+                    continue
+                await websocket.send_json(
+                    {"type": "error", "message": "unsupported listener message"}
+                )
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            sender.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await sender
+            app.state.tts_broadcast.unregister(subscription.listener_id, owner_key)
+
+    @app.post("/api/tts/broadcast/jobs/{job_id}/audio")
+    async def tts_broadcast_audio(job_id: str, request: Request) -> Response:
+        owner_key = _request_tts_owner_key(request)
+        listener_id = str(request.headers.get("X-TTS-Listener-ID", "") or "")
+        try:
+            job = app.state.tts_broadcast.claim_audio(job_id, listener_id, owner_key)
+        except TTSBroadcastNotFound as exc:
+            raise HTTPException(status_code=404, detail="TTS job not found") from exc
+
+        try:
+            if app.state.tts_synthesizer is None:
+                raise HTTPException(status_code=503, detail="TTS is unavailable")
+            async with tts_synthesis_lock:
+                try:
+                    job = app.state.tts_broadcast.claimed_job(job_id)
+                except TTSBroadcastNotFound as exc:
+                    raise HTTPException(status_code=404, detail="TTS job not found") from exc
+                if job.audio_bytes is None:
+                    try:
+                        audio = await asyncio.to_thread(
+                            app.state.tts_synthesizer.synthesize,
+                            job.text,
+                            job.target_language,
+                        )
+                        job = app.state.tts_broadcast.cache_audio(
+                            job.job_id,
+                            audio.wav_bytes,
+                            sample_rate=audio.sample_rate,
+                            duration_ms=audio.duration_ms,
+                        )
+                    except TTSBroadcastNotFound as exc:
+                        raise HTTPException(status_code=404, detail="TTS job not found") from exc
+                    except Exception as exc:
+                        logger.warning("Broadcast TTS synthesis failed: %s", type(exc).__name__)
+                        raise HTTPException(status_code=503, detail="TTS synthesis failed") from exc
+
+            headers = {
+                "Cache-Control": "no-store",
+                "X-TTS-Sample-Rate": str(job.sample_rate or ""),
+                "X-TTS-Duration-Ms": str(job.duration_ms or 0),
+            }
+            return Response(
+                content=job.audio_bytes or b"",
+                media_type="audio/wav",
+                headers=headers,
+            )
+        finally:
+            app.state.tts_broadcast.release_audio(job_id)
 
     @app.post("/api/tts/jobs/{job_id}/audio")
     async def tts_audio(job_id: str, request: Request) -> Response:

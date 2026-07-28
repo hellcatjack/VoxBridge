@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import _create_app, _hash_auth_password
+from voxbridge.tts.jobs import TTSReadyItem
 from voxbridge.tts.kokoro_onnx import SynthesizedAudio
 
 
@@ -226,6 +227,155 @@ def test_auth_login_sets_cookie_allows_access_and_logout_blocks_again():
     assert logout.status_code in {302, 303, 307}
     assert logout.headers["location"] == "/login"
     assert client.get("/", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_listener_page_requires_auth_and_login_returns_to_listener():
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    app = _create_app(args, _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
+    client = TestClient(app)
+
+    redirect = client.get("/listen", follow_redirects=False)
+    assert redirect.status_code in {302, 303, 307}
+    assert redirect.headers["location"] == "/login?next=%2Flisten"
+    login_page = client.get(redirect.headers["location"])
+    assert login_page.status_code == 200
+    assert 'name="next" value="/listen"' in login_page.text
+
+    login = client.post(
+        "/login",
+        data={"username": "admin", "password": "secret", "next": "/listen"},
+        follow_redirects=False,
+    )
+    assert login.status_code in {302, 303, 307}
+    assert login.headers["location"] == "/listen"
+    page = client.get("/listen")
+    assert page.status_code == 200
+    assert "译文实时朗读" in page.text
+
+
+@pytest.mark.parametrize(
+    "unsafe_next",
+    ["https://attacker.example/listen", "//attacker.example/listen", "/\\attacker"],
+)
+def test_login_rejects_external_next_redirect(unsafe_next):
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    client = TestClient(_create_app(args, _FakeASR()))
+
+    login = client.post(
+        "/login",
+        data={"username": "admin", "password": "secret", "next": unsafe_next},
+        follow_redirects=False,
+    )
+
+    assert login.status_code in {302, 303, 307}
+    assert login.headers["location"] == "/"
+
+
+def test_tts_listener_websocket_authentication_and_ready_state():
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    app = _create_app(args, _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
+
+    unauthenticated = TestClient(app)
+    with unauthenticated.websocket_connect("/ws/tts") as ws:
+        error = ws.receive_json()
+        assert error == {"type": "error", "message": "unauthorized"}
+
+    authenticated = TestClient(app)
+    _login_tts_owner(authenticated)
+    with authenticated.websocket_connect("/ws/tts") as ws:
+        ready = ws.receive_json()
+        assert ready["type"] == "tts_listener_ready"
+        assert ready["listener_id"]
+        assert ready["tts_available"] is True
+        assert ready["producer_active"] is False
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+
+def test_listener_websocket_does_not_consume_asr_connection_quota():
+    args = _args()
+    args.max_connections = 1
+    app = _create_app(args, _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as asr_ws:
+        assert asr_ws.receive_json()["type"] == "ready"
+        with client.websocket_connect("/ws/tts") as listener_ws:
+            assert listener_ws.receive_json()["type"] == "tts_listener_ready"
+
+
+def test_broadcast_audio_is_shared_across_authenticated_listeners():
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    synth = _FakeTTSSynthesizer()
+    app = _create_app(args, _FakeASR(), tts_synthesizer=synth)
+    first_client = TestClient(app)
+    second_client = TestClient(app)
+    foreign_client = TestClient(app)
+    first_owner = _login_tts_owner(first_client)
+    second_owner = _login_tts_owner(second_client)
+    _login_tts_owner(foreign_client)
+    first = app.state.tts_broadcast.register(first_owner)
+    second = app.state.tts_broadcast.register(second_owner)
+    job = app.state.tts_broadcast.publish(
+        TTSReadyItem("s1", 1, 0, "English", "Stable translation.")
+    )
+    endpoint = f"/api/tts/broadcast/jobs/{job.job_id}/audio"
+
+    first_audio = first_client.post(
+        endpoint,
+        headers={"X-TTS-Listener-ID": first.listener_id},
+    )
+    second_audio = second_client.post(
+        endpoint,
+        headers={"X-TTS-Listener-ID": second.listener_id},
+    )
+    foreign_audio = foreign_client.post(
+        endpoint,
+        headers={"X-TTS-Listener-ID": first.listener_id},
+    )
+
+    assert first_audio.status_code == 200
+    assert first_audio.content == b"RIFF-fake-wav"
+    assert first_audio.headers["cache-control"] == "no-store"
+    assert first_audio.headers["x-tts-sample-rate"] == "24000"
+    assert first_audio.headers["x-tts-duration-ms"] == "750"
+    assert second_audio.content == first_audio.content
+    assert synth.calls == [("Stable translation.", "English")]
+    assert foreign_audio.status_code == 404
+
+    assert app.state.tts_broadcast.acknowledge(job.job_id, first.listener_id, first_owner)
+    assert app.state.tts_broadcast.job_count == 1
+    assert app.state.tts_broadcast.acknowledge(job.job_id, second.listener_id, second_owner)
+    assert app.state.tts_broadcast.job_count == 0
+
+
+def test_broadcast_audio_requires_listener_header_and_available_synthesizer():
+    app = _create_app(_args(), _FakeASR())
+    client = TestClient(app)
+    listener = app.state.tts_broadcast.register("anonymous")
+    job = app.state.tts_broadcast.publish(
+        TTSReadyItem("s1", 1, 0, "English", "Stable translation.")
+    )
+    endpoint = f"/api/tts/broadcast/jobs/{job.job_id}/audio"
+
+    assert client.post(endpoint).status_code == 404
+    unavailable = client.post(
+        endpoint,
+        headers={"X-TTS-Listener-ID": listener.listener_id},
+    )
+    assert unavailable.status_code == 503
 
 
 def test_tts_audio_is_authenticated_cached_and_acknowledged():

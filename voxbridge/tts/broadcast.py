@@ -241,6 +241,14 @@ class TTSBroadcastHub:
                 state.in_flight -= 1
             self._cleanup_job_locked(state.job.job_id)
 
+    def claimed_job(self, job_id: str) -> BroadcastTTSJob:
+        """Return the latest snapshot while at least one audio lease is active."""
+        with self._lock:
+            state = self._jobs.get(str(job_id or ""))
+            if state is None or state.in_flight <= 0:
+                raise TTSBroadcastNotFound("TTS broadcast job not found")
+            return state.job
+
     def cache_audio(
         self,
         job_id: str,
