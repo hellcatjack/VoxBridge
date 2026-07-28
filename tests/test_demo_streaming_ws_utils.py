@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.tts.jobs import OrderedTTSBuffer
+from voxbridge.tts.listener_page import TTS_LISTENER_HTML
 from voxbridge.cli.demo_streaming_ws import (
     INDEX_HTML_TEMPLATE,
     OpenAIAPITranslator,
@@ -1755,6 +1756,28 @@ def test_index_template_tts_stop_preserves_queue_but_disable_clears_it():
 def test_index_template_warns_about_system_audio_tts_feedback_without_forcing_disable():
     assert "系统声音可能回采朗读" in INDEX_HTML_TEMPLATE
     assert "ttsEnabledInput.checked = false" not in INDEX_HTML_TEMPLATE
+
+
+def test_listener_page_requires_explicit_start_and_uses_fifo():
+    assert 'id="startListening"' in TTS_LISTENER_HTML
+    assert 'id="stopListening"' in TTS_LISTENER_HTML
+    assert 'new WebSocket(wsUrl("/ws/tts"))' in TTS_LISTENER_HTML
+    assert "queue.push(job);" in TTS_LISTENER_HTML
+    assert "currentJob = queue.shift();" in TTS_LISTENER_HTML
+    assert 'type: "tts_received"' in TTS_LISTENER_HTML
+    assert 'addEventListener("ended"' in TTS_LISTENER_HTML
+
+
+def test_listener_page_fetches_only_the_fifo_head_and_stops_locally():
+    assert "if (currentJob || queue.length === 0)" in TTS_LISTENER_HTML
+    assert "X-TTS-Listener-ID" in TTS_LISTENER_HTML
+    assert "for (let attempt = 0; attempt < 2; attempt += 1)" in TTS_LISTENER_HTML
+    assert "await response.arrayBuffer();" in TTS_LISTENER_HTML
+    assert "abortController.abort();" in TTS_LISTENER_HTML
+    assert "sourceNode.stop();" in TTS_LISTENER_HTML
+    assert "queue = [];" in TTS_LISTENER_HTML
+    assert "set_tts_enabled" not in TTS_LISTENER_HTML
+    assert "window.location.reload" not in TTS_LISTENER_HTML
 
 
 def test_port_precheck_rejects_occupied_port():
