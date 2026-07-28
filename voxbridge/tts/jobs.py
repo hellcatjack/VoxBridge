@@ -72,6 +72,7 @@ class TTSWaitState:
     required_quiet_ms: int
     remaining_ms: int
     blocked_by_earlier: bool
+    waiting_for_latest_grace: bool
 
 
 @dataclass(slots=True)
@@ -93,17 +94,23 @@ class RevisionStableTTSBuffer:
         self,
         *,
         stable_sec: float,
+        latest_revision_grace_sec: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if stable_sec < 0:
             raise ValueError("stable_sec must not be negative")
+        if latest_revision_grace_sec < 0:
+            raise ValueError("latest_revision_grace_sec must not be negative")
         self._stable_sec = float(stable_sec)
+        self._latest_revision_grace_sec = float(latest_revision_grace_sec)
         self._clock = clock
         self._entries: dict[int, _RevisionStableEntry] = {}
         self._sentence_orders: dict[str, int] = {}
         self._order_sentences: dict[int, str] = {}
         self._released: dict[str, tuple[int, int, float]] = {}
         self._next_order = 0
+        self._highest_source_order = -1
+        self._sealed_through = -1
         self._lock = threading.RLock()
 
     @staticmethod
@@ -180,6 +187,10 @@ class RevisionStableTTSBuffer:
                     int(source_order),
                     float(now),
                 )
+                self._highest_source_order = max(
+                    self._highest_source_order,
+                    int(source_order),
+                )
                 return TTSRevisionRegistration(
                     accepted=True,
                     reset=False,
@@ -209,6 +220,15 @@ class RevisionStableTTSBuffer:
                 previous_quiet_age_ms=previous_quiet_age_ms,
                 previous_ready=previous_ready,
             )
+
+    def seal_through(self, source_order: int) -> bool:
+        if source_order < 0:
+            raise ValueError("source_order must not be negative")
+        with self._lock:
+            next_value = max(self._sealed_through, int(source_order))
+            changed = next_value != self._sealed_through
+            self._sealed_through = next_value
+            return changed
 
     def mark_ready(
         self,
@@ -264,6 +284,23 @@ class RevisionStableTTSBuffer:
             return None
         return entry
 
+    def _release_policy(
+        self,
+        entry: _RevisionStableEntry,
+    ) -> tuple[float, str, bool]:
+        if entry.source_order <= self._sealed_through:
+            return 0.0, "source_sealed", False
+        if (
+            entry.source_order == self._highest_source_order
+            and self._latest_revision_grace_sec > 0
+        ):
+            return (
+                self._stable_sec + self._latest_revision_grace_sec,
+                "latest_revision_grace",
+                True,
+            )
+        return self._stable_sec, "quiet_window", False
+
     def wait_state(self, sentence_id: str) -> TTSWaitState | None:
         sid = self._require_sentence_id(sentence_id)
         now = self._clock()
@@ -273,7 +310,8 @@ class RevisionStableTTSBuffer:
             if entry is None or entry.status != "ready":
                 return None
             quiet_age_ms = self._elapsed_ms(entry.changed_at, now)
-            required_ms = int(round(self._stable_sec * 1000.0))
+            required_sec, _, waiting_for_latest_grace = self._release_policy(entry)
+            required_ms = int(round(required_sec * 1000.0))
             return TTSWaitState(
                 sentence_id=sid,
                 revision=int(entry.revision),
@@ -282,6 +320,7 @@ class RevisionStableTTSBuffer:
                 required_quiet_ms=required_ms,
                 remaining_ms=max(0, required_ms - quiet_age_ms),
                 blocked_by_earlier=entry.source_order != self._next_order,
+                waiting_for_latest_grace=waiting_for_latest_grace,
             )
 
     def next_deadline(self) -> float | None:
@@ -289,7 +328,8 @@ class RevisionStableTTSBuffer:
             entry = self._entries.get(self._next_order)
             if entry is None or entry.status != "ready":
                 return None
-            return float(entry.changed_at + self._stable_sec)
+            required_sec, _, _ = self._release_policy(entry)
+            return float(entry.changed_at + required_sec)
 
     def drain(self, *, force: bool = False) -> list[TTSReadyItem]:
         now = self._clock()
@@ -303,7 +343,8 @@ class RevisionStableTTSBuffer:
                     del self._entries[self._next_order]
                     self._next_order += 1
                     continue
-                if not force and now < entry.changed_at + self._stable_sec:
+                required_sec, release_reason, _ = self._release_policy(entry)
+                if not force and now < entry.changed_at + required_sec:
                     break
                 del self._entries[self._next_order]
                 self._next_order += 1
@@ -319,7 +360,7 @@ class RevisionStableTTSBuffer:
                         source_order=int(entry.source_order),
                         target_language=str(entry.target_language or ""),
                         text=str(entry.text or ""),
-                        release_reason="final_force" if force else "quiet_window",
+                        release_reason="final_force" if force else release_reason,
                         source_quiet_age_ms=self._elapsed_ms(entry.changed_at, now),
                         translation_ready_age_ms=self._elapsed_ms(
                             entry.translation_ready_at
@@ -343,6 +384,8 @@ class RevisionStableTTSBuffer:
             self._order_sentences.clear()
             self._released.clear()
             self._next_order = 0
+            self._highest_source_order = -1
+            self._sealed_through = -1
 
 
 class TTSJobRegistry:

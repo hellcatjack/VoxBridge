@@ -142,6 +142,117 @@ def test_revision_update_discards_old_translation_and_restarts_window():
     assert [item.text for item in buffer.drain()] == ["new"]
 
 
+def test_newest_source_uses_additional_revision_grace():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "first", "English")
+
+    clock.advance(3.0)
+    assert buffer.drain() == []
+    assert buffer.next_deadline() == pytest.approx(107.0)
+    wait = buffer.wait_state("s1")
+    assert wait is not None
+    assert wait.required_quiet_ms == 7000
+    assert wait.remaining_ms == 4000
+    assert wait.waiting_for_latest_grace is True
+
+    clock.advance(4.0)
+    ready = buffer.drain()
+
+    assert [item.text for item in ready] == ["first"]
+    assert ready[0].release_reason == "latest_revision_grace"
+
+
+def test_successor_removes_latest_grace_from_preceding_source():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "first", "English")
+
+    clock.advance(3.0)
+    buffer.register("s2", 1, 1)
+    ready = buffer.drain()
+
+    assert [item.text for item in ready] == ["first"]
+    assert ready[0].release_reason == "quiet_window"
+
+
+def test_sealed_newest_source_releases_without_arbitrary_timer():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "final", "English")
+
+    assert buffer.seal_through(0) is True
+    ready = buffer.drain()
+
+    assert [item.text for item in ready] == ["final"]
+    assert ready[0].release_reason == "source_sealed"
+
+
+def test_translation_ready_after_seal_releases_current_revision():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+
+    buffer.seal_through(0)
+    assert buffer.drain() == []
+    buffer.mark_ready("s1", 1, "final", "English")
+
+    assert [item.release_reason for item in buffer.drain()] == ["source_sealed"]
+
+
+def test_latest_source_revision_restarts_full_grace_window():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "old", "English")
+    clock.advance(6.5)
+
+    update = buffer.register("s1", 2, 0)
+    buffer.mark_ready("s1", 2, "new", "English")
+    clock.advance(6.5)
+
+    assert update.reset is True
+    assert buffer.drain() == []
+    clock.advance(0.5)
+    assert [item.text for item in buffer.drain()] == ["new"]
+
+
+def test_stability_buffer_validates_grace_and_seals_monotonically():
+    with pytest.raises(ValueError, match="latest_revision_grace_sec"):
+        RevisionStableTTSBuffer(stable_sec=3.0, latest_revision_grace_sec=-0.1)
+
+    buffer = RevisionStableTTSBuffer(stable_sec=3.0, latest_revision_grace_sec=4.0)
+    with pytest.raises(ValueError, match="source_order"):
+        buffer.seal_through(-1)
+    assert buffer.seal_through(2) is True
+    assert buffer.seal_through(1) is False
+    assert buffer.seal_through(2) is False
+    assert buffer.seal_through(3) is True
+
+
 def test_translation_finishing_after_source_deadline_releases_immediately():
     clock = FakeClock(100.0)
     buffer = RevisionStableTTSBuffer(stable_sec=3.0, clock=clock)
