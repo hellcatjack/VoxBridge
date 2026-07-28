@@ -131,6 +131,7 @@ to the same `ExecStart` command:
 --tts-zh-vocab-path models/kokoro/config-v1.1-zh.json
 --tts-cpu-threads 4
 --tts-listener-queue-size 128
+--tts-revision-stable-sec 3.0
 ```
 
 Translation endpoints and model names are deployment-specific. Keep API keys outside the unit file.
@@ -149,6 +150,12 @@ registry is bounded by `--tts-max-client-jobs` and jobs expire after
 does not discard pending stable translations. When capturing system audio, use a
 separate listener device or headphones to avoid feeding synthesized speech back
 into ASR.
+
+`--tts-revision-stable-sec` delays spoken publication from the latest source
+sentence revision while leaving visible subtitles responsive. The recommended
+production value is `3.0`. Tune it only from observed
+`tts_late_revision_after_release` timing; do not add punctuation,
+language-specific word lists, or frontend timers to infer speech stability.
 
 Load and start the service:
 

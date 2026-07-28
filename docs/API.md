@@ -522,6 +522,31 @@ not a hard timeout. The backend does not wait for CPU synthesis or browser
 playback. Listener FIFOs therefore continue independently after the producer
 becomes inactive.
 
+### Spoken Translation Revision Stability
+
+Visible `sentence_committed`, `sentence_updated`, and `sentence_translation`
+events remain immediate. Spoken translation has a separate backend gate:
+`--tts-revision-stable-sec 3.0` requires the current source revision to remain
+unchanged for 3.0 seconds before a TTS job is published. The timer starts at the
+latest source revision, not at translation completion. A translation that
+finishes after the source revision deadline can publish immediately.
+
+A higher revision inside the quiet window invalidates the older ready
+translation and restarts the source timer. Source order remains strict, so a
+later sentence cannot overtake an unresolved earlier sentence. Set the option
+to `0` only to disable the delay for controlled compatibility testing; revision
+and source-order validation remain active.
+
+Normal `finish` first reconciles final ASR text and drains current translation
+work, then bypasses only the remaining quiet-window duration for the latest
+ready revisions. An abrupt WebSocket disconnect does not force speech and
+discards pending TTS state.
+
+Structured diagnostics are `tts_stability_wait`, `tts_stability_reset`,
+`tts_stability_release`, and `tts_late_revision_after_release`. These events
+contain short fingerprints, revisions, timing, and queue counts, but no source
+text, translated text, raw sentence IDs, or raw TTS job IDs.
+
 ### Other Messages
 
 - `processing`: backend is running a longer blocking decode.

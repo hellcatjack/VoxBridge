@@ -4,6 +4,11 @@ All notable public changes to VoxBridge are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented Kokoro playback from speaking a translated sentence revision that
+  is superseded inside the backend revision-stability window.
+
 ### Added
 
 - Applied a shared, anti-hallucination ESV terminology policy to both

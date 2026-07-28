@@ -114,3 +114,15 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "/listen" in deployment
     assert "Kokoro" in changelog
     assert "multi-listener" in changelog
+
+
+def test_docs_publish_tts_revision_stability_contract():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    api = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    assert "--tts-revision-stable-sec" in api
+    assert "--tts-revision-stable-sec 3.0" in deployment
+    assert "source revision" in api.lower()
+    assert "字幕" in readme and "朗读" in readme
+    assert "3.0" in readme
