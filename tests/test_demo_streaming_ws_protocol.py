@@ -434,6 +434,47 @@ def test_ws_tts_jobs_follow_source_order_and_precede_final():
     )
 
 
+@pytest.mark.parametrize(
+    ("direction", "expected_target"),
+    (("zh2en", "English"), ("en2zh", "Chinese")),
+)
+def test_ws_tts_jobs_use_canonical_language_for_localized_translation_labels(
+    direction, expected_target
+):
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.translation_source_language = "中文"
+    args.translation_target_language = "英语"
+    args.tts_final_translation_drain_sec = 2.0
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "translation_direction": direction,
+                "tts_enabled": True,
+                "tts_client_id": "client-a-12345678",
+            }
+        )
+        _receive_until_type(ws, "started")
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    jobs = [event for event in events if event.get("type") == "tts_job"]
+    assert jobs
+    assert {event["target_language"] for event in jobs} == {expected_target}
+
+
 def test_ws_tts_canonical_stop_redecode_does_not_repeat_issued_sentences():
     args = _args()
     args.final_redecode_on_stop = True

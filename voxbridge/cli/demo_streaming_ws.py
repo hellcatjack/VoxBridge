@@ -5303,6 +5303,13 @@ def _create_app(
                 return en_label, zh_label
             return zh_label, en_label
 
+        def _canonical_tts_language(language: str) -> str:
+            if _is_chinese_label(language):
+                return "Chinese"
+            if _is_english_label(language):
+                return "English"
+            return str(language or "")
+
         initial_translation_direction = _normalize_translation_direction("zh2en")
         initial_translation_source, initial_translation_target = _resolve_direction_languages(initial_translation_direction)
         translation_runtime = SimpleNamespace(
@@ -5955,7 +5962,7 @@ def _create_app(
                 str(sentence_id),
                 int(revision),
                 str(translated),
-                str(target_language),
+                _canonical_tts_language(str(target_language)),
             )
             await _publish_tts_ready(ready)
 
