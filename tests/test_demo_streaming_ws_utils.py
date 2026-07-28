@@ -376,6 +376,41 @@ def test_hard_cut_fallback_merges_unfinished_cjk_tail():
     assert demo_streaming_ws._should_hard_cut_fallback_merge("第一句不完整", "继续补全成句。")
 
 
+@pytest.mark.parametrize(
+    ("source_language", "target_language"),
+    [
+        ("Chinese", "English"),
+        ("中文", "英文"),
+        ("zh", "en"),
+    ],
+)
+def test_translation_prompt_applies_esv_policy_to_zh_en_aliases(
+    source_language,
+    target_language,
+):
+    prompt = demo_streaming_ws._build_translation_prompt(
+        "这是需要翻译的讲道内容。",
+        source_language,
+        target_language,
+    )
+
+    assert "English Standard Version (ESV)" in prompt
+    assert "必须采用" in prompt
+    assert "不得补写、扩写" in prompt
+    assert "无法确定对应经文时" in prompt
+
+
+def test_translation_prompt_does_not_apply_esv_policy_to_en_zh():
+    prompt = demo_streaming_ws._build_translation_prompt(
+        "This is the source sentence.",
+        "English",
+        "中文",
+    )
+
+    assert "English Standard Version (ESV)" not in prompt
+    assert "不得补写、扩写" not in prompt
+
+
 def test_openai_api_translator_retries_when_generation_hits_token_limit(monkeypatch):
     calls = []
 

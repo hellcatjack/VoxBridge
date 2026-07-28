@@ -468,6 +468,35 @@ def _text_matches_source_language(text: str, source_language: str) -> bool:
     return True
 
 
+_ESV_ZH_TO_EN_POLICY = (
+    "涉及基督教、圣经或神学内容时，卷名、人名、地名、称谓、神学术语及大小写"
+    "必须采用 English Standard Version (ESV) 的标准英文用法；能明确识别为经文时，"
+    "措辞应尽量贴近 ESV，但不得补写、扩写、解释或用记忆中的经文替换原文；"
+    "无法确定对应经文时，必须忠实翻译当前中文文本，不得猜测。"
+)
+
+
+def _build_translation_prompt(
+    text: str,
+    source_language: str,
+    target_language: str,
+) -> str:
+    source = str(source_language or "Chinese")
+    target = str(target_language or "English")
+    requirements = [
+        "忠实原文，不增删",
+        "保留专有名词",
+        "只输出译文本身，不要解释",
+    ]
+    if _is_chinese_label(source) and _is_english_label(target):
+        requirements.append(_ESV_ZH_TO_EN_POLICY)
+    return (
+        f"请将以下{source}文本翻译为{target}。\n"
+        f"要求：{'；'.join(requirements)}。\n\n"
+        f"原文：\n{text}"
+    )
+
+
 def _split_sentences_and_tail(text: str) -> Tuple[List[str], str]:
     src = str(text or "").strip()
     if not src:
