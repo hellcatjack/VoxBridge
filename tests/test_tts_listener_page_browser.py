@@ -61,3 +61,49 @@ def test_rate_change_updates_persistent_media_element(listener_page):
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.preservesPitch"
     ) is True
+
+
+def test_listener_start_stop_preserves_rate_selection(listener_page):
+    listener_page.add_init_script(
+        """
+        HTMLMediaElement.prototype.play = function() { return Promise.resolve(); };
+        HTMLMediaElement.prototype.pause = function() {};
+        window.WebSocket = class FakeWebSocket extends EventTarget {
+          static OPEN = 1;
+          static CLOSING = 2;
+          constructor() {
+            super();
+            this.readyState = FakeWebSocket.OPEN;
+            window.setTimeout(() => {
+              this.dispatchEvent(new Event("open"));
+              this.dispatchEvent(new MessageEvent("message", {
+                data: JSON.stringify({
+                  type: "tts_listener_ready",
+                  listener_id: "test-listener",
+                  tts_available: true,
+                  producer_active: false,
+                }),
+              }));
+            }, 0);
+          }
+          send() {}
+          close() {
+            this.readyState = 3;
+            this.dispatchEvent(new Event("close"));
+          }
+        };
+        """
+    )
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.25")
+    listener_page.locator("#startListening").click()
+    listener_page.wait_for_function(
+        "document.querySelector('#connectionStatus').textContent === '已连接'"
+    )
+    listener_page.select_option("#playbackRate", "1.5")
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+    listener_page.locator("#stopListening").click()
+    assert listener_page.input_value("#playbackRate") == "1.5"
+    assert listener_page.text_content("#connectionStatus") == "已停止"
