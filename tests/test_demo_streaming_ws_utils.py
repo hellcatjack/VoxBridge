@@ -1444,7 +1444,11 @@ def test_index_template_has_translation_direction_selector_and_ws_control():
     assert 'id="translationDirectionLabel"' in INDEX_HTML_TEMPLATE
     assert 'value="zh2en"' in INDEX_HTML_TEMPLATE
     assert 'value="en2zh"' in INDEX_HTML_TEMPLATE
-    assert 'type="checkbox"' not in INDEX_HTML_TEMPLATE
+    direction_control = INDEX_HTML_TEMPLATE.split(
+        'for="translationDirectionSelect"', 1
+    )[1].split("</label>", 1)[0]
+    assert "<select" in direction_control
+    assert 'type="checkbox"' not in direction_control
     assert "function selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
     assert 'type: "set_translation_direction"' in INDEX_HTML_TEMPLATE
     assert "translation_direction: selectedTranslationDirection()" in INDEX_HTML_TEMPLATE
@@ -1552,6 +1556,51 @@ def test_index_template_supports_system_audio_capture_via_display_media():
     assert "selfBrowserSurface: \"exclude\"" in INDEX_HTML_TEMPLATE
     assert "if (!audioTracks || audioTracks.length === 0)" in INDEX_HTML_TEMPLATE
     assert "请选择整屏共享并勾选系统音频" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_has_optional_stable_translation_tts_control():
+    assert 'id="ttsEnabledInput"' in INDEX_HTML_TEMPLATE
+    assert 'id="ttsStatus"' in INDEX_HTML_TEMPLATE
+    tts_input = re.search(r'<input[^>]+id="ttsEnabledInput"[^>]*>', INDEX_HTML_TEMPLATE)
+    assert tts_input is not None
+    assert 'type="checkbox"' in tts_input.group(0)
+    assert "checked" not in tts_input.group(0)
+    assert "朗读译文" in INDEX_HTML_TEMPLATE
+    assert "tts_enabled: !!ttsEnabledInput.checked" in INDEX_HTML_TEMPLATE
+    assert "tts_client_id: ttsClientId" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_plays_tts_jobs_in_strict_fifo_without_text_splitting():
+    assert "let ttsQueue = [];" in INDEX_HTML_TEMPLATE
+    assert "ttsQueue.push(job);" in INDEX_HTML_TEMPLATE
+    assert "async function pumpTTSQueue()" in INDEX_HTML_TEMPLATE
+    assert "ttsCurrent = ttsQueue.shift();" in INDEX_HTML_TEMPLATE
+    assert 'addEventListener("ended"' in INDEX_HTML_TEMPLATE
+    assert "ttsQueue.pop(" not in INDEX_HTML_TEMPLATE
+    pump = INDEX_HTML_TEMPLATE.split("async function pumpTTSQueue()", 1)[1].split(
+        "async function cancelTTSPlayback", 1
+    )[0]
+    assert ".split(" not in pump
+    assert "message.is_stable !== true" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_tts_stop_preserves_queue_but_disable_clears_it():
+    stop_handler = INDEX_HTML_TEMPLATE.split("btnStop.onclick = async () => {", 1)[1].split(
+        'if (typeof window !== "undefined")', 1
+    )[0]
+    assert "await stopPipeline(false);" in stop_handler
+    assert "cancelTTSPlayback" not in stop_handler
+    assert "async function cancelTTSPlayback" in INDEX_HTML_TEMPLATE
+    assert "ttsQueue = [];" in INDEX_HTML_TEMPLATE
+    assert "ttsAbortController.abort();" in INDEX_HTML_TEMPLATE
+    assert "ttsSourceNode.stop();" in INDEX_HTML_TEMPLATE
+    assert 'type: "set_tts_enabled"' in INDEX_HTML_TEMPLATE
+    assert "await cancelTTSPlayback({ notifyBackend: true });" in INDEX_HTML_TEMPLATE
+
+
+def test_index_template_warns_about_system_audio_tts_feedback_without_forcing_disable():
+    assert "系统声音可能回采朗读" in INDEX_HTML_TEMPLATE
+    assert "ttsEnabledInput.checked = false" not in INDEX_HTML_TEMPLATE
 
 
 def test_port_precheck_rejects_occupied_port():

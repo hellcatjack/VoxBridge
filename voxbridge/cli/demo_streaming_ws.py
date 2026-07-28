@@ -1778,6 +1778,25 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       color:var(--muted);
     }
 
+    .tts-toggle{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border:1px solid var(--line);
+      border-radius: 10px;
+      background:var(--surface-soft);
+      padding: 7px 10px;
+      font-size: 12px;
+      color:var(--muted);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .tts-toggle input{
+      margin: 0;
+      accent-color: var(--accent);
+    }
+
     .source-toggle select{
       border:1px solid #bdcbb7;
       border-radius: 8px;
@@ -2070,6 +2089,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             <option value="en2zh">英文 -> 中文</option>
           </select>
         </label>
+        <label class="tts-toggle" for="ttsEnabledInput">
+          <input id="ttsEnabledInput" type="checkbox" />
+          <span>朗读译文</span>
+        </label>
+        <span id="ttsStatus" class="badge">朗读关闭</span>
         <label class="font-size-control" for="subtitleTopFontInput">
           <span>上方字号</span>
           <input id="subtitleTopFontInput" aria-label="上方字幕字号" type="number" min="18" max="72" step="1" inputmode="numeric" placeholder="自动" />
@@ -2145,6 +2169,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const subtitleTopFontInput = $("subtitleTopFontInput");
   const subtitleBottomFontInput = $("subtitleBottomFontInput");
   const asrContextInput = $("asrContextInput");
+  const ttsEnabledInput = $("ttsEnabledInput");
+  const ttsStatus = $("ttsStatus");
   const rawTextEl = $("rawText");
   const languageSelect = $("languageSelect");
   const toggleEchoCancellation = $("toggleEchoCancellation");
@@ -2192,6 +2218,16 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let inputSource = "mic";
   let translationDirection = "zh2en";
   let activeContextMetadata = null;
+  let ttsAvailable = false;
+  let ttsQueue = [];
+  let ttsCurrent = null;
+  let ttsAudioCtx = null;
+  let ttsAbortController = null;
+  let ttsSourceNode = null;
+  let ttsGeneration = 0;
+  let ttsPumpPromise = null;
+  const ttsSeenJobIds = new Set();
+  const ttsClientId = createTTSClientId();
   const autoScrollRaf = new WeakMap();
   const scrollFollowState = {
     zh: { follow: true, autoScrolling: false },
@@ -2199,6 +2235,203 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function createTTSClientId(){
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return `page-${window.crypto.randomUUID()}`;
+      }
+    } catch (err) {}
+    return `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+  }
+
+  function updateTTSStatus(message = "", cls = ""){
+    if (!ttsStatus) return;
+    const enabled = !!(ttsEnabledInput && ttsEnabledInput.checked);
+    const feedbackRisk = enabled && selectedInputSource() === "system";
+    let text = String(message || "");
+    let statusClass = String(cls || "");
+    if (!text) {
+      if (!enabled) {
+        text = "朗读关闭";
+      } else if (!ttsAvailable) {
+        text = "朗读等待服务";
+        statusClass = "warn";
+      } else if (ttsCurrent) {
+        text = `朗读中 · 待播 ${ttsQueue.length}`;
+        statusClass = "ok";
+      } else if (ttsQueue.length > 0) {
+        text = `待播 ${ttsQueue.length}`;
+        statusClass = "warn";
+      } else {
+        text = "朗读就绪";
+        statusClass = "ok";
+      }
+    }
+    if (feedbackRisk) {
+      text = `系统声音可能回采朗读 · ${text}`;
+      if (!statusClass) statusClass = "warn";
+    }
+    ttsStatus.textContent = text;
+    ttsStatus.className = "badge " + statusClass;
+  }
+
+  async function ensureTTSAudioContext(){
+    if (!ttsAudioCtx || ttsAudioCtx.state === "closed") {
+      ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (ttsAudioCtx.state === "suspended") {
+      await ttsAudioCtx.resume();
+    }
+    return ttsAudioCtx;
+  }
+
+  async function acknowledgeTTSJob(jobId){
+    try {
+      await fetch(`/api/tts/jobs/${encodeURIComponent(jobId)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+    } catch (err) {
+      traceSubtitle("tts_ack_failed", { jobId: String(jobId || "") });
+    }
+  }
+
+  async function fetchTTSAudio(job, signal){
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await fetch(
+          `/api/tts/jobs/${encodeURIComponent(job.job_id)}/audio`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            cache: "no-store",
+            signal,
+          }
+        );
+        if (!response.ok) throw new Error(`TTS audio request failed (${response.status})`);
+        return await response.arrayBuffer();
+      } catch (err) {
+        if (signal.aborted) throw err;
+        lastError = err;
+        if (attempt === 0) await sleep(250);
+      }
+    }
+    throw lastError || new Error("TTS audio request failed");
+  }
+
+  async function playTTSAudioBuffer(audioBuffer, generation){
+    if (generation !== ttsGeneration) return;
+    const ctx = await ensureTTSAudioContext();
+    if (generation !== ttsGeneration) return;
+    await new Promise((resolve) => {
+      const sourceNode = ctx.createBufferSource();
+      ttsSourceNode = sourceNode;
+      sourceNode.buffer = audioBuffer;
+      sourceNode.connect(ctx.destination);
+      sourceNode.addEventListener("ended", resolve, { once: true });
+      sourceNode.start();
+    });
+  }
+
+  async function pumpTTSQueue(){
+    if (ttsPumpPromise) return ttsPumpPromise;
+    ttsPumpPromise = (async () => {
+      while (ttsQueue.length > 0 && ttsEnabledInput && ttsEnabledInput.checked) {
+        ttsCurrent = ttsQueue.shift();
+        const job = ttsCurrent;
+        const generation = ttsGeneration;
+        ttsAbortController = new AbortController();
+        updateTTSStatus();
+        try {
+          const encoded = await fetchTTSAudio(job, ttsAbortController.signal);
+          if (generation !== ttsGeneration) continue;
+          const ctx = await ensureTTSAudioContext();
+          const audioBuffer = await ctx.decodeAudioData(encoded.slice(0));
+          await acknowledgeTTSJob(job.job_id);
+          if (generation !== ttsGeneration) continue;
+          await playTTSAudioBuffer(audioBuffer, generation);
+        } catch (err) {
+          if (generation === ttsGeneration && !(err && err.name === "AbortError")) {
+            traceSubtitle("tts_play_failed", {
+              jobId: String(job.job_id || ""),
+              error: String((err && err.message) || err || "unknown"),
+            });
+            await acknowledgeTTSJob(job.job_id);
+            updateTTSStatus("朗读失败，继续下一条", "err");
+          }
+        } finally {
+          if (ttsSourceNode) {
+            try { ttsSourceNode.disconnect(); } catch (err) {}
+          }
+          ttsSourceNode = null;
+          ttsAbortController = null;
+          if (ttsCurrent === job) ttsCurrent = null;
+          updateTTSStatus();
+        }
+      }
+    })().finally(() => {
+      ttsPumpPromise = null;
+      updateTTSStatus();
+      if (ttsQueue.length > 0 && ttsEnabledInput && ttsEnabledInput.checked) {
+        void pumpTTSQueue();
+      }
+    });
+    return ttsPumpPromise;
+  }
+
+  async function cancelTTSPlayback({ notifyBackend = true } = {}){
+    ttsGeneration += 1;
+    ttsQueue = [];
+    ttsSeenJobIds.clear();
+    if (ttsAbortController) {
+      try { ttsAbortController.abort(); } catch (err) {}
+    }
+    if (ttsSourceNode) {
+      try { ttsSourceNode.stop(); } catch (err) {}
+      try { ttsSourceNode.disconnect(); } catch (err) {}
+    }
+    ttsAbortController = null;
+    ttsSourceNode = null;
+    ttsCurrent = null;
+    if (notifyBackend) {
+      try {
+        await fetch(`/api/tts/clients/${encodeURIComponent(ttsClientId)}/jobs`, {
+          method: "DELETE",
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+      } catch (err) {
+        traceSubtitle("tts_cancel_failed", {});
+      }
+    }
+    updateTTSStatus();
+  }
+
+  function queueTTSJob(message){
+    if (!ttsEnabledInput || !ttsEnabledInput.checked) return;
+    if (!message || message.is_stable !== true) return;
+    const jobId = String(message.job_id || "").trim();
+    if (!jobId || ttsSeenJobIds.has(jobId)) return;
+    const job = {
+      job_id: jobId,
+      sentence_id: String(message.sentence_id || ""),
+      revision: Number(message.revision || 0),
+      source_order: Number(message.source_order || 0),
+      target_language: String(message.target_language || ""),
+    };
+    ttsSeenJobIds.add(jobId);
+    ttsQueue.push(job);
+    traceSubtitle("tts_job_queued", {
+      jobId,
+      sourceOrder: job.source_order,
+      queueDepth: ttsQueue.length,
+    });
+    updateTTSStatus();
+    void pumpTTSQueue();
+  }
 
   (() => {
     let enabled = !!SUBTITLE_TRACE_DEFAULT;
@@ -3485,6 +3718,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     if (msg.type === "ready") {
+      ttsAvailable = !!msg.tts_available;
       const localDirectionBeforeStart = selectedTranslationDirection();
       if (msg.translation_direction) {
         const serverDirection = normalizeTranslationDirection(msg.translation_direction);
@@ -3499,9 +3733,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         translationDirection: localDirectionBeforeStart,
       });
       setStatus("Connected / 已连接", "ok");
+      updateTTSStatus();
       return;
     }
     if (msg.type === "started") {
+      ttsAvailable = !!msg.tts_available;
       activeContextMetadata = {
         asr_context_active: !!msg.asr_context_active,
         asr_context_term_count: Number(msg.asr_context_term_count || 0),
@@ -3530,11 +3766,30 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       currentTranslationTail = "";
       renderTranscript();
       renderTranslation();
+      updateTTSStatus();
       return;
     }
     if (msg.type === "translation_direction") {
       const direction = applyTranslationDirection(msg.translation_direction);
       traceSubtitle("ws_translation_direction", { direction });
+      return;
+    }
+    if (msg.type === "tts_status") {
+      ttsAvailable = !!msg.tts_available;
+      const status = String(msg.status || "");
+      if (status === "unavailable") {
+        updateTTSStatus("朗读服务不可用", "err");
+      } else if (status === "queue_full") {
+        updateTTSStatus("朗读队列已满", "err");
+      } else if (status === "translation_drain_timeout") {
+        updateTTSStatus("部分译文尚未完成", "warn");
+      } else {
+        updateTTSStatus();
+      }
+      return;
+    }
+    if (msg.type === "tts_job") {
+      queueTTSJob(msg);
       return;
     }
     if (msg.type === "sentence_committed") {
@@ -3794,6 +4049,39 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     inputSourceSelect.addEventListener("change", () => {
       const next = selectedInputSource();
       applyInputSource(next);
+      updateTTSStatus();
+    });
+  }
+
+  if (ttsEnabledInput) {
+    ttsEnabledInput.addEventListener("change", async () => {
+      const enabled = !!ttsEnabledInput.checked;
+      if (!enabled) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "set_tts_enabled",
+            enabled: false,
+            tts_client_id: ttsClientId,
+          }));
+        }
+        await cancelTTSPlayback({ notifyBackend: true });
+        return;
+      }
+      try {
+        await ensureTTSAudioContext();
+      } catch (err) {
+        updateTTSStatus("浏览器无法播放朗读", "err");
+        return;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "set_tts_enabled",
+          enabled: true,
+          tts_client_id: ttsClientId,
+        }));
+      }
+      updateTTSStatus();
+      void pumpTTSQueue();
     });
   }
 
@@ -3886,6 +4174,9 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
     try {
       const sourceMode = selectedInputSource();
+      if (ttsEnabledInput && ttsEnabledInput.checked) {
+        await ensureTTSAudioContext();
+      }
       traceSubtitle("capture_source_starting", { source: sourceMode });
       if (sourceMode === "system") {
         setStatus("Share full screen + system audio / 请选择整屏共享并勾选系统音频", "warn");
@@ -3903,6 +4194,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           language: selectedAsrLanguage(),
           translation_direction: selectedTranslationDirection(),
           asr_context_terms: asrContextTerms,
+          tts_enabled: !!ttsEnabledInput.checked,
+          tts_client_id: ttsClientId,
         })
       );
       const started = await startedPromise;
@@ -4163,6 +4456,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             language,
             translation_direction: selectedTranslationDirection(),
             asr_context_terms: asrContextTerms,
+            tts_enabled: false,
+            tts_client_id: ttsClientId,
           })
         );
         const startOk = await _waitUntil(
