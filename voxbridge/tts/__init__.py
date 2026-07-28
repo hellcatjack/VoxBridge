@@ -1,5 +1,13 @@
 """Text-to-speech support for stable translated sentences."""
 
+from .broadcast import (
+    BroadcastTTSJob,
+    TTSBroadcastError,
+    TTSBroadcastHub,
+    TTSBroadcastNotFound,
+    TTSBroadcastQueueFull,
+    TTSListenerSubscription,
+)
 from .jobs import (
     OrderedTTSBuffer,
     TTSJob,
@@ -17,7 +25,13 @@ from .kokoro_onnx import (
 )
 
 __all__ = [
+    "BroadcastTTSJob",
     "OrderedTTSBuffer",
+    "TTSBroadcastError",
+    "TTSBroadcastHub",
+    "TTSBroadcastNotFound",
+    "TTSBroadcastQueueFull",
+    "TTSListenerSubscription",
     "TTSJob",
     "TTSJobNotFound",
     "TTSJobRegistry",
