@@ -344,7 +344,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let listenerId = "";
     let queue = [];
     let currentJob = null;
-    let abortController = null;
+    const audioPreparations = new Map();
     let activeObjectUrl = "";
     let cancelActivePlayback = null;
     let generation = 0;
@@ -439,6 +439,60 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       throw lastError || new Error("audio request failed");
     }
 
+    function jobIdOf(job) {
+      return String((job && job.job_id) || "");
+    }
+
+    function prepareAudio(job) {
+      const jobId = jobIdOf(job);
+      if (!jobId) throw new Error("TTS job ID is missing");
+      const existing = audioPreparations.get(jobId);
+      if (existing) return existing;
+
+      const controller = new AbortController();
+      const preparation = {
+        controller,
+        audioBytes: null,
+        error: null,
+        promise: null,
+      };
+      preparation.promise = fetchAudio(job, controller.signal)
+        .then((audioBytes) => {
+          preparation.audioBytes = audioBytes;
+          return preparation;
+        })
+        .catch((error) => {
+          preparation.error = error;
+          return preparation;
+        });
+      audioPreparations.set(jobId, preparation);
+      return preparation;
+    }
+
+    function prefetchNextAudio() {
+      if (!currentJob || queue.length === 0) return;
+      const nextJob = queue[0];
+      prepareAudio(nextJob);
+    }
+
+    async function consumePreparedAudio(job) {
+      const jobId = jobIdOf(job);
+      const preparation = prepareAudio(job);
+      await preparation.promise;
+      if (audioPreparations.get(jobId) === preparation) {
+        audioPreparations.delete(jobId);
+      }
+      if (preparation.error) throw preparation.error;
+      return preparation.audioBytes;
+    }
+
+    function cancelAudioPreparations() {
+      for (const preparation of audioPreparations.values()) {
+        preparation.controller.abort();
+      }
+      audioPreparations.clear();
+    }
+
     async function playAudioBuffer(buffer, localGeneration) {
       if (localGeneration !== generation) return;
       const audioBlob = new Blob([buffer], { type: "audio/wav" });
@@ -480,11 +534,12 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       const localGeneration = generation;
       currentJob = queue.shift();
       updateQueueStatus();
-      abortController = new AbortController();
       playbackStatus.textContent = `正在朗读 · ${currentJob.target_language || "译文"}`;
       nowPlaying.dataset.playing = "true";
       try {
-        const audioBytes = await fetchAudio(currentJob, abortController.signal);
+        const audioPromise = consumePreparedAudio(currentJob);
+        prefetchNextAudio();
+        const audioBytes = await audioPromise;
         await playAudioBuffer(audioBytes, localGeneration);
       } catch (error) {
         if (error && error.name !== "AbortError" && localGeneration === generation) {
@@ -492,7 +547,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         }
       } finally {
         if (localGeneration !== generation) return;
-        abortController = null;
         currentJob = null;
         nowPlaying.dataset.playing = "false";
         playbackStatus.textContent = queue.length > 0 ? "准备下一条" : "等待新译文";
@@ -510,10 +564,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function resetLocalPlayback() {
       generation += 1;
-      if (abortController) {
-        abortController.abort();
-        abortController = null;
-      }
+      cancelAudioPreparations();
       stopActivePlayback();
       queue = [];
       currentJob = null;
@@ -580,6 +631,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
           const job = message;
           queue.push(job);
           updateQueueStatus();
+          prefetchNextAudio();
           void pumpQueue();
           return;
         }
@@ -624,6 +676,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     });
     window.addEventListener("beforeunload", () => {
       if (socket) socket.close(1000, "page closed");
+      cancelAudioPreparations();
       stopActivePlayback();
     });
   })();

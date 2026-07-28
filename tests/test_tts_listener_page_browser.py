@@ -27,8 +27,133 @@ def listener_page():
                 body=TTS_LISTENER_HTML,
             ),
         )
+        page.set_default_timeout(3000)
         yield page
         browser.close()
+
+
+def _install_queue_harness(listener_page, *, deferred_fetch: bool = False):
+    listener_page.add_init_script(
+        f"""
+        HTMLMediaElement.prototype.play = function() {{ return Promise.resolve(); }};
+        HTMLMediaElement.prototype.pause = function() {{}};
+        HTMLMediaElement.prototype.load = function() {{}};
+        const nativeMediaAddEventListener = HTMLMediaElement.prototype.addEventListener;
+        const nativeMediaRemoveEventListener = HTMLMediaElement.prototype.removeEventListener;
+        const controlledEndedListeners = new Set();
+        const controlledErrorListeners = new Set();
+        HTMLMediaElement.prototype.addEventListener = function(type, listener, options) {{
+          if (this.id === "ttsPlayback" && type === "ended") {{
+            controlledEndedListeners.add(listener);
+            return;
+          }}
+          if (this.id === "ttsPlayback" && type === "error") {{
+            controlledErrorListeners.add(listener);
+            return;
+          }}
+          return nativeMediaAddEventListener.call(this, type, listener, options);
+        }};
+        HTMLMediaElement.prototype.removeEventListener = function(type, listener, options) {{
+          if (this.id === "ttsPlayback" && type === "ended") {{
+            controlledEndedListeners.delete(listener);
+            return;
+          }}
+          if (this.id === "ttsPlayback" && type === "error") {{
+            controlledErrorListeners.delete(listener);
+            return;
+          }}
+          return nativeMediaRemoveEventListener.call(this, type, listener, options);
+        }};
+        window.__finishTTSPlayback = function() {{
+          const event = new Event("ended");
+          for (const listener of Array.from(controlledEndedListeners)) {{
+            listener.call(document.querySelector("#ttsPlayback"), event);
+          }}
+        }};
+        window.__ttsFetchCalls = [];
+        window.__ttsSentMessages = [];
+        window.__ttsAbortCount = 0;
+        window.fetch = function(url, options = {{}}) {{
+          const parts = String(url).split("/");
+          const jobId = decodeURIComponent(parts[parts.length - 2]);
+          window.__ttsFetchCalls.push(jobId);
+          if ({str(deferred_fetch).lower()}) {{
+            return new Promise((resolve, reject) => {{
+              const signal = options.signal;
+              const abort = () => {{
+                window.__ttsAbortCount += 1;
+                reject(new DOMException("fetch aborted", "AbortError"));
+              }};
+              if (signal.aborted) abort();
+              else signal.addEventListener("abort", abort, {{ once: true }});
+            }});
+          }}
+          return Promise.resolve({{
+            ok: true,
+            status: 200,
+            arrayBuffer: () => Promise.resolve(new Uint8Array([82, 73, 70, 70]).buffer),
+          }});
+        }};
+        window.WebSocket = class FakeWebSocket extends EventTarget {{
+          static OPEN = 1;
+          static CLOSING = 2;
+          constructor() {{
+            super();
+            this.readyState = FakeWebSocket.OPEN;
+            window.__ttsSocket = this;
+            window.setTimeout(() => {{
+              this.dispatchEvent(new Event("open"));
+              this.dispatchEvent(new MessageEvent("message", {{
+                data: JSON.stringify({{
+                  type: "tts_listener_ready",
+                  listener_id: "test-listener",
+                  tts_available: true,
+                  producer_active: true,
+                }}),
+              }}));
+            }}, 0);
+          }}
+          emitJob(jobId, sourceOrder) {{
+            this.dispatchEvent(new MessageEvent("message", {{
+              data: JSON.stringify({{
+                type: "tts_job",
+                job_id: jobId,
+                revision: 1,
+                source_order: sourceOrder,
+                target_language: "English",
+                is_stable: true,
+              }}),
+            }}));
+          }}
+          send(payload) {{
+            window.__ttsSentMessages.push(JSON.parse(payload));
+          }}
+          close() {{
+            this.readyState = 3;
+            this.dispatchEvent(new Event("close"));
+          }}
+        }};
+        """
+    )
+
+
+def _start_queue_harness(listener_page):
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.locator("#startListening").click()
+    listener_page.wait_for_function(
+        "document.querySelector('#connectionStatus').textContent === '已连接'"
+    )
+
+
+def _emit_job(listener_page, job_id: str, source_order: int):
+    listener_page.evaluate(
+        "([jobId, sourceOrder]) => window.__ttsSocket.emitJob(jobId, sourceOrder)",
+        [job_id, source_order],
+    )
+
+
+def _fetch_job_ids(listener_page):
+    return listener_page.evaluate("window.__ttsFetchCalls.slice()")
 
 
 def test_listener_rate_selection_persists_after_reload(listener_page):
@@ -118,3 +243,35 @@ def test_listener_start_stop_preserves_rate_selection(listener_page):
     listener_page.locator("#stopListening").click()
     assert listener_page.input_value("#playbackRate") == "1.1"
     assert listener_page.text_content("#connectionStatus") == "已停止"
+
+
+def test_listener_prefetches_exactly_one_future_fifo_item(listener_page):
+    _install_queue_harness(listener_page)
+    _start_queue_harness(listener_page)
+    _emit_job(listener_page, "job-1", 0)
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 1")
+    assert _fetch_job_ids(listener_page) == ["job-1"]
+
+    _emit_job(listener_page, "job-2", 1)
+    _emit_job(listener_page, "job-3", 2)
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 2")
+    assert _fetch_job_ids(listener_page) == ["job-1", "job-2"]
+    listener_page.wait_for_timeout(100)
+    assert _fetch_job_ids(listener_page) == ["job-1", "job-2"]
+
+    listener_page.evaluate("window.__finishTTSPlayback()")
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 3")
+    assert _fetch_job_ids(listener_page) == ["job-1", "job-2", "job-3"]
+
+
+def test_listener_stop_aborts_current_and_prefetched_audio(listener_page):
+    _install_queue_harness(listener_page, deferred_fetch=True)
+    _start_queue_harness(listener_page)
+    _emit_job(listener_page, "job-1", 0)
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 1")
+    _emit_job(listener_page, "job-2", 1)
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 2")
+
+    listener_page.locator("#stopListening").click()
+    listener_page.wait_for_function("window.__ttsAbortCount === 2")
+    assert listener_page.evaluate("window.__ttsAbortCount") == 2

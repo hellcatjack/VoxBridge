@@ -1798,16 +1798,34 @@ def test_listener_page_requires_explicit_start_and_uses_fifo():
     assert 'addEventListener("ended"' in TTS_LISTENER_HTML
 
 
-def test_listener_page_fetches_only_the_fifo_head_and_stops_locally():
+def test_listener_page_fetches_fifo_audio_and_stops_locally():
     assert "if (currentJob || queue.length === 0)" in TTS_LISTENER_HTML
     assert "X-TTS-Listener-ID" in TTS_LISTENER_HTML
     assert "for (let attempt = 0; attempt < 2; attempt += 1)" in TTS_LISTENER_HTML
     assert "await response.arrayBuffer();" in TTS_LISTENER_HTML
-    assert "abortController.abort();" in TTS_LISTENER_HTML
+    assert "cancelAudioPreparations();" in TTS_LISTENER_HTML
     assert "stopActivePlayback();" in TTS_LISTENER_HTML
     assert "queue = [];" in TTS_LISTENER_HTML
     assert "set_tts_enabled" not in TTS_LISTENER_HTML
     assert "window.location.reload" not in TTS_LISTENER_HTML
+
+
+def test_listener_page_prefetches_only_one_future_fifo_item():
+    assert "const audioPreparations = new Map();" in TTS_LISTENER_HTML
+    assert "function prepareAudio(job)" in TTS_LISTENER_HTML
+    assert "function prefetchNextAudio()" in TTS_LISTENER_HTML
+    assert "const nextJob = queue[0];" in TTS_LISTENER_HTML
+    assert "prepareAudio(nextJob);" in TTS_LISTENER_HTML
+    assert "queue.slice" not in TTS_LISTENER_HTML
+
+
+def test_listener_page_reuses_prepared_audio_and_cancels_on_reset():
+    assert "async function consumePreparedAudio(job)" in TTS_LISTENER_HTML
+    assert "const preparation = prepareAudio(job);" in TTS_LISTENER_HTML
+    assert "audioPreparations.delete(jobId);" in TTS_LISTENER_HTML
+    assert "function cancelAudioPreparations()" in TTS_LISTENER_HTML
+    assert "preparation.controller.abort();" in TTS_LISTENER_HTML
+    assert TTS_LISTENER_HTML.count("cancelAudioPreparations();") >= 2
 
 
 def test_listener_page_exposes_allowlisted_per_device_playback_rates():
