@@ -24,6 +24,7 @@ import fcntl
 import hashlib
 import hmac
 import inspect
+import importlib.util
 import json
 import logging
 import os
@@ -54,7 +55,12 @@ from voxbridge.streaming.context_schedule import (
 from voxbridge.streaming.segment_policy import SegmentPolicy
 from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overlap
 from voxbridge.tts.jobs import OrderedTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
-from voxbridge.tts.kokoro_onnx import TTSSynthesisError
+from voxbridge.tts.kokoro_onnx import (
+    KokoroOnnxSynthesizer,
+    KokoroTTSConfig,
+    TTSConfigurationError,
+    TTSSynthesisError,
+)
 
 SAMPLE_RATE = 16000
 logger = logging.getLogger(__name__)
@@ -4696,7 +4702,7 @@ def _create_app(
     infer_lock = asyncio.Lock()
     tts_synthesis_lock = asyncio.Lock()
     app.state.tts_jobs = TTSJobRegistry(
-        ttl_sec=max(1.0, float(getattr(args, "tts_job_ttl_sec", 600.0))),
+        ttl_sec=max(1.0, float(getattr(args, "tts_job_ttl_sec", 1800.0))),
         max_client_jobs=max(1, int(getattr(args, "tts_max_client_jobs", 4096))),
     )
     app.state.tts_synthesizer = tts_synthesizer
@@ -9192,7 +9198,7 @@ def _create_app(
             translation_task = translation_runtime.task
             if translation_task is not None and not translation_task.done():
                 translation_drain_sec = (
-                    max(0.1, float(getattr(args, "tts_final_translation_drain_sec", 5.0)))
+                    max(0.1, float(getattr(args, "tts_final_translation_drain_sec", 30.0)))
                     if tts_runtime.enabled
                     else 1.2
                 )
@@ -9685,6 +9691,43 @@ def _create_app(
     return app
 
 
+def _build_tts_synthesizer(args: argparse.Namespace, *, translator: Any) -> Any:
+    if not bool(getattr(args, "enable_tts", False)):
+        return None
+    if translator is None:
+        logger.warning("TTS disabled because translation is not enabled")
+        return None
+
+    runtime_modules = ("onnxruntime", "kokoro_onnx", "misaki", "soundfile")
+    missing_modules = [name for name in runtime_modules if importlib.util.find_spec(name) is None]
+    if missing_modules:
+        logger.warning(
+            "TTS disabled because optional runtime modules are missing: %s",
+            ", ".join(missing_modules),
+        )
+        return None
+
+    try:
+        config = KokoroTTSConfig(
+            english_model_path=Path(str(args.tts_en_model_path)).expanduser(),
+            english_voices_path=Path(str(args.tts_en_voices_path)).expanduser(),
+            chinese_model_path=Path(str(args.tts_zh_model_path)).expanduser(),
+            chinese_voices_path=Path(str(args.tts_zh_voices_path)).expanduser(),
+            chinese_config_path=Path(str(args.tts_zh_vocab_path)).expanduser(),
+            english_voice=str(args.tts_en_voice),
+            chinese_voice=str(args.tts_zh_voice),
+            speed=float(args.tts_speed),
+            cpu_threads=int(args.tts_cpu_threads),
+            max_chars=int(args.tts_max_text_chars),
+        )
+        return KokoroOnnxSynthesizer(config=config)
+    except (TTSConfigurationError, ImportError) as exc:
+        logger.warning("TTS disabled because initialization failed: %s", exc)
+    except Exception as exc:
+        logger.warning("TTS disabled because initialization failed: %s", type(exc).__name__)
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VoxBridge Streaming Web Demo (HTTPS + WebSocket)")
     p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B", help="Model name or local path")
@@ -9865,6 +9908,69 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32,
         help="Do not early-commit English completed sentences shorter than this many characters unless they also meet the word threshold",
+    )
+    p.add_argument(
+        "--enable-tts",
+        action="store_true",
+        help="Enable optional CPU Kokoro speech for stable translated sentences",
+    )
+    p.add_argument(
+        "--tts-en-model-path",
+        default="/data/Qwen3-ASR/models/kokoro/kokoro-v1.0.onnx",
+        help="Kokoro v1.0 English ONNX model",
+    )
+    p.add_argument(
+        "--tts-en-voices-path",
+        default="/data/Qwen3-ASR/models/kokoro/voices-v1.0.bin",
+        help="Kokoro v1.0 English voices",
+    )
+    p.add_argument(
+        "--tts-zh-model-path",
+        default="/data/Qwen3-ASR/models/kokoro/kokoro-v1.1-zh.onnx",
+        help="Kokoro v1.1 Chinese ONNX model",
+    )
+    p.add_argument(
+        "--tts-zh-voices-path",
+        default="/data/Qwen3-ASR/models/kokoro/voices-v1.1-zh.bin",
+        help="Kokoro v1.1 Chinese voices",
+    )
+    p.add_argument(
+        "--tts-zh-vocab-path",
+        default="/data/Qwen3-ASR/models/kokoro/config-v1.1-zh.json",
+        help="Kokoro v1.1 Chinese vocabulary config",
+    )
+    p.add_argument("--tts-en-voice", default="af_heart", help="English Kokoro voice")
+    p.add_argument("--tts-zh-voice", default="zf_001", help="Chinese Kokoro voice")
+    p.add_argument("--tts-speed", type=float, default=1.05, help="Kokoro speaking speed")
+    p.add_argument(
+        "--tts-cpu-threads",
+        type=int,
+        default=4,
+        help="ONNX Runtime intra-op CPU threads for Kokoro",
+    )
+    p.add_argument(
+        "--tts-max-text-chars",
+        type=int,
+        default=1000,
+        help="Reject a single TTS job above this translated character count",
+    )
+    p.add_argument(
+        "--tts-job-ttl-sec",
+        type=float,
+        default=1800.0,
+        help="Maximum lifetime of an unacknowledged in-memory TTS job",
+    )
+    p.add_argument(
+        "--tts-max-client-jobs",
+        type=int,
+        default=4096,
+        help="Maximum unread TTS jobs retained for one browser client",
+    )
+    p.add_argument(
+        "--tts-final-translation-drain-sec",
+        type=float,
+        default=30.0,
+        help="Wait this long for stable translations before sending final",
     )
 
     p.add_argument("--client-chunk-ms", type=int, default=200, help="Client capture chunk length in milliseconds")
@@ -10181,7 +10287,21 @@ def main() -> None:
                 )
                 logger.info("local translator loaded.")
 
-        app = _create_app(args, asr, translator=translator)
+        tts_synthesizer = _build_tts_synthesizer(args, translator=translator)
+        if tts_synthesizer is not None:
+            logger.info(
+                "CPU Kokoro TTS enabled threads=%d voices=%s,%s",
+                int(args.tts_cpu_threads),
+                str(args.tts_en_voice),
+                str(args.tts_zh_voice),
+            )
+
+        app = _create_app(
+            args,
+            asr,
+            translator=translator,
+            tts_synthesizer=tts_synthesizer,
+        )
 
         uvicorn.run(
             app,

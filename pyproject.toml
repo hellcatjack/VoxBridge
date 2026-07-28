@@ -22,6 +22,11 @@ dependencies = [
 dev = [
   "pytest",
 ]
+tts = [
+  "kokoro-onnx==0.5.0",
+  "misaki[zh]==0.9.4",
+  "soundfile>=0.13.1",
+]
 
 [project.scripts]
 voxbridge-streaming-ws = "voxbridge.cli.demo_streaming_ws:main"

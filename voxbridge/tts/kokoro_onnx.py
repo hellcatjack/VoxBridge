@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import soundfile as sf
 
 
 class TTSConfigurationError(RuntimeError):
@@ -182,6 +181,8 @@ class KokoroOnnxSynthesizer:
         samples_array = np.asarray(samples, dtype=np.float32).reshape(-1)
         if samples_array.size == 0 or int(sample_rate) <= 0:
             raise TTSSynthesisError("Kokoro returned empty audio")
+        import soundfile as sf
+
         output = io.BytesIO()
         sf.write(output, np.clip(samples_array, -1.0, 1.0), int(sample_rate), format="WAV", subtype="PCM_16")
         duration_ms = round(samples_array.size * 1000 / int(sample_rate))

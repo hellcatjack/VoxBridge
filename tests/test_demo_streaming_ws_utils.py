@@ -7,6 +7,7 @@ import json
 import threading
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import (
@@ -904,6 +905,111 @@ def test_parse_args_accepts_early_translation_stability_controls(monkeypatch):
     assert args.early_translation_short_stable_hits == 5
     assert args.early_translation_min_english_words == 7
     assert args.early_translation_min_english_chars == 36
+
+
+def test_parse_args_uses_safe_tts_defaults(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    args = parse_args()
+
+    assert args.port == 8024
+    assert args.enable_tts is False
+    assert args.tts_en_voice == "af_heart"
+    assert args.tts_zh_voice == "zf_001"
+    assert args.tts_speed == 1.05
+    assert args.tts_cpu_threads == 4
+    assert args.tts_max_text_chars == 1000
+    assert args.tts_job_ttl_sec == 1800.0
+    assert args.tts_max_client_jobs == 4096
+    assert args.tts_final_translation_drain_sec == 30.0
+
+
+def test_parse_args_accepts_kokoro_tts_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--enable-tts",
+            "--tts-en-model-path",
+            "/models/en.onnx",
+            "--tts-en-voices-path",
+            "/models/en.bin",
+            "--tts-zh-model-path",
+            "/models/zh.onnx",
+            "--tts-zh-voices-path",
+            "/models/zh.bin",
+            "--tts-zh-vocab-path",
+            "/models/zh.json",
+            "--tts-en-voice",
+            "af_bella",
+            "--tts-zh-voice",
+            "zf_002",
+            "--tts-speed",
+            "1.1",
+            "--tts-cpu-threads",
+            "6",
+            "--tts-max-text-chars",
+            "800",
+            "--tts-job-ttl-sec",
+            "900",
+            "--tts-max-client-jobs",
+            "2048",
+            "--tts-final-translation-drain-sec",
+            "12",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.enable_tts is True
+    assert args.tts_en_model_path == "/models/en.onnx"
+    assert args.tts_en_voices_path == "/models/en.bin"
+    assert args.tts_zh_model_path == "/models/zh.onnx"
+    assert args.tts_zh_voices_path == "/models/zh.bin"
+    assert args.tts_zh_vocab_path == "/models/zh.json"
+    assert args.tts_en_voice == "af_bella"
+    assert args.tts_zh_voice == "zf_002"
+    assert args.tts_speed == 1.1
+    assert args.tts_cpu_threads == 6
+    assert args.tts_max_text_chars == 800
+    assert args.tts_job_ttl_sec == 900.0
+    assert args.tts_max_client_jobs == 2048
+    assert args.tts_final_translation_drain_sec == 12.0
+
+
+def test_build_tts_synthesizer_is_optional_and_maps_cli_config(monkeypatch):
+    disabled = SimpleNamespace(enable_tts=False)
+    assert demo_streaming_ws._build_tts_synthesizer(disabled, translator=object()) is None
+
+    args = SimpleNamespace(
+        enable_tts=True,
+        tts_en_model_path="/models/en.onnx",
+        tts_en_voices_path="/models/en.bin",
+        tts_zh_model_path="/models/zh.onnx",
+        tts_zh_voices_path="/models/zh.bin",
+        tts_zh_vocab_path="/models/zh.json",
+        tts_en_voice="af_bella",
+        tts_zh_voice="zf_002",
+        tts_speed=1.1,
+        tts_cpu_threads=6,
+        tts_max_text_chars=800,
+    )
+    captured = {}
+
+    class FakeSynthesizer:
+        def __init__(self, *, config):
+            captured["config"] = config
+
+    monkeypatch.setattr(demo_streaming_ws.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(demo_streaming_ws, "KokoroOnnxSynthesizer", FakeSynthesizer)
+
+    synth = demo_streaming_ws._build_tts_synthesizer(args, translator=object())
+
+    assert isinstance(synth, FakeSynthesizer)
+    assert captured["config"].english_model_path == Path("/models/en.onnx")
+    assert captured["config"].chinese_config_path == Path("/models/zh.json")
+    assert captured["config"].english_voice == "af_bella"
+    assert captured["config"].cpu_threads == 6
 
 
 def test_index_template_contains_core_stream_controls():
