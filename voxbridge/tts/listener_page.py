@@ -319,6 +319,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const playbackElement = document.getElementById("ttsPlayback");
     const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
     const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2]);
+    const INTER_SENTENCE_PAUSE_MS = 300;
     const SILENT_WAV_DATA_URL =
       "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
 
@@ -347,6 +348,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const audioPreparations = new Map();
     let activeObjectUrl = "";
     let cancelActivePlayback = null;
+    let cancelSentencePause = null;
     let generation = 0;
     let heartbeat = null;
     const seenJobIds = new Set();
@@ -493,6 +495,32 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       audioPreparations.clear();
     }
 
+    function cancelInterSentencePause() {
+      if (!cancelSentencePause) return;
+      const cancel = cancelSentencePause;
+      cancelSentencePause = null;
+      cancel();
+    }
+
+    async function waitForInterSentencePause() {
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = null;
+        const settle = (error) => {
+          if (settled) return;
+          settled = true;
+          if (timer !== null) window.clearTimeout(timer);
+          cancelSentencePause = null;
+          if (error) reject(error);
+          else resolve();
+        };
+        timer = window.setTimeout(() => settle(), INTER_SENTENCE_PAUSE_MS);
+        cancelSentencePause = () => {
+          settle(new DOMException("sentence pause cancelled", "AbortError"));
+        };
+      });
+    }
+
     async function playAudioBuffer(buffer, localGeneration) {
       if (localGeneration !== generation) return;
       const audioBlob = new Blob([buffer], { type: "audio/wav" });
@@ -541,6 +569,9 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         prefetchNextAudio();
         const audioBytes = await audioPromise;
         await playAudioBuffer(audioBytes, localGeneration);
+        if (localGeneration !== generation) return;
+        nowPlaying.dataset.playing = "false";
+        await waitForInterSentencePause();
       } catch (error) {
         if (error && error.name !== "AbortError" && localGeneration === generation) {
           playbackStatus.textContent = "本条音频不可用，继续下一条";
@@ -565,6 +596,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     function resetLocalPlayback() {
       generation += 1;
       cancelAudioPreparations();
+      cancelInterSentencePause();
       stopActivePlayback();
       queue = [];
       currentJob = null;
@@ -677,6 +709,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     window.addEventListener("beforeunload", () => {
       if (socket) socket.close(1000, "page closed");
       cancelAudioPreparations();
+      cancelInterSentencePause();
       stopActivePlayback();
     });
   })();

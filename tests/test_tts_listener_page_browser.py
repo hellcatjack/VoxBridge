@@ -35,7 +35,13 @@ def listener_page():
 def _install_queue_harness(listener_page, *, deferred_fetch: bool = False):
     listener_page.add_init_script(
         f"""
-        HTMLMediaElement.prototype.play = function() {{ return Promise.resolve(); }};
+        window.__ttsPlayStarts = [];
+        HTMLMediaElement.prototype.play = function() {{
+          if (!this.muted && String(this.src).startsWith("blob:")) {{
+            window.__ttsPlayStarts.push(performance.now());
+          }}
+          return Promise.resolve();
+        }};
         HTMLMediaElement.prototype.pause = function() {{}};
         HTMLMediaElement.prototype.load = function() {{}};
         const nativeMediaAddEventListener = HTMLMediaElement.prototype.addEventListener;
@@ -275,3 +281,36 @@ def test_listener_stop_aborts_current_and_prefetched_audio(listener_page):
     listener_page.locator("#stopListening").click()
     listener_page.wait_for_function("window.__ttsAbortCount === 2")
     assert listener_page.evaluate("window.__ttsAbortCount") == 2
+
+
+def test_listener_waits_for_sentence_pause_before_prepared_audio(listener_page):
+    _install_queue_harness(listener_page)
+    _start_queue_harness(listener_page)
+    _emit_job(listener_page, "job-1", 0)
+    listener_page.wait_for_function("window.__ttsPlayStarts.length === 1")
+    _emit_job(listener_page, "job-2", 1)
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 2")
+
+    ended_at = listener_page.evaluate("performance.now()")
+    listener_page.evaluate("window.__finishTTSPlayback()")
+    listener_page.wait_for_function("window.__ttsPlayStarts.length === 2")
+    second_started_at = listener_page.evaluate("window.__ttsPlayStarts[1]")
+    assert second_started_at - ended_at >= 280
+
+
+def test_listener_stop_cancels_active_sentence_pause_immediately(listener_page):
+    _install_queue_harness(listener_page)
+    _start_queue_harness(listener_page)
+    _emit_job(listener_page, "job-1", 0)
+    listener_page.wait_for_function("window.__ttsPlayStarts.length === 1")
+    _emit_job(listener_page, "job-2", 1)
+    listener_page.wait_for_function("window.__ttsFetchCalls.length === 2")
+
+    listener_page.evaluate("window.__finishTTSPlayback()")
+    listener_page.wait_for_timeout(50)
+    assert listener_page.evaluate("window.__ttsPlayStarts.length") == 1
+    stop_started_at = listener_page.evaluate("performance.now()")
+    listener_page.locator("#stopListening").click()
+    stop_finished_at = listener_page.evaluate("performance.now()")
+    assert listener_page.text_content("#connectionStatus") == "已停止"
+    assert stop_finished_at - stop_started_at < 200

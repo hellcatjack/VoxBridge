@@ -1828,6 +1828,14 @@ def test_listener_page_reuses_prepared_audio_and_cancels_on_reset():
     assert TTS_LISTENER_HTML.count("cancelAudioPreparations();") >= 2
 
 
+def test_listener_page_waits_for_cancellable_sentence_pause_after_playback():
+    assert "const INTER_SENTENCE_PAUSE_MS = 300;" in TTS_LISTENER_HTML
+    assert "async function waitForInterSentencePause()" in TTS_LISTENER_HTML
+    assert "await waitForInterSentencePause();" in TTS_LISTENER_HTML
+    assert "function cancelInterSentencePause()" in TTS_LISTENER_HTML
+    assert TTS_LISTENER_HTML.count("cancelInterSentencePause();") >= 2
+
+
 def test_listener_page_exposes_allowlisted_per_device_playback_rates():
     assert 'id="playbackRate"' in TTS_LISTENER_HTML
     for value in ("0.8", "0.9", "1", "1.1", "1.2"):
