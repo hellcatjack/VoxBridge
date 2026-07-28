@@ -30,7 +30,7 @@ Playwright with system Google Chrome, FastAPI user service on port 8024.
 
 ## Invariants
 
-- Rate choices are exactly `0.75`, `1.0`, `1.25`, `1.5`, and `2.0`; invalid storage
+- Rate choices are exactly `0.8`, `0.9`, `1.0`, `1.1`, and `1.2`; invalid storage
   falls back to `1.0`.
 - The speed value remains local and never enters WebSocket or HTTP requests.
 - Changing speed updates the active media element immediately.
@@ -53,10 +53,10 @@ Append focused assertions:
 ```python
 def test_listener_page_exposes_allowlisted_per_device_playback_rates():
     assert 'id="playbackRate"' in TTS_LISTENER_HTML
-    for value in ("0.75", "1", "1.25", "1.5", "2"):
+    for value in ("0.8", "0.9", "1", "1.1", "1.2"):
         assert f'<option value="{value}"' in TTS_LISTENER_HTML
     assert 'const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";' in TTS_LISTENER_HTML
-    assert "const SUPPORTED_PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);" in TTS_LISTENER_HTML
+    assert "const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2]);" in TTS_LISTENER_HTML
 
 
 def test_listener_page_normalizes_and_persists_playback_rate_locally():
@@ -107,9 +107,9 @@ def listener_page():
 
 def test_listener_rate_selection_persists_after_reload(listener_page):
     listener_page.goto("https://voxbridge.test/listen")
-    listener_page.select_option("#playbackRate", "1.5")
+    listener_page.select_option("#playbackRate", "1.2")
     listener_page.reload()
-    assert listener_page.input_value("#playbackRate") == "1.5"
+    assert listener_page.input_value("#playbackRate") == "1.2"
 
 
 def test_listener_rate_control_fits_mobile_without_horizontal_overflow(listener_page):
@@ -145,11 +145,11 @@ Add a `.playback-settings` row above `.actions`, with this control:
 <div class="playback-settings">
   <label for="playbackRate">朗读速度</label>
   <select id="playbackRate" aria-label="朗读速度">
-    <option value="0.75">0.75x</option>
+    <option value="0.8">0.8x</option>
+    <option value="0.9">0.9x</option>
     <option value="1" selected>1.0x</option>
-    <option value="1.25">1.25x</option>
-    <option value="1.5">1.5x</option>
-    <option value="2">2.0x</option>
+    <option value="1.1">1.1x</option>
+    <option value="1.2">1.2x</option>
   </select>
 </div>
 ```
@@ -160,7 +160,7 @@ Style it as a compact panel using the page's existing colors and stack it cleanl
 ```javascript
 const playbackRateInput = document.getElementById("playbackRate");
 const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
-const SUPPORTED_PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);
+const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2]);
 
 function normalizePlaybackRate(value) {
   const parsed = Number(value);
@@ -249,13 +249,13 @@ Add a real-browser assertion to `tests/test_tts_listener_page_browser.py`:
 ```python
 def test_rate_change_updates_persistent_media_element(listener_page):
     listener_page.goto("https://voxbridge.test/listen")
-    listener_page.select_option("#playbackRate", "1.5")
+    listener_page.select_option("#playbackRate", "1.2")
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
-    ) == 1.5
+    ) == 1.2
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.defaultPlaybackRate"
-    ) == 1.5
+    ) == 1.2
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.preservesPitch"
     ) is True
@@ -415,8 +415,8 @@ git commit -m "feat: apply TTS rate during listener playback"
 Extend `test_public_docs_describe_optional_kokoro_tts_contract()`:
 
 ```python
-assert "0.75x" in readme
-assert "2.0x" in readme
+assert "0.8x" in readme
+assert "1.2x" in readme
 assert "per-device" in api.lower()
 assert "localStorage" in api
 assert "--tts-speed" in deployment
@@ -434,7 +434,7 @@ Expected: failure because the per-device playback contract is undocumented.
 
 - [ ] **Step 3: Document the behavior without changing the protocol**
 
-Document that `/listen` supports `0.75x` through `2.0x`, persists the preference per
+Document that `/listen` supports `0.8x` through `1.2x` in `0.1x` steps, persists the preference per
 browser, applies it immediately, and does not change shared synthesis. In deployment
 docs distinguish backend `--tts-speed` from the listener-side multiplier.
 
@@ -515,7 +515,7 @@ since restart. Confirm the service still uses `.venv/bin/python` and retains
 - [ ] **Step 7: Run Playwright against the deployed authenticated page**
 
 Use an authenticated browser session without writing credentials into source or logs.
-Verify the five options, select `1.5x`, reload, verify persistence, switch to a mobile
+Verify the five options, select `1.2x`, reload, verify persistence, switch to a mobile
 viewport, and confirm no horizontal overflow. Do not open an ASR WebSocket or a second
 backend during this UI-only smoke test.
 

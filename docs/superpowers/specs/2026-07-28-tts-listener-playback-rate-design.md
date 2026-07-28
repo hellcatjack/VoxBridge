@@ -11,7 +11,9 @@ cache entries, or FIFO delivery guarantees.
 ## Scope
 
 - Add a compact playback-rate control to the standalone `/listen` page.
-- Offer `0.75x`, `1.0x`, `1.25x`, `1.5x`, and `2.0x`; default to `1.0x`.
+- Offer `0.8x`, `0.9x`, `1.0x`, `1.1x`, and `1.2x`; default to `1.0x`.
+- Treat stored values outside that current allowlist as legacy values and fall
+  back to `1.0x`.
 - Persist the selected value in `localStorage` on that browser only.
 - Apply a new selection immediately to the item currently playing and to every
   queued item that follows.

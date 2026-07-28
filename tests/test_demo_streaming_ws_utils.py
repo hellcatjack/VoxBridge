@@ -1812,14 +1812,16 @@ def test_listener_page_fetches_only_the_fifo_head_and_stops_locally():
 
 def test_listener_page_exposes_allowlisted_per_device_playback_rates():
     assert 'id="playbackRate"' in TTS_LISTENER_HTML
-    for value in ("0.75", "1", "1.25", "1.5", "2"):
+    for value in ("0.8", "0.9", "1", "1.1", "1.2"):
         assert f'<option value="{value}"' in TTS_LISTENER_HTML
+    for removed_value in ("0.75", "1.25", "1.5", "2"):
+        assert f'<option value="{removed_value}"' not in TTS_LISTENER_HTML
     assert (
         'const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";'
         in TTS_LISTENER_HTML
     )
     assert (
-        "const SUPPORTED_PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);"
+        "const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2]);"
         in TTS_LISTENER_HTML
     )
 

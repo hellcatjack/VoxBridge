@@ -145,7 +145,7 @@ CPU lock, then shared by all listeners assigned to that job.
 
 `--tts-speed` is the backend Kokoro synthesis baseline and remains global for
 the generated shared WAV. The `/listen` selector is a listener-side playback
-multiplier (`0.75x` through `2.0x`) stored per browser; changing it does not
+multiplier (`0.8x` through `1.2x` in `0.1x` steps) stored per browser; changing it does not
 restart the service, alter another device, or create another synthesis/cache
 variant.
 

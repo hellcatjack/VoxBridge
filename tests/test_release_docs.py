@@ -92,8 +92,10 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "仅接收连接后" in readme
     assert "多个设备" in readme
     assert "主字幕页不播放" in readme
-    assert "0.75x" in readme
-    assert "2.0x" in readme
+    assert "0.8x" in readme
+    assert "1.2x" in readme
+    assert "0.75x" not in readme
+    assert "2.0x" not in readme
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
 
     assert "GET /listen" in api

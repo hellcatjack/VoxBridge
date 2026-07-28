@@ -33,9 +33,20 @@ def listener_page():
 
 def test_listener_rate_selection_persists_after_reload(listener_page):
     listener_page.goto("https://voxbridge.test/listen")
-    listener_page.select_option("#playbackRate", "1.5")
+    listener_page.select_option("#playbackRate", "1.2")
     listener_page.reload()
-    assert listener_page.input_value("#playbackRate") == "1.5"
+    assert listener_page.input_value("#playbackRate") == "1.2"
+
+
+def test_unsupported_legacy_rate_falls_back_to_default(listener_page):
+    listener_page.add_init_script(
+        "window.localStorage.setItem('voxbridge.ttsPlaybackRate', '1.5');"
+    )
+    listener_page.goto("https://voxbridge.test/listen")
+    assert listener_page.input_value("#playbackRate") == "1"
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
 
 
 def test_listener_rate_control_fits_mobile_without_horizontal_overflow(listener_page):
@@ -51,13 +62,13 @@ def test_listener_rate_control_fits_mobile_without_horizontal_overflow(listener_
 
 def test_rate_change_updates_persistent_media_element(listener_page):
     listener_page.goto("https://voxbridge.test/listen")
-    listener_page.select_option("#playbackRate", "1.5")
+    listener_page.select_option("#playbackRate", "1.2")
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
-    ) == 1.5
+    ) == 1.2
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.defaultPlaybackRate"
-    ) == 1.5
+    ) == 1.2
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.preservesPitch"
     ) is True
@@ -95,15 +106,15 @@ def test_listener_start_stop_preserves_rate_selection(listener_page):
         """
     )
     listener_page.goto("https://voxbridge.test/listen")
-    listener_page.select_option("#playbackRate", "1.25")
+    listener_page.select_option("#playbackRate", "0.9")
     listener_page.locator("#startListening").click()
     listener_page.wait_for_function(
         "document.querySelector('#connectionStatus').textContent === '已连接'"
     )
-    listener_page.select_option("#playbackRate", "1.5")
+    listener_page.select_option("#playbackRate", "1.1")
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
-    ) == 1.5
+    ) == 1.1
     listener_page.locator("#stopListening").click()
-    assert listener_page.input_value("#playbackRate") == "1.5"
+    assert listener_page.input_value("#playbackRate") == "1.1"
     assert listener_page.text_content("#connectionStatus") == "已停止"
