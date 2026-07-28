@@ -60,7 +60,7 @@ from voxbridge.tts.broadcast import (
     TTSBroadcastNotFound,
     TTSBroadcastQueueFull,
 )
-from voxbridge.tts.jobs import OrderedTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
+from voxbridge.tts.jobs import RevisionStableTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
 from voxbridge.tts.listener_page import TTS_LISTENER_HTML
 from voxbridge.tts.kokoro_onnx import (
     KokoroOnnxSynthesizer,
@@ -89,6 +89,13 @@ def _positive_int_arg(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _non_negative_float_arg(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must not be negative")
     return parsed
 
 
@@ -5257,6 +5264,10 @@ def _create_app(
             target_language=initial_translation_target,
             latest_by_sentence={},
         )
+        tts_revision_stable_sec = max(
+            0.0,
+            float(getattr(args, "tts_revision_stable_sec", 3.0)),
+        )
         tts_runtime = SimpleNamespace(
             available=bool(tts_synthesizer is not None and translator is not None),
             broadcast_enabled=bool(tts_synthesizer is not None and translator is not None),
@@ -5265,7 +5276,11 @@ def _create_app(
             generation=0,
             next_source_order=0,
             sentence_orders={},
-            ordered=OrderedTTSBuffer(),
+            ordered=RevisionStableTTSBuffer(stable_sec=tts_revision_stable_sec),
+            stability_task=None,
+            stability_wake=asyncio.Event(),
+            stability_stopping=False,
+            last_wait_key=None,
             session_issued_job_count=0,
             owner_key=(
                 "anonymous"
@@ -5748,6 +5763,8 @@ def _create_app(
             tts_runtime.next_source_order = 0
             tts_runtime.sentence_orders.clear()
             tts_runtime.ordered.reset()
+            tts_runtime.last_wait_key = None
+            tts_runtime.stability_wake.set()
 
         def _tts_output_active() -> bool:
             return bool(tts_runtime.broadcast_enabled or tts_runtime.enabled)
@@ -5834,7 +5851,9 @@ def _create_app(
                 source_order, registered_generation = registered
                 if int(registered_generation) != generation:
                     return
-            tts_runtime.ordered.register(sid, int(revision), int(source_order))
+            registration = tts_runtime.ordered.register(sid, int(revision), int(source_order))
+            if registration.accepted:
+                tts_runtime.stability_wake.set()
             _trace_event(
                 "tts_source_registered",
                 sentence_id=sid,
@@ -5943,12 +5962,15 @@ def _create_app(
                 _, registered_generation = registered
                 if int(registered_generation) != int(tts_runtime.generation):
                     return []
-                return tts_runtime.ordered.mark_ready(
+                accepted = tts_runtime.ordered.mark_ready(
                     str(sentence_id),
                     int(revision),
                     str(translated),
                     _canonical_tts_language(str(target_language)),
                 )
+                if accepted:
+                    tts_runtime.stability_wake.set()
+                return tts_runtime.ordered.drain()
 
             await _run_ordered_tts_transition(
                 tts_transition_lock,
@@ -5964,19 +5986,50 @@ def _create_app(
                 _, registered_generation = registered
                 if int(registered_generation) != int(tts_runtime.generation):
                     return []
-                ready = tts_runtime.ordered.mark_failed(str(sentence_id), int(revision))
+                accepted = tts_runtime.ordered.mark_failed(str(sentence_id), int(revision))
+                if accepted:
+                    tts_runtime.stability_wake.set()
                 _trace_event(
                     "tts_translation_skipped",
                     sentence_id=str(sentence_id or ""),
                     revision=int(revision),
                 )
-                return ready
+                return tts_runtime.ordered.drain()
 
             await _run_ordered_tts_transition(
                 tts_transition_lock,
                 _transition,
                 _publish_tts_ready,
             )
+
+        async def _drain_tts_stability(*, force: bool = False) -> None:
+            async with tts_transition_lock:
+                ready = tts_runtime.ordered.drain(force=force)
+                if ready:
+                    await _publish_tts_ready(ready)
+
+        async def _tts_stability_scheduler() -> None:
+            try:
+                while not bool(tts_runtime.stability_stopping):
+                    tts_runtime.stability_wake.clear()
+                    await _drain_tts_stability()
+                    async with tts_transition_lock:
+                        deadline = tts_runtime.ordered.next_deadline()
+                    if deadline is None:
+                        await tts_runtime.stability_wake.wait()
+                        continue
+                    timeout = max(0.0, float(deadline) - time.monotonic())
+                    try:
+                        await asyncio.wait_for(
+                            tts_runtime.stability_wake.wait(),
+                            timeout=timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+
+        tts_runtime.stability_task = asyncio.create_task(_tts_stability_scheduler())
 
         async def _set_translation_direction(
             direction_raw: Any,
@@ -10020,6 +10073,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Warn after this long while continuing to wait for stable translations before final",
+    )
+    p.add_argument(
+        "--tts-revision-stable-sec",
+        type=_non_negative_float_arg,
+        default=3.0,
+        help="Require this long without a source revision before publishing translated speech",
     )
 
     p.add_argument("--client-chunk-ms", type=int, default=200, help="Client capture chunk length in milliseconds")

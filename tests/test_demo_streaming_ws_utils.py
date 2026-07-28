@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
-from voxbridge.tts.jobs import OrderedTTSBuffer
+from voxbridge.tts.jobs import RevisionStableTTSBuffer
 from voxbridge.tts.listener_page import TTS_LISTENER_HTML
 from voxbridge.cli.demo_streaming_ws import (
     INDEX_HTML_TEMPLATE,
@@ -47,11 +47,13 @@ from voxbridge.cli.demo_streaming_ws import (
 
 def test_ordered_tts_transition_serializes_drain_and_whole_batch_publication():
     async def scenario():
-        buffer = OrderedTTSBuffer()
+        buffer = RevisionStableTTSBuffer(stable_sec=0.0)
         for order in range(4):
             buffer.register(f"s{order}", 1, order)
-        assert buffer.mark_ready("s1", 1, "one", "English") == []
-        assert buffer.mark_ready("s2", 1, "two", "English") == []
+        assert buffer.mark_ready("s1", 1, "one", "English") is True
+        assert buffer.drain() == []
+        assert buffer.mark_ready("s2", 1, "two", "English") is True
+        assert buffer.drain() == []
 
         transition_lock = asyncio.Lock()
         first_send_started = asyncio.Event()
@@ -65,10 +67,14 @@ def test_ordered_tts_transition_serializes_drain_and_whole_batch_publication():
                     await release_first_send.wait()
                 sent.append(item.source_order)
 
+        def mark_ready_and_drain(sentence_id, text):
+            assert buffer.mark_ready(sentence_id, 1, text, "English") is True
+            return buffer.drain()
+
         first = asyncio.create_task(
             demo_streaming_ws._run_ordered_tts_transition(
                 transition_lock,
-                lambda: buffer.mark_ready("s0", 1, "zero", "English"),
+                lambda: mark_ready_and_drain("s0", "zero"),
                 publish,
             )
         )
@@ -76,7 +82,7 @@ def test_ordered_tts_transition_serializes_drain_and_whole_batch_publication():
         second = asyncio.create_task(
             demo_streaming_ws._run_ordered_tts_transition(
                 transition_lock,
-                lambda: buffer.mark_ready("s3", 1, "three", "English"),
+                lambda: mark_ready_and_drain("s3", "three"),
                 publish,
             )
         )
@@ -972,6 +978,29 @@ def test_parse_args_uses_safe_tts_defaults(monkeypatch):
     assert args.tts_max_client_jobs == 4096
     assert args.tts_listener_queue_size == 128
     assert args.tts_final_translation_drain_sec == 30.0
+
+
+def test_parse_args_uses_safe_tts_revision_stability_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    args = parse_args()
+
+    assert args.tts_revision_stable_sec == 3.0
+
+
+def test_parse_args_accepts_tts_revision_stability_override(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog", "--tts-revision-stable-sec", "1.75"])
+
+    args = parse_args()
+
+    assert args.tts_revision_stable_sec == 1.75
+
+
+def test_parse_args_rejects_negative_tts_revision_stability(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog", "--tts-revision-stable-sec", "-0.1"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_parse_args_accepts_kokoro_tts_options(monkeypatch):

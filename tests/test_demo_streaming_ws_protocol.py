@@ -104,6 +104,7 @@ def _args():
         decode_interval_sec=1.0,
         idle_timeout_sec=30,
         max_frame_samples=32000,
+        tts_revision_stable_sec=0.0,
     )
 
 
@@ -575,6 +576,15 @@ def _collect_through_final(ws, max_steps=160):
     pytest.fail(f"did not receive final, seen={[event.get('type') for event in events]}")
 
 
+def _drain_listener_events(subscription):
+    events = []
+    while True:
+        try:
+            events.append(subscription.queue.get_nowait())
+        except asyncio.QueueEmpty:
+            return events
+
+
 def test_ws_tts_defaults_off_and_marks_translation_stable():
     args = _args()
     args.final_redecode_on_stop = False
@@ -645,6 +655,39 @@ def test_ws_broadcasts_stable_translations_without_legacy_tts_fields():
     )
     assert app.state.tts_broadcast.job_count == 3
     assert not [event for event in events if event.get("type") == "tts_job"]
+
+
+def test_ws_tts_stability_scheduler_releases_without_more_audio():
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.tts_revision_stable_sec = 0.12
+    app = _create_app(
+        args,
+        _StableTTSSentenceASR(),
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    listener = app.state.tts_broadcast.register("anonymous")
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "start"})
+        _receive_until_type(ws, "started")
+        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        _receive_until_type(ws, "sentence_translation")
+        assert not [
+            event
+            for event in _drain_listener_events(listener)
+            if event.get("type") == "tts_job"
+        ]
+
+        time.sleep(0.16)
+        jobs = [
+            event
+            for event in _drain_listener_events(listener)
+            if event.get("type") == "tts_job"
+        ]
+        assert jobs
 
 
 def test_ws_does_not_retain_broadcast_jobs_without_listeners():
