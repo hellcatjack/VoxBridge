@@ -23,6 +23,7 @@ import difflib
 import fcntl
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -469,10 +470,11 @@ def _text_matches_source_language(text: str, source_language: str) -> bool:
 
 
 _ESV_ZH_TO_EN_POLICY = (
-    "涉及基督教、圣经或神学内容时，卷名、人名、地名、称谓、神学术语及大小写"
-    "必须采用 English Standard Version (ESV) 的标准英文用法；能明确识别为经文时，"
-    "措辞应尽量贴近 ESV，但不得补写、扩写、解释或用记忆中的经文替换原文；"
-    "无法确定对应经文时，必须忠实翻译当前中文文本，不得猜测。"
+    "忠实原文是最高优先级。涉及基督教、圣经或神学内容时，仅对原文中明确出现的"
+    "卷名、人名、地名、称谓、神学术语及大小写，必须采用 English Standard Version "
+    "(ESV) 的标准英文用法；只有原文完整且语义明确等同于某段经文时，措辞才应尽量"
+    "贴近 ESV；若原文是节选、转述、误引或无法确定对应经文时，必须按演讲者实际说法"
+    "忠实翻译；不得补写、扩写、解释、纠正或用记忆中的经文替换原文"
 )
 
 
@@ -480,16 +482,24 @@ def _build_translation_prompt(
     text: str,
     source_language: str,
     target_language: str,
+    translation_direction: Optional[str] = None,
 ) -> str:
     source = str(source_language or "Chinese")
     target = str(target_language or "English")
-    requirements = [
-        "忠实原文，不增删",
-        "保留专有名词",
-        "只输出译文本身，不要解释",
-    ]
-    if _is_chinese_label(source) and _is_english_label(target):
+    direction = str(translation_direction or "").strip().lower()
+    if direction in {"zh2en", "zh->en", "chinese->english", "中文->英文"}:
+        use_esv_policy = True
+    elif direction in {"en2zh", "en->zh", "english->chinese", "英文->中文"}:
+        use_esv_policy = False
+    else:
+        use_esv_policy = _is_chinese_label(source) and _is_english_label(target)
+
+    requirements = ["忠实原文，不增删"]
+    if use_esv_policy:
         requirements.append(_ESV_ZH_TO_EN_POLICY)
+    else:
+        requirements.append("保留专有名词")
+    requirements.append("只输出译文本身，不要解释")
     return (
         f"请将以下{source}文本翻译为{target}。\n"
         f"要求：{'；'.join(requirements)}。\n\n"
@@ -1372,16 +1382,23 @@ class LocalTranslator:
         self.model = AutoModelForCausalLM.from_pretrained(self.model_path, **model_kwargs)
         self._lock = threading.Lock()
 
-    def _build_prompt(self, text: str, source_language: Optional[str] = None, target_language: Optional[str] = None) -> str:
+    def _build_prompt(
+        self,
+        text: str,
+        source_language: Optional[str] = None,
+        target_language: Optional[str] = None,
+        translation_direction: Optional[str] = None,
+    ) -> str:
         source = str(source_language or self.source_language or "Chinese")
         target = str(target_language or self.target_language or "English")
-        return _build_translation_prompt(text, source, target)
+        return _build_translation_prompt(text, source, target, translation_direction)
 
     def translate(
         self,
         text: str,
         source_language: Optional[str] = None,
         target_language: Optional[str] = None,
+        translation_direction: Optional[str] = None,
     ) -> str:
         import torch
 
@@ -1393,7 +1410,17 @@ class LocalTranslator:
         if not _text_matches_source_language(src, source):
             return ""
 
-        messages = [{"role": "user", "content": self._build_prompt(src, source_language=source, target_language=target)}]
+        messages = [
+            {
+                "role": "user",
+                "content": self._build_prompt(
+                    src,
+                    source_language=source,
+                    target_language=target,
+                    translation_direction=translation_direction,
+                ),
+            }
+        ]
         tokenized_chat = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -1457,10 +1484,16 @@ class OpenAIAPITranslator:
         else:
             self.chat_url = f"{normalized}/v1/chat/completions"
 
-    def _build_prompt(self, text: str, source_language: Optional[str] = None, target_language: Optional[str] = None) -> str:
+    def _build_prompt(
+        self,
+        text: str,
+        source_language: Optional[str] = None,
+        target_language: Optional[str] = None,
+        translation_direction: Optional[str] = None,
+    ) -> str:
         source = str(source_language or self.source_language or "Chinese")
         target = str(target_language or self.target_language or "English")
-        return _build_translation_prompt(text, source, target)
+        return _build_translation_prompt(text, source, target, translation_direction)
 
     def _extract_content(self, payload: Dict[str, Any]) -> str:
         choices = payload.get("choices")
@@ -1492,6 +1525,7 @@ class OpenAIAPITranslator:
         text: str,
         source_language: Optional[str] = None,
         target_language: Optional[str] = None,
+        translation_direction: Optional[str] = None,
     ) -> str:
         src = str(text or "").strip()
         if not src:
@@ -1508,6 +1542,7 @@ class OpenAIAPITranslator:
                     src,
                     source_language=source,
                     target_language=target,
+                    translation_direction=translation_direction,
                 ),
             }
         ]
@@ -4357,6 +4392,15 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
     app = FastAPI(title="VoxBridge Streaming WebSocket Demo")
     infer_lock = asyncio.Lock()
     runtime = SimpleNamespace(active_connections=0)
+    translator_accepts_direction = False
+    if translator is not None:
+        with suppress(TypeError, ValueError):
+            translate_parameters = inspect.signature(translator.translate).parameters.values()
+            translator_accepts_direction = any(
+                parameter.name == "translation_direction"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in translate_parameters
+            )
     debug_roots = [Path.cwd().resolve(), Path("/tmp").resolve()]
     auth = _build_auth_config(args)
     asr_context_schedule = _load_asr_context_schedule(args)
@@ -5444,11 +5488,16 @@ def _create_app(args: argparse.Namespace, asr: Any, translator: Optional[LocalTr
             t0 = time.monotonic()
             try:
                 try:
+                    translate_kwargs = {
+                        "source_language": effective_source_language,
+                        "target_language": target_language,
+                    }
+                    if translator_accepts_direction:
+                        translate_kwargs["translation_direction"] = direction
                     out = await asyncio.to_thread(
                         translator.translate,
                         src,
-                        source_language=effective_source_language,
-                        target_language=target_language,
+                        **translate_kwargs,
                     )
                 except TypeError:
                     out = await asyncio.to_thread(translator.translate, src)

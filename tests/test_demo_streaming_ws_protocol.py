@@ -2842,6 +2842,58 @@ def test_ws_supports_runtime_translation_direction_switch():
     assert tgt_lang == "Chinese"
 
 
+def test_ws_preserves_zh2en_policy_direction_after_latin_source_autofallback():
+    class _LatinTextASR(_FakeASR):
+        def streaming_transcribe(self, wav, state):
+            assert isinstance(wav, np.ndarray)
+            state.language = "Chinese"
+            state.text = (
+                "The name Jesus Christ appears in this complete sentence. "
+                "Another complete sentence follows with enough words."
+            )
+            return state
+
+    class _DirectionRecordingTranslator:
+        def __init__(self):
+            self.calls = []
+
+        def translate(
+            self,
+            text,
+            source_language=None,
+            target_language=None,
+            translation_direction=None,
+        ):
+            self.calls.append(
+                (
+                    str(text or ""),
+                    str(source_language or ""),
+                    str(target_language or ""),
+                    str(translation_direction or ""),
+                )
+            )
+            return f"translated:{text}"
+
+    translator = _DirectionRecordingTranslator()
+    app = _create_app(_args(), _LatinTextASR(), translator=translator)
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as ws:
+        ready = ws.receive_json()
+        assert ready["translation_direction"] == "zh2en"
+
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        ws.send_bytes(raw)
+        _receive_until_type(ws, "sentence_committed")
+        _receive_until_type(ws, "sentence_translation")
+
+    assert translator.calls
+    _, source_language, target_language, direction = translator.calls[-1]
+    assert source_language == "English"
+    assert target_language == "English"
+    assert direction == "zh2en"
+
+
 def test_ws_stop_does_not_reset_committed_subtitles_for_noncanonical_final_tail():
     first = "The first committed sentence is complete and long enough."
     second = "The second held sentence is complete and long enough."

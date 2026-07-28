@@ -398,6 +398,8 @@ def test_translation_prompt_applies_esv_policy_to_zh_en_aliases(
     assert "必须采用" in prompt
     assert "不得补写、扩写" in prompt
     assert "无法确定对应经文时" in prompt
+    assert "忠实原文是最高优先级" in prompt
+    assert "节选、转述、误引" in prompt
 
 
 def test_translation_prompt_does_not_apply_esv_policy_to_en_zh():
@@ -409,6 +411,23 @@ def test_translation_prompt_does_not_apply_esv_policy_to_en_zh():
 
     assert "English Standard Version (ESV)" not in prompt
     assert "不得补写、扩写" not in prompt
+    assert prompt == (
+        "请将以下English文本翻译为中文。\n"
+        "要求：忠实原文，不增删；保留专有名词；只输出译文本身，不要解释。\n\n"
+        "原文：\nThis is the source sentence."
+    )
+
+
+def test_translation_prompt_uses_session_direction_after_source_autofallback():
+    prompt = demo_streaming_ws._build_translation_prompt(
+        "Jesus Christ",
+        "English",
+        "English",
+        translation_direction="zh2en",
+    )
+
+    assert "English Standard Version (ESV)" in prompt
+    assert "忠实原文是最高优先级" in prompt
 
 
 def test_translator_backends_share_esv_prompt_policy_without_loading_model():
@@ -459,14 +478,66 @@ def test_openai_api_translator_sends_esv_policy_for_zh_en(monkeypatch):
     translator = OpenAIAPITranslator(
         "http://127.0.0.1:8001",
         "fake-model",
-        source_language="Chinese",
+        source_language="English",
         target_language="English",
     )
 
-    assert translator.translate("这是讲道内容。") == "Translated sentence."
+    assert translator.translate(
+        "Jesus Christ",
+        source_language="English",
+        target_language="English",
+        translation_direction="zh2en",
+    ) == "Translated sentence."
     prompt = captured[0]["messages"][0]["content"]
     assert "English Standard Version (ESV)" in prompt
     assert "不得补写、扩写" in prompt
+
+
+def test_openai_api_translator_keeps_general_prompt_for_en_zh(monkeypatch):
+    captured = []
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": "译文。"},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    translator = OpenAIAPITranslator(
+        "http://127.0.0.1:8001",
+        "fake-model",
+        source_language="English",
+        target_language="中文",
+    )
+
+    assert translator.translate(
+        "This is the source sentence.",
+        translation_direction="en2zh",
+    ) == "译文。"
+    prompt = captured[0]["messages"][0]["content"]
+    assert "English Standard Version (ESV)" not in prompt
+    assert prompt == (
+        "请将以下English文本翻译为中文。\n"
+        "要求：忠实原文，不增删；保留专有名词；只输出译文本身，不要解释。\n\n"
+        "原文：\nThis is the source sentence."
+    )
 
 
 def test_openai_api_translator_retries_when_generation_hits_token_limit(monkeypatch):
