@@ -8,6 +8,13 @@ from .jobs import (
     TTSQueueFull,
     TTSReadyItem,
 )
+from .kokoro_onnx import (
+    KokoroOnnxSynthesizer,
+    KokoroTTSConfig,
+    SynthesizedAudio,
+    TTSConfigurationError,
+    TTSSynthesisError,
+)
 
 __all__ = [
     "OrderedTTSBuffer",
@@ -16,4 +23,9 @@ __all__ = [
     "TTSJobRegistry",
     "TTSQueueFull",
     "TTSReadyItem",
+    "KokoroOnnxSynthesizer",
+    "KokoroTTSConfig",
+    "SynthesizedAudio",
+    "TTSConfigurationError",
+    "TTSSynthesisError",
 ]
