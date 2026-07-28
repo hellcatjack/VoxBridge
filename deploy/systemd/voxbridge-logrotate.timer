@@ -1,0 +1,11 @@
+[Unit]
+Description=Check VoxBridge user logs hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=voxbridge-logrotate.service
+
+[Install]
+WantedBy=timers.target

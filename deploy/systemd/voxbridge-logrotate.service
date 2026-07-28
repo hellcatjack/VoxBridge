@@ -1,0 +1,7 @@
+[Unit]
+Description=Rotate VoxBridge user logs
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/voxbridge
+ExecStart=/usr/sbin/logrotate --state %h/.local/state/voxbridge/logrotate.status %h/.config/voxbridge/logrotate.conf

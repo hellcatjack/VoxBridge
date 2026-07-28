@@ -140,3 +140,26 @@ def test_docs_publish_tts_revision_stability_contract():
     assert "source revision" in api.lower()
     assert "字幕" in readme and "朗读" in readme
     assert "3.0" in readme
+
+
+def test_user_service_templates_bound_log_rotation():
+    logrotate = (
+        ROOT / "deploy" / "logrotate" / "voxbridge.conf"
+    ).read_text(encoding="utf-8")
+    service = (
+        ROOT / "deploy" / "systemd" / "voxbridge-logrotate.service"
+    ).read_text(encoding="utf-8")
+    timer = (
+        ROOT / "deploy" / "systemd" / "voxbridge-logrotate.timer"
+    ).read_text(encoding="utf-8")
+
+    assert "/data/Qwen3-ASR/logs/voxbridge_8024.log" in logrotate
+    assert "/data/Qwen3-ASR/logs/voxbridge_subtitle_trace.jsonl" in logrotate
+    assert "size 512M" in logrotate
+    assert "rotate 21" in logrotate
+    assert "compress" in logrotate
+    assert "copytruncate" in logrotate
+    assert "%h/.local/state/voxbridge/logrotate.status" in service
+    assert "%h/.config/voxbridge/logrotate.conf" in service
+    assert "OnUnitActiveSec=1h" in timer
+    assert "Persistent=true" in timer
