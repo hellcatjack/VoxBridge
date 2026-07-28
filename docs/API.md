@@ -47,6 +47,12 @@ WAV reached that browser, so a prefetched job can be acknowledged before local
 playback. No endpoint or WebSocket message changes. If synthesis takes longer
 than the current clip, a residual transition wait remains.
 
+After each successful clip, the listener applies a fixed `300ms sentence pause`
+before promoting the next prepared FIFO item. This wall-clock gate is independent
+of playback rate and translation direction, does not inspect text or punctuation,
+and does not stop lookahead preparation. Reset, Stop, disconnect, and unload
+cancel an active pause immediately.
+
 ### `GET /login`
 
 Returns the login page when authentication is enabled.

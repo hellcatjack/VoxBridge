@@ -156,6 +156,12 @@ preparation. This does not increase Kokoro inference concurrency because the
 backend synthesis lock remains global, and it does not guarantee a gapless
 transition when synthesis is slower than the clip already playing.
 
+The listener adds a fixed `300ms` sentence pause after successful playback. It
+gates only promotion of the next prepared item; synthesis and transfer continue
+during the pause. The delay is not scaled by listener playback rate, and all
+listener reset paths cancel it immediately. It requires no service flag or
+systemd change.
+
 `--tts-listener-queue-size` bounds unread metadata per device. A listener that
 cannot keep up is disconnected without delaying other listeners. The shared job
 registry is bounded by `--tts-max-client-jobs` and jobs expire after
