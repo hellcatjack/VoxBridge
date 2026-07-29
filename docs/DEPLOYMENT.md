@@ -33,6 +33,18 @@ The dry-run must not uninstall or replace Torch, Triton, ROCm/CUDA, or install a
 CUDA-flavored Torch wheel. The TTS extra uses ONNX Runtime
 `CPUExecutionProvider`; it does not share vLLM GPU memory.
 
+For observation-only Silero VAD on an already validated ROCm/CUDA environment,
+install the package without dependency resolution:
+
+```bash
+uv pip install --python .venv/bin/python --no-deps 'silero-vad==6.2.1'
+```
+
+Do not install `.[vad-shadow]` on a production accelerator environment without
+first inspecting a dry run. A generic resolver can replace the locally matched
+Torch and Triton builds. Verify those versions remain unchanged after the
+no-dependency install.
+
 Create `models/kokoro/` and obtain these assets from the official
 `thewh1teagle/kokoro-onnx` releases and `hexgrad/Kokoro-82M-v1.1-zh` model page:
 
@@ -119,6 +131,34 @@ Add translation, VAD, context schedule, queue, or model-memory flags to `ExecSta
 ```bash
 .venv/bin/python -m voxbridge.cli.demo_streaming_ws --help
 ```
+
+The recommended quality-preserving decode gate instrumentation is:
+
+```text
+--silent-decode-pre-roll-sec 0.4
+--silero-vad-shadow
+--silero-vad-shadow-threshold 0.5
+--silero-vad-shadow-log-sec 1.0
+```
+
+The pre-roll contains only audio skipped by the current energy gate and is
+replayed once when decoding resumes. Silero remains observe-only: it cannot
+trigger a cut or suppress audio. Loading and inference failures disable only the
+shadow observer for the current WebSocket session.
+
+Long comma-delimited speech is translated in rollback-safe clause units without
+rotating the ASR state. The defaults are:
+
+```text
+--stable-clause-target-cjk-chars 32
+--stable-clause-target-latin-words 24
+```
+
+These are target sizes rather than hard character wrapping limits. Only the
+first comma, semicolon, or colon at or after the target is eligible, making the
+boundary prefix-deterministic. The newest unit remains tentative, every clause
+must cross the tokenizer rollback window, and `0` disables the corresponding
+script-aware splitter.
 
 After a translation backend is configured and verified, append these TTS flags
 to the same `ExecStart` command:
@@ -301,6 +341,7 @@ For rollback, select a previously verified commit or annotated tag, reinstall th
 - Confirm old backend and EngineCore PIDs exit before starting another model process.
 - Monitor `NRestarts`, process RSS, GPU memory, GTT, queue depth, and queue-drop trace fields during long sessions.
 - Monitor CPU load and process RSS after enabling Kokoro. TTS synthesis is globally serialized; high backlog degrades by increasing spoken delay rather than starting concurrent CPU model runs.
+- Compare `silero_shadow_observation` and `silero_shadow_disagreement` with `silent_decode_skipped`, `audio_preroll_replayed`, and subsequent ASR output before allowing a neural VAD to influence control decisions.
 - Treat logs, audio, translations, subtitle traces, and screenshots as sensitive meeting data.
 - Keep credentials in mode `0600` runtime files or a dedicated secret manager.
 - Keep the service on port `8024`; changing the public proxy port does not change the backend contract.

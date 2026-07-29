@@ -27,6 +27,9 @@ tts = [
   "misaki[zh]==0.9.4",
   "soundfile>=0.13.1",
 ]
+vad-shadow = [
+  "silero-vad==6.2.1",
+]
 
 [project.scripts]
 voxbridge-streaming-ws = "voxbridge.cli.demo_streaming_ws:main"

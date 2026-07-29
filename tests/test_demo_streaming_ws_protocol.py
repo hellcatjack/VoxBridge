@@ -15,6 +15,13 @@ import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import _create_app, _hash_auth_password
 from voxbridge.tts.jobs import RevisionStableTTSBuffer, TTSReadyItem
 from voxbridge.tts.kokoro_onnx import SynthesizedAudio
+from voxbridge.streaming.vad_support import SileroShadowObserver
+
+
+class _FakeTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return list(str(text or ""))
 
 
 class _FakeASR:
@@ -22,6 +29,7 @@ class _FakeASR:
         self.init_calls = []
         self.finish_calls = 0
         self.transcribe_calls = []
+        self.processor = SimpleNamespace(tokenizer=_FakeTokenizer())
 
     def init_streaming_state(self, **kwargs):
         self.init_calls.append(kwargs)
@@ -154,6 +162,435 @@ def test_ws_ready_partial_final_flow():
         assert final["type"] == "final"
         assert final["language"] == "Chinese"
         assert final["text"]
+
+
+def test_ws_replays_skipped_audio_once_when_decode_resumes(monkeypatch):
+    class RecordingASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.streaming_wavs = []
+
+        def streaming_transcribe(self, wav, state):
+            self.streaming_wavs.append(np.asarray(wav, dtype=np.float32).copy())
+            return super().streaming_transcribe(wav, state)
+
+    decisions = iter((True, False))
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "_should_skip_stream_decode",
+        lambda **kwargs: next(decisions),
+    )
+    args = _args()
+    args.silent_decode_pre_roll_sec = 0.4
+    args.silero_vad_shadow = False
+    fake_asr = RecordingASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        first = np.array([100, 200, 300], dtype="<i2")
+        second = np.array([400, 500, 600], dtype="<i2")
+        ws.send_bytes(first.tobytes())
+        time.sleep(0.05)
+        ws.send_bytes(second.tobytes())
+        _receive_until_type(ws, "partial")
+
+    assert len(fake_asr.streaming_wavs) == 1
+    expected = np.concatenate((first, second)).astype(np.float32) / 32768.0
+    np.testing.assert_allclose(fake_asr.streaming_wavs[0], expected)
+
+
+def test_ws_quarantines_context_fragment_after_silent_resume(monkeypatch, tmp_path):
+    context_terms = ["尼希米", "城墙", "羊门", "粪门", "祭司", "圣经"]
+    context_fragment = "所以说，城墙、羊门、粪门。"
+    natural_text = "整本圣经的作用和要求正在这里继续说明。"
+
+    class ResumeContextASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.decode_count = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            state.context = str(kwargs.get("context", "") or "")
+            state._raw_decoded = ""
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            self.decode_count += 1
+            state.language = "Chinese"
+            state.text = context_fragment if self.decode_count <= 2 else natural_text
+            state._raw_decoded = state.text
+            return state
+
+    decisions = iter((True, True, True, False, False, False))
+    decision_count = 0
+
+    def decide(**kwargs):
+        nonlocal decision_count
+        del kwargs
+        decision_count += 1
+        return next(decisions)
+
+    monkeypatch.setattr(demo_streaming_ws, "_should_skip_stream_decode", decide)
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: 0.0,
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    args = _args()
+    args.force_language = "Chinese"
+    args.asr_context_apply_mode = "streaming"
+    args.silent_decode_pre_roll_sec = 0.4
+    args.chunk_size_sec = 0.1
+    args.silero_vad_shadow = True
+    args.silero_vad_shadow_threshold = 0.5
+    args.silero_vad_shadow_log_sec = 1.0
+    args.final_redecode_on_stop = False
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "resume-context-trace.jsonl")
+    fake_asr = ResumeContextASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "language": "Chinese",
+                "asr_context_terms": context_terms,
+            }
+        )
+        _receive_until_type(ws, "started")
+        frame = np.resize(np.array([100, 200, 300], dtype="<i2"), 640).tobytes()
+        for expected_count in range(1, 4):
+            ws.send_bytes(frame)
+            deadline = time.time() + 1.0
+            while decision_count < expected_count and time.time() < deadline:
+                time.sleep(0.01)
+            assert decision_count >= expected_count
+
+        ws.send_bytes(frame)
+        deadline = time.time() + 1.0
+        while fake_asr.decode_count < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        assert fake_asr.decode_count >= 1
+
+        time.sleep(args.chunk_size_sec + 0.05)
+        ws.send_bytes(frame)
+        deadline = time.time() + 1.0
+        while fake_asr.decode_count < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert fake_asr.decode_count >= 2
+
+        ws.send_bytes(frame)
+        partial = _receive_until_type(ws, "partial")
+
+    assert partial["text"] == natural_text
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    quarantined = [
+        row for row in trace_rows if row.get("event") == "asr_context_resume_partial_quarantined"
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0]["text_chars"] == len(context_fragment)
+    assert context_fragment not in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8")
+
+
+def test_ws_discards_context_fragment_if_hard_cut_finalizes_silent_resume(
+    monkeypatch,
+    tmp_path,
+):
+    context_terms = ["尼希米", "城墙", "羊门", "粪门", "祭司", "圣经"]
+    context_fragment = "所以说，城墙、羊门、粪门。"
+    natural_text = "这是此前已经听到的正常语音。"
+
+    class FinalizeContextASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.decode_count = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            state.context = str(kwargs.get("context", "") or "")
+            state._raw_decoded = ""
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            self.decode_count += 1
+            state.language = "Chinese"
+            state.text = natural_text if self.decode_count == 1 else context_fragment
+            state._raw_decoded = state.text
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            state.text = context_fragment
+            state._raw_decoded = state.text
+            return state
+
+    decisions = iter((False, True, True, True, False))
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "_should_skip_stream_decode",
+        lambda **kwargs: next(decisions),
+    )
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: 0.0,
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    args = _args()
+    args.force_language = "Chinese"
+    args.asr_context_apply_mode = "streaming"
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.silent_decode_pre_roll_sec = 0.4
+    args.chunk_size_sec = 0.1
+    args.silero_vad_shadow = True
+    args.silero_vad_shadow_threshold = 0.5
+    args.silero_vad_shadow_log_sec = 1.0
+    args.final_redecode_on_stop = False
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "resume-context-finalize-trace.jsonl")
+    fake_asr = FinalizeContextASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "language": "Chinese",
+                "asr_context_terms": context_terms,
+            }
+        )
+        _receive_until_type(ws, "started")
+        frame = np.resize(np.array([100, 200, 300], dtype="<i2"), 640).tobytes()
+        ws.send_bytes(frame)
+        assert _receive_until_type(ws, "partial")["text"] == natural_text
+        for _ in range(3):
+            ws.send_bytes(frame)
+            time.sleep(0.02)
+        time.sleep(1.1)
+        ws.send_bytes(frame)
+
+        deadline = time.time() + 2.0
+        while fake_asr.finish_calls < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        assert fake_asr.finish_calls >= 1
+        ws.send_json({"type": "ping"})
+        events = []
+        while True:
+            event = ws.receive_json()
+            events.append(event)
+            if event.get("type") == "pong":
+                break
+
+    committed = [
+        str(event.get("text", "") or "").strip()
+        for event in events
+        if event.get("type") == "sentence_committed"
+    ]
+    assert context_fragment not in committed
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    discarded = [
+        row for row in trace_rows if row.get("event") == "asr_context_silent_segment_discarded"
+    ]
+    assert len(discarded) == 1
+    assert discarded[0]["text_hash8"] == hashlib.md5(context_fragment.encode("utf-8")).hexdigest()[:8]
+    assert discarded[0]["fallback_snapshot_used"] is True
+    assert discarded[0]["fallback_snapshot_hash8"] == hashlib.md5(
+        natural_text.encode("utf-8")
+    ).hexdigest()[:8]
+    finalized = [row for row in trace_rows if row.get("event") == "segment_finalize_done"]
+    assert len(finalized) == 1
+    assert finalized[0]["final_text_chars"] == len(natural_text)
+
+
+def test_ws_discards_context_fragment_if_stop_finalizes_silent_resume(
+    monkeypatch,
+    tmp_path,
+):
+    context_terms = ["尼希米", "城墙", "羊门", "粪门", "祭司", "圣经"]
+    context_fragment = "所以说，城墙、羊门、粪门。"
+
+    class StopContextASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.decode_count = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            state.context = str(kwargs.get("context", "") or "")
+            state._raw_decoded = ""
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            self.decode_count += 1
+            state.language = "Chinese"
+            state.text = context_fragment
+            state._raw_decoded = state.text
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            state.text = context_fragment
+            state._raw_decoded = state.text
+            return state
+
+    decisions = iter((True, True, True, False))
+    decision_count = 0
+
+    def decide(**kwargs):
+        nonlocal decision_count
+        del kwargs
+        decision_count += 1
+        return next(decisions)
+
+    monkeypatch.setattr(demo_streaming_ws, "_should_skip_stream_decode", decide)
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: 0.0,
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    args = _args()
+    args.force_language = "Chinese"
+    args.asr_context_apply_mode = "streaming"
+    args.silent_decode_pre_roll_sec = 0.4
+    args.chunk_size_sec = 0.1
+    args.silero_vad_shadow = True
+    args.silero_vad_shadow_threshold = 0.5
+    args.silero_vad_shadow_log_sec = 1.0
+    args.final_redecode_on_stop = False
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "resume-context-stop-trace.jsonl")
+    fake_asr = StopContextASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "language": "Chinese",
+                "asr_context_terms": context_terms,
+            }
+        )
+        _receive_until_type(ws, "started")
+        frame = np.resize(np.array([100, 200, 300], dtype="<i2"), 640).tobytes()
+        for expected_count in range(1, 4):
+            ws.send_bytes(frame)
+            deadline = time.time() + 1.0
+            while decision_count < expected_count and time.time() < deadline:
+                time.sleep(0.01)
+            assert decision_count >= expected_count
+        ws.send_bytes(frame)
+        deadline = time.time() + 1.0
+        while fake_asr.decode_count < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        assert fake_asr.decode_count >= 1
+
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    final = next(event for event in events if event.get("type") == "final")
+    assert final["text"] == ""
+    assert context_fragment not in str(final.get("committed_text", "") or "")
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    discarded = [
+        row for row in trace_rows if row.get("event") == "asr_context_silent_segment_discarded"
+    ]
+    assert len(discarded) == 1
+    assert discarded[0]["reason"] == "stop"
+    assert discarded[0]["fallback_snapshot_used"] is False
+
+
+def test_ws_silero_shadow_writes_observations_without_controlling_asr(monkeypatch, tmp_path):
+    trace_path = tmp_path / "silero-shadow.jsonl"
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: 0.8,
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    args = _args()
+    args.silero_vad_shadow = True
+    args.silero_vad_shadow_threshold = 0.5
+    args.silero_vad_shadow_log_sec = 1.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+    args.subtitle_trace_log_partial_every = 20
+
+    with TestClient(_create_app(args, _FakeASR())).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_bytes(np.full(512, 20_000, dtype="<i2").tobytes())
+        partial = _receive_until_type(ws, "partial")
+
+    assert partial["type"] == "partial"
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    by_event = {row["event"]: row for row in rows}
+    assert by_event["silero_shadow_ready"]["control_mode"] == "observe_only"
+    assert by_event["silero_shadow_observation"]["probability"] == 0.8
+    assert by_event["silero_shadow_observation"]["control_mode"] == "observe_only"
+
+
+def test_ws_silero_shadow_load_failure_keeps_asr_available(monkeypatch, tmp_path):
+    trace_path = tmp_path / "silero-shadow-load-failure.jsonl"
+
+    def fail_to_load(*, threshold):
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(demo_streaming_ws, "create_silero_onnx_observer", fail_to_load)
+    args = _args()
+    args.silero_vad_shadow = True
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+
+    with TestClient(_create_app(args, _FakeASR())).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_bytes(np.full(512, 20_000, dtype="<i2").tobytes())
+        partial = _receive_until_type(ws, "partial")
+
+    assert partial["type"] == "partial"
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    unavailable = [row for row in rows if row["event"] == "silero_shadow_unavailable"]
+    assert unavailable
+    assert unavailable[0]["phase"] == "load"
+    assert unavailable[0]["error_type"] == "RuntimeError"
 
 
 def test_auth_disabled_keeps_http_and_websocket_access_open():
@@ -828,16 +1265,30 @@ def test_segment_finalization_seals_tts_after_final_reconciliation():
     assert reconcile_pos < seal_pos < reset_pos
 
 
-def test_ws_segment_seals_newest_tts_source_without_global_delay(tmp_path):
+def test_ws_rollback_safe_source_avoids_global_grace_and_hardcut_tail_waits_for_finish(tmp_path):
     class _TwoSentenceSegmentASR(_FakeASR):
         sentences = (
             "这是第一句已经稳定完成并且长度足够。",
             "这是第二句已经稳定完成并且长度足够。",
         )
 
+        def __init__(self):
+            super().__init__()
+            self.segment_no = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            self.segment_no += 1
+            state.segment_no = self.segment_no
+            return state
+
         def streaming_transcribe(self, wav, state):
             state.language = "Chinese"
-            state.text = "".join(self.sentences)
+            state.text = (
+                "".join(self.sentences)
+                if state.segment_no <= 2
+                else self.sentences[1]
+            )
             state.audio_accum = np.concatenate(
                 [state.audio_accum, np.asarray(wav, dtype=np.float32)]
             )
@@ -846,7 +1297,11 @@ def test_ws_segment_seals_newest_tts_source_without_global_delay(tmp_path):
         def finish_streaming_transcribe(self, state):
             self.finish_calls += 1
             state.language = "Chinese"
-            state.text = "".join(self.sentences)
+            state.text = (
+                "".join(self.sentences)
+                if state.segment_no <= 2
+                else self.sentences[1]
+            )
             return state
 
     args = _args()
@@ -886,17 +1341,21 @@ def test_ws_segment_seals_newest_tts_source_without_global_delay(tmp_path):
         time.sleep(1.1)
         ws.send_bytes(frame)
         jobs = list(released_before_cut)
-        for _ in range(40):
-            ws.send_json({"type": "ping"})
-            _receive_until_type(ws, "pong")
-            jobs.extend(
-                event
-                for event in _drain_listener_events(listener)
-                if event.get("type") == "tts_job"
-            )
-            if len(jobs) >= 2:
-                break
-            time.sleep(0.02)
+        _receive_until_type(ws, "partial")
+        jobs.extend(
+            event
+            for event in _drain_listener_events(listener)
+            if event.get("type") == "tts_job"
+        )
+        assert [event["source_order"] for event in jobs] == [0]
+
+        ws.send_json({"type": "finish", "mode": "stop"})
+        _collect_through_final(ws)
+        jobs.extend(
+            event
+            for event in _drain_listener_events(listener)
+            if event.get("type") == "tts_job"
+        )
 
     assert [event["source_order"] for event in jobs] == [0, 1]
     trace_rows = [
@@ -909,7 +1368,7 @@ def test_ws_segment_seals_newest_tts_source_without_global_delay(tmp_path):
         for row in trace_rows
         if row.get("event") == "tts_stability_release"
     ]
-    assert "source_sealed" in release_reasons
+    assert release_reasons == ["rollback_safe", "final_force"]
 
 
 def test_ws_translation_direction_change_discards_pending_tts():
@@ -1114,12 +1573,23 @@ def test_ws_tts_canonical_stop_redecode_does_not_repeat_issued_sentences():
 
 
 def test_ws_tts_toggle_does_not_replay_earlier_sentences_at_stop():
+    class _RollbackSafeTTSSentenceASR(_StableTTSSentenceASR):
+        def streaming_transcribe(self, wav, state):
+            state.language = "Chinese"
+            state.text = f"{''.join(self.sentences)}后续内容正在生成"
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            return state
+
     args = _args()
     args.final_redecode_on_stop = True
     args.final_redecode_max_sec = 30.0
     args.translation_workers = 3
     args.tts_final_translation_drain_sec = 2.0
-    asr = _StableTTSSentenceASR()
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 1
+    asr = _RollbackSafeTTSSentenceASR()
     asr.transcribe_language = "Chinese"
     asr.transcribe_text = "".join(asr.sentences)
     app = _create_app(
@@ -1140,8 +1610,15 @@ def test_ws_tts_toggle_does_not_replay_earlier_sentences_at_stop():
             }
         )
         _receive_until_type(ws, "started")
-        ws.send_bytes(np.array([0, 1000, -1000], dtype="<i2").tobytes())
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
         events = []
+        for _ in range(2):
+            ws.send_bytes(raw)
+            while True:
+                event = ws.receive_json()
+                events.append(event)
+                if event.get("type") == "partial":
+                    break
         while len([event for event in events if event.get("type") == "tts_job"]) < 3:
             events.append(ws.receive_json())
 
@@ -1443,6 +1920,7 @@ def test_ws_transformers_mode_applies_session_context_to_final_decode():
     fake_asr = _FakeASR()
     args = _args()
     args.backend = "transformers"
+    args.asr_context_apply_mode = "segment_final"
     app = _create_app(args, fake_asr)
     client = TestClient(app)
 
@@ -1947,7 +2425,87 @@ def test_ws_keeps_spoken_context_terms_when_they_grow_incrementally(tmp_path):
     assert fake_asr.last_state._raw_decoded == spoken
 
 
-def test_ws_applies_context_once_to_complete_segment_by_default(tmp_path):
+def test_ws_drops_consecutive_streaming_context_terms_before_commit_translation_and_tts(
+    tmp_path,
+):
+    context_terms = ["Alpha", "Beta", "Gamma", "Delta"]
+    contaminated = (
+        "This uncertain sentence contains enough unrelated words before Alpha Beta Gamma."
+    )
+    natural = "This normal sentence remains available for translation and speech output."
+
+    class ConsecutiveContextRunASR(_FakeASR):
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            state.context = str(kwargs.get("context", "") or "")
+            state._raw_decoded = ""
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            state.language = "English"
+            state.text = f"{contaminated} {natural}"
+            state._raw_decoded = state.text
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            return state
+
+    trace_path = tmp_path / "streaming-context-commit-gate.jsonl"
+    fake_asr = ConsecutiveContextRunASR()
+    translator = _FakeTranslator()
+    args = _args()
+    args.force_language = "English"
+    args.asr_context_apply_mode = "streaming"
+    args.final_redecode_on_stop = False
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+    app = _create_app(
+        args,
+        fake_asr,
+        translator=translator,
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "language": "English",
+                "asr_context_terms": context_terms,
+                "tts_enabled": True,
+                "tts_client_id": "context-gate-client",
+            }
+        )
+        _receive_until_type(ws, "started")
+        ws.send_bytes(np.array([0, 1200, -1200] * 320, dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    committed = [event["text"] for event in events if event.get("type") == "sentence_committed"]
+    translated_sources = [call[0] for call in translator.calls]
+    tts_jobs = [event for event in events if event.get("type") == "tts_job"]
+    trace_rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert fake_asr.init_calls[-1]["context"] == " ".join(context_terms)
+    assert contaminated not in committed
+    assert contaminated not in translated_sources
+    assert natural in committed
+    assert natural in translated_sources
+    assert len(tts_jobs) == 1
+    assert any(row.get("event") == "context_run_commit_dropped" for row in trace_rows)
+
+
+def test_ws_segment_final_mode_applies_context_once_to_complete_segment(tmp_path):
     schedule_path = tmp_path / "context.json"
     schedule_path.write_text(
         json.dumps(
@@ -1971,6 +2529,7 @@ def test_ws_applies_context_once_to_complete_segment_by_default(tmp_path):
     args.asr_context_max_terms = 24
     args.asr_context_max_chars = 160
     args.asr_context_lookaround_sec = 0.0
+    args.asr_context_apply_mode = "segment_final"
     args.segment_hard_cut_sec = 1.0
     args.segment_overlap_sec = 0.0
     args.final_redecode_on_stop = False
@@ -1999,6 +2558,81 @@ def test_ws_applies_context_once_to_complete_segment_by_default(tmp_path):
     segment_audio = fake_asr.transcribe_calls[0]["audio"][0][0]
     assert isinstance(segment_audio, np.ndarray)
     assert segment_audio.size > 0
+
+
+def test_segment_context_redecode_rejects_unsubstantiated_glossary_fragment(tmp_path):
+    context_terms = ["尼希米", "城墙", "羊门", "粪门", "祭司", "圣经"]
+    context_fragment = "所以说，城墙、羊门、粪门。"
+    natural_text = "让我们来赞美他，让我们来敬拜他。"
+
+    class FragmentEchoASR(_FakeASR):
+        def streaming_transcribe(self, wav, state):
+            state.audio_accum = np.concatenate(
+                [state.audio_accum, np.asarray(wav, dtype=np.float32)]
+            )
+            state.language = "Chinese"
+            state.text = natural_text
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            state.text = natural_text
+            return state
+
+        def transcribe(self, audio, context="", language=None):
+            self.transcribe_text = context_fragment if context else natural_text
+            self.transcribe_language = "Chinese"
+            return super().transcribe(audio, context=context, language=language)
+
+    trace_path = tmp_path / "segment-context-fragment.jsonl"
+    fake_asr = FragmentEchoASR()
+    fake_asr.sampling_params = SimpleNamespace(max_tokens=32)
+    args = _args()
+    args.force_language = "Chinese"
+    args.asr_context_apply_mode = "segment_final"
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.final_redecode_on_stop = False
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "start",
+                "language": "Chinese",
+                "asr_context_terms": context_terms,
+            }
+        )
+        _receive_until_type(ws, "started")
+        raw = np.array([0, 1200, -1200] * 2400, dtype="<i2").tobytes()
+        ws.send_bytes(raw)
+        assert _receive_until_type(ws, "partial")["text"] == natural_text
+        time.sleep(1.1)
+        ws.send_bytes(raw)
+        deadline = time.time() + 2.0
+        while not fake_asr.transcribe_calls and time.time() < deadline:
+            time.sleep(0.02)
+        assert fake_asr.transcribe_calls
+
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events = _collect_through_final(ws)
+
+    assert all(context_fragment not in str(event.get("text", "") or "") for event in events)
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rejected = [
+        row
+        for row in rows
+        if row.get("event") == "asr_context_final_redecode_skipped"
+        and row.get("reason") == "context_fragment_echo"
+    ]
+    assert rejected
 
 
 def test_ws_keeps_stop_redecode_when_schedule_does_not_match_language(tmp_path):
@@ -2072,6 +2706,7 @@ def test_segment_context_lexical_correction_updates_sentence_and_translation(tmp
     args = _args()
     args.force_language = "English"
     args.asr_context_schedule = str(schedule_path)
+    args.asr_context_apply_mode = "segment_final"
     args.segment_hard_cut_sec = 1.0
     args.segment_overlap_sec = 0.0
     args.final_redecode_on_stop = False
@@ -2149,6 +2784,7 @@ def test_segment_context_correction_does_not_recommit_covered_sentences(tmp_path
     args = _args()
     args.force_language = "English"
     args.asr_context_schedule = str(schedule_path)
+    args.asr_context_apply_mode = "segment_final"
     args.segment_hard_cut_sec = 1.0
     args.segment_overlap_sec = 0.0
     args.final_redecode_on_stop = False
@@ -2203,6 +2839,7 @@ def test_new_start_resets_segment_context_application_state(tmp_path):
     args = _args()
     args.force_language = "Chinese"
     args.asr_context_schedule = str(schedule_path)
+    args.asr_context_apply_mode = "segment_final"
     args.segment_hard_cut_sec = 1.0
     args.segment_overlap_sec = 0.0
     args.final_redecode_on_stop = True
@@ -2268,6 +2905,7 @@ def test_stale_context_correction_cannot_mark_restarted_session(tmp_path):
     args = _args()
     args.force_language = "Chinese"
     args.asr_context_schedule = str(schedule_path)
+    args.asr_context_apply_mode = "segment_final"
     args.segment_hard_cut_sec = 1.0
     args.segment_overlap_sec = 0.0
     args.final_redecode_on_stop = True
@@ -2320,6 +2958,7 @@ def test_stop_segment_context_correction_is_not_overwritten_by_full_redecode(tmp
     args = _args()
     args.force_language = "English"
     args.asr_context_schedule = str(schedule_path)
+    args.asr_context_apply_mode = "segment_final"
     args.final_redecode_on_stop = True
     args.final_redecode_max_sec = 30.0
     app = _create_app(args, fake_asr)
@@ -2378,6 +3017,7 @@ def test_unchanged_stop_context_result_keeps_context_free_final_redecode(tmp_pat
     args = _args()
     args.force_language = "English"
     args.asr_context_schedule = str(schedule_path)
+    args.asr_context_apply_mode = "segment_final"
     args.final_redecode_on_stop = True
     args.final_redecode_max_sec = 30.0
     app = _create_app(args, fake_asr)
@@ -2665,7 +3305,7 @@ def test_ws_sentence_events_explicitly_mark_solidified_text_as_stable():
         assert committed["stability"]["reason"] == "sentence_committed"
 
 
-def test_ws_early_translates_stable_newest_completed_sentence_without_waiting_for_next_sentence():
+def test_ws_keeps_stable_terminal_hypothesis_tentative_without_rollback_safe_lookahead():
     class _StableSingleSentenceASR(_FakeASR):
         def streaming_transcribe(self, wav, state):
             assert isinstance(wav, np.ndarray)
@@ -2680,23 +3320,214 @@ def test_ws_early_translates_stable_newest_completed_sentence_without_waiting_fo
     app = _create_app(args, _StableSingleSentenceASR(), translator=translator)
     client = TestClient(app)
 
+    events = []
     with client.websocket_connect("/ws") as ws:
         ws.receive_json()  # ready
         raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
 
-        ws.send_bytes(raw)
-        first_partial = _receive_until_type(ws, "partial")
-        assert first_partial["type"] == "partial"
-        assert first_partial["tentative_text"] == "这是一个已经稳定完成并且长度足够的句子。"
+        for _ in range(4):
+            ws.send_bytes(raw)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    assert message["tentative_text"] == "这是一个已经稳定完成并且长度足够的句子。"
+                    break
 
-        ws.send_bytes(raw)
-        committed = ws.receive_json()
-        assert committed["type"] == "sentence_committed"
-        assert committed["text"] == "这是一个已经稳定完成并且长度足够的句子。"
-        tr = _receive_until_type(ws, "sentence_translation")
-        assert tr["translation"].startswith("[Chinese->English]")
+    assert [message for message in events if message.get("type") == "sentence_committed"] == []
+    assert [message for message in events if message.get("type") == "sentence_translation"] == []
+    assert translator.calls == []
 
-    assert translator.calls
+
+def test_ws_early_translates_sentence_after_rollback_safe_lookahead(tmp_path):
+    sentence = "这是一个已经稳定完成并且长度足够的句子。"
+    lookahead = "后续内容正在生成"
+
+    class _StableSentenceWithLookaheadASR(_FakeASR):
+        def streaming_transcribe(self, wav, state):
+            assert isinstance(wav, np.ndarray)
+            state.language = "Chinese"
+            state.text = f"{sentence}{lookahead}"
+            return state
+
+    args = _args()
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 2
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "rollback-safe-early-commit.jsonl")
+    translator = _FakeTranslator()
+    app = _create_app(args, _StableSentenceWithLookaheadASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        for _ in range(2):
+            ws.send_bytes(raw)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+
+    commits = [message for message in events if message.get("type") == "sentence_committed"]
+    assert [message.get("text") for message in commits] == [sentence]
+    assert [call[0] for call in translator.calls] == [sentence]
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    promoted = [row for row in trace_rows if row.get("event") == "early_translation_stable_commit"]
+    assert len(promoted) == 1
+    assert promoted[0]["rollback_safe"] is True
+    assert int(promoted[0]["lookahead_tokens"]) >= int(promoted[0]["required_lookahead_tokens"])
+
+
+def test_ws_commits_long_comma_text_as_rollback_safe_clauses_without_cutting_asr(tmp_path):
+    text = (
+        "一个在南边的家，一个在 P C C 的教会，另外一个家在 P C C O 的家，"
+        "都是神托付给我看管的家，我有责任看顾家人的灵命成长，"
+        "我也有责任看顾两个儿子与神的关系，但是最重要的是，"
+        "我在教会中也有责任看管神所托付给我的羊，我也需要帮助牧者，"
+        "我也需要分担他们的责任，所以刚开始必须建立好自己属灵的家"
+    )
+
+    class _LongCommaASR(_FakeASR):
+        def streaming_transcribe(self, wav, state):
+            assert isinstance(wav, np.ndarray)
+            state.language = "Chinese"
+            state.text = text
+            return state
+
+    args = _args()
+    args.stable_clause_target_cjk_chars = 32
+    args.stable_clause_target_latin_words = 24
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "stable-clause.jsonl")
+    translator = _FakeTranslator()
+    app = _create_app(args, _LongCommaASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        for _ in range(2):
+            ws.send_bytes(raw)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+
+    commits = [message for message in events if message.get("type") == "sentence_committed"]
+    assert len(commits) >= 2
+    assert all(message["text"].endswith(("，", "；", "：")) for message in commits)
+    assert all(message.get("boundary_kind") == "stable_clause" for message in commits)
+    assert [call[0] for call in translator.calls] == [message["text"] for message in commits]
+
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    committed_rows = [row for row in trace_rows if row.get("event") == "sentence_new_commit"]
+    assert committed_rows
+    assert all(row.get("rollback_safe") is True for row in committed_rows)
+    assert all(row.get("boundary_kind") == "stable_clause" for row in committed_rows)
+    assert not [row for row in trace_rows if row.get("event") == "segment_cut_decision"]
+
+
+def test_ws_holds_stable_clause_until_following_text_exits_rollback_window(tmp_path):
+    clause = f"{'甲' * 32}，"
+    short_following = "后续。"
+    safe_following = "后续内容已经足够。"
+
+    class _GrowingLookaheadASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def streaming_transcribe(self, wav, state):
+            assert isinstance(wav, np.ndarray)
+            self.calls += 1
+            state.language = "Chinese"
+            following = short_following if self.calls <= 3 else safe_following
+            state.text = f"{clause}{following}"
+            return state
+
+    args = _args()
+    args.stable_clause_target_cjk_chars = 32
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "stable-clause-lookahead.jsonl")
+    translator = _FakeTranslator()
+    app = _create_app(args, _GrowingLookaheadASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        for call_no in range(5):
+            ws.send_bytes(raw)
+            while True:
+                message = ws.receive_json()
+                events.append((call_no, message))
+                if message.get("type") == "partial":
+                    break
+
+    commits = [
+        (call_no, message)
+        for call_no, message in events
+        if message.get("type") == "sentence_committed"
+    ]
+    assert commits
+    assert commits[0][0] >= 3
+    assert commits[0][1]["text"] == clause
+    assert [call[0] for call in translator.calls] == [clause]
+
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    waits = [row for row in trace_rows if row.get("event") == "stable_clause_rollback_wait"]
+    assert waits
+    assert all(int(row.get("lookahead_tokens", 0)) < 5 for row in waits)
+    committed = [row for row in trace_rows if row.get("event") == "sentence_new_commit"]
+    assert committed[0]["rollback_safe"] is True
+
+
+def test_ws_does_not_early_translate_sentence_inside_rollback_window():
+    sentence = "这是一个已经稳定完成并且长度足够的句子。"
+    lookahead = "后续"
+
+    class _SentenceInsideRollbackWindowASR(_FakeASR):
+        def streaming_transcribe(self, wav, state):
+            assert isinstance(wav, np.ndarray)
+            state.language = "Chinese"
+            state.text = f"{sentence}{lookahead}"
+            return state
+
+    args = _args()
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 2
+    translator = _FakeTranslator()
+    app = _create_app(args, _SentenceInsideRollbackWindowASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
+        for _ in range(4):
+            ws.send_bytes(raw)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+
+    assert [message for message in events if message.get("type") == "sentence_committed"] == []
+    assert translator.calls == []
 
 
 def test_ws_does_not_early_commit_short_english_completed_sentence():
@@ -2733,14 +3564,15 @@ def test_ws_does_not_early_commit_short_english_completed_sentence():
     assert seen[-1]["tentative_text"] == "The Short Session Topic."
 
 
-def test_ws_early_translates_stable_short_english_terminal_sentence(tmp_path):
+def test_ws_early_translates_stable_short_english_after_rollback_safe_lookahead(tmp_path):
     sentence = "The Short Session Topic."
+    lookahead = " Follow up"
 
     class _ShortEnglishASR(_FakeASR):
         def streaming_transcribe(self, wav, state):
             assert isinstance(wav, np.ndarray)
             state.language = "English"
-            state.text = sentence
+            state.text = f"{sentence}{lookahead}"
             return state
 
     args = _args()
@@ -3338,26 +4170,30 @@ def test_ws_updates_committed_sentence_after_model_corrects_its_tail():
 
     committed = []
     updated = []
+    latest_by_id = {}
     partials = []
     with client.websocket_connect("/ws") as ws:
         ws.receive_json()  # ready
         raw = np.array([0, 1000, -1000], dtype="<i2").tobytes()
-        for _ in range(3):
+        for _ in range(4):
             ws.send_bytes(raw)
             while True:
                 msg = ws.receive_json()
                 if msg["type"] == "sentence_committed":
                     committed.append(msg["text"])
+                    latest_by_id[str(msg.get("sentence_id", ""))] = str(msg["text"])
                     continue
                 if msg["type"] == "sentence_updated":
                     updated.append(msg["text"])
+                    latest_by_id[str(msg.get("sentence_id", ""))] = str(msg["text"])
                     continue
                 if msg["type"] == "partial":
                     partials.append(msg)
                     break
 
-    assert asr.s2_old in committed
-    assert asr.s2_new in updated
+    assert asr.s2_old.replace(" ", "") in "".join(committed).replace(" ", "")
+    assert updated
+    assert asr.s2_new.replace(" ", "") in "".join(latest_by_id.values()).replace(" ", "")
     assert partials[-1]["tentative_text"] == asr.s3
 
 
@@ -3902,6 +4738,259 @@ def test_ws_hard_cut_carries_unfinished_tail_to_next_segment():
     assert "第一句不完整继续补全成句。" in str(final_msg.get("committed_text", ""))
 
 
+def test_ws_mid_speech_hard_cut_holds_terminal_hypothesis_for_continuation(tmp_path):
+    prior = "感谢赞美主，奉靠我主基督。"
+    continuation = "得胜的名求，Amen。"
+    following = "现在开始下一段完整内容。"
+
+    class _MidSpeechHardCutASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.segment_no = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            self.segment_no += 1
+            state.segment_no = self.segment_no
+            state.segment_calls = 0
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.language = "Chinese"
+            state.segment_calls += 1
+            if state.segment_no == 1:
+                state.text = prior
+            elif state.segment_calls <= 2:
+                state.text = continuation
+            else:
+                state.text = f"{continuation}{following}"
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            return state
+
+    translator = _FakeTranslator()
+    args = _args()
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.final_redecode_on_stop = False
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 2
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "mid-speech-hard-cut.jsonl")
+    app = _create_app(args, _MidSpeechHardCutASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        frame = np.array([0, 1200, -1200] * 2400, dtype="<i2").tobytes()
+        ws.send_bytes(frame)
+        _receive_until_type(ws, "partial")
+        time.sleep(1.1)
+        for _ in range(6):
+            ws.send_bytes(frame)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events.extend(_collect_through_final(ws))
+
+    source_texts = [call[0] for call in translator.calls]
+    combined = f"{prior.removesuffix('。')}{continuation}"
+    assert prior not in source_texts
+    assert continuation not in source_texts
+    assert combined in source_texts
+    committed = [
+        str(message.get("text", ""))
+        for message in events
+        if message.get("type") in {"sentence_committed", "sentence_updated"}
+    ]
+    assert combined in committed
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("event") == "hard_cut_mid_speech_tail_held" for row in trace_rows)
+
+
+def test_ws_mid_speech_hard_cut_waits_for_boundary_sentence_to_finish_growing(tmp_path):
+    prior = "那卖过房子的人都知道，最麻烦的地方就是。"
+    provisional = "我们要上市之前。"
+    corrected = "我们要上市之前，就是把这个房子准备好，才能上市。"
+    following_tail = "那我一直都以为自己会把房子整理得还不错"
+
+    class _GrowingBoundaryAfterHardCutASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.segment_no = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            self.segment_no += 1
+            state.segment_no = self.segment_no
+            state.segment_calls = 0
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.language = "Chinese"
+            state.segment_calls += 1
+            if state.segment_no == 1:
+                state.text = prior
+            elif state.segment_calls <= 4:
+                state.text = provisional
+            elif state.segment_calls <= 8:
+                state.text = corrected
+            else:
+                state.text = f"{corrected}{following_tail}"
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            return state
+
+    translator = _FakeTranslator()
+    args = _args()
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.final_redecode_on_stop = False
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 2
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "growing-hard-cut-boundary.jsonl")
+    app = _create_app(args, _GrowingBoundaryAfterHardCutASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        frame = np.array([0, 1200, -1200] * 2400, dtype="<i2").tobytes()
+        ws.send_bytes(frame)
+        _receive_until_type(ws, "partial")
+        time.sleep(1.1)
+        for _ in range(14):
+            ws.send_bytes(frame)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events.extend(_collect_through_final(ws))
+
+    provisional_combined = f"{prior.removesuffix('。')}{provisional}"
+    corrected_combined = f"{prior.removesuffix('。')}{corrected}"
+    source_texts = [call[0] for call in translator.calls]
+    assert provisional_combined not in source_texts
+    assert corrected_combined in "".join(source_texts)
+    committed = [
+        str(message.get("text", ""))
+        for message in events
+        if message.get("type") in {"sentence_committed", "sentence_updated"}
+    ]
+    assert corrected_combined in "".join(committed)
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("event") == "hard_cut_boundary_commit_wait" for row in trace_rows)
+
+
+def test_ws_hard_cut_keeps_alignment_when_boundary_punctuation_is_retracted(tmp_path):
+    prior = "那今天的经文在《尼希米记》第三章，我们知道尼希米终于回到。"
+    provisional = "耶路撒冷要重建这个城墙。"
+    provisional_with_tail = f"{provisional}从"
+    corrected = "耶路撒冷要重建这个城墙，重建这些门和塔楼。"
+    following = "那我们就看到复兴也是重建，重建也是复兴。"
+
+    class _RetractedBoundaryAfterHardCutASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.segment_no = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            self.segment_no += 1
+            state.segment_no = self.segment_no
+            state.segment_calls = 0
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.language = "Chinese"
+            state.segment_calls += 1
+            if state.segment_no == 1:
+                state.text = prior
+            elif state.segment_calls <= 2:
+                state.text = provisional
+            elif state.segment_calls <= 4:
+                state.text = provisional_with_tail
+            elif state.segment_calls <= 8:
+                state.text = corrected
+            else:
+                state.text = f"{corrected}{following}"
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            return state
+
+    translator = _FakeTranslator()
+    args = _args()
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.final_redecode_on_stop = False
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 2
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "retracted-hard-cut-boundary.jsonl")
+    app = _create_app(args, _RetractedBoundaryAfterHardCutASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        frame = np.array([0, 1200, -1200] * 2400, dtype="<i2").tobytes()
+        ws.send_bytes(frame)
+        _receive_until_type(ws, "partial")
+        time.sleep(1.1)
+        for _ in range(14):
+            ws.send_bytes(frame)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events.extend(_collect_through_final(ws))
+
+    prior_base = prior.removesuffix("。")
+    provisional_combined = f"{prior_base}{provisional}"
+    corrected_combined = f"{prior_base}{corrected}"
+    latest_by_id = {}
+    for message in events:
+        if message.get("type") in {"sentence_committed", "sentence_updated"}:
+            latest_by_id[str(message.get("sentence_id", ""))] = str(message.get("text", "")).strip()
+
+    assert provisional_combined not in latest_by_id.values()
+    assert corrected_combined in "".join(latest_by_id.values())
+    assert corrected_combined in "".join(call[0] for call in translator.calls)
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        row.get("event") == "pending_prefix_retained_for_candidate_alignment"
+        and row.get("carry_alignment") is True
+        for row in trace_rows
+    )
+
+
 def test_ws_hard_cut_keeps_terminal_prefix_separate_when_next_sentence_grows(tmp_path):
     prior = "She's a girl."
     initial_next = "Yes, so we have."
@@ -4096,6 +5185,7 @@ def test_ws_hard_cut_skips_recent_long_duplicate_from_next_segment(tmp_path):
         "to be considered a replay after a segment cut and should only be committed once."
     )
     followup = "The followup sentence is complete and distinct enough to be committed safely."
+    trailing = "Additional context continues beyond the stable boundary"
 
     class _DuplicateAfterCutASR(_FakeASR):
         def __init__(self):
@@ -4114,7 +5204,7 @@ def test_ws_hard_cut_skips_recent_long_duplicate_from_next_segment(tmp_path):
             if int(getattr(state, "segment_no", 1)) == 1:
                 state.text = duplicate
             else:
-                state.text = f"{duplicate} {followup}"
+                state.text = f"{duplicate} {followup} {trailing}"
             return state
 
         def finish_streaming_transcribe(self, state):
@@ -4151,6 +5241,7 @@ def test_ws_hard_cut_skips_recent_long_duplicate_from_next_segment(tmp_path):
         send_and_collect_partial()
 
         time.sleep(1.1)
+        send_and_collect_partial()
         send_and_collect_partial()
         send_and_collect_partial()
 

@@ -42,7 +42,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import uvicorn
@@ -55,6 +55,7 @@ from voxbridge.streaming.context_schedule import (
 )
 from voxbridge.streaming.segment_policy import SegmentPolicy
 from voxbridge.streaming.text_pool import dedup_segment_join, trim_prefix_overlap
+from voxbridge.streaming.vad_support import AudioPreRollBuffer, create_silero_onnx_observer
 from voxbridge.tts.broadcast import (
     TTSBroadcastHub,
     TTSBroadcastNotFound,
@@ -74,6 +75,7 @@ logger = logging.getLogger(__name__)
 SENTENCE_BOUNDARY_PATTERN = re.compile(
     r"[。！？!?…]+[\"'”’)\]）】》]*|\.+[\"'”’)\]）】》]*(?=\s|$|[\u3400-\u9fff])"
 )
+SOFT_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[,，;；:：][\"'”’)\]）】》]*")
 SENTENCE_CLOSER_CHARS = "\"'”’)]）】》"
 INITIALS_ABBREVIATION_PATTERN = re.compile(r"(?:\b[A-Za-z]\.){2,}$")
 MIN_CJK_SENTENCE_CHARS = 10
@@ -202,7 +204,7 @@ def _load_asr_context_schedule(args: argparse.Namespace) -> Optional[ContextSche
 
 
 def _normalize_asr_context_apply_mode(value: Any) -> str:
-    mode = str(value or "segment_final").strip().lower().replace("-", "_")
+    mode = str(value or "streaming").strip().lower().replace("-", "_")
     if mode not in {"segment_final", "streaming"}:
         raise ValueError(f"unsupported ASR context apply mode: {value!r}")
     return mode
@@ -268,6 +270,166 @@ def _looks_like_asr_context_echo(context: str, text: str, previous_text: str = "
         if 0.6 <= evidence_ratio <= 1.6 and evidence_similarity >= 0.55:
             return False
     return True
+
+
+def _looks_like_asr_context_fragment_echo(context: str, text: str) -> bool:
+    context_terms: List[str] = []
+    seen_terms: set[str] = set()
+    for raw_term in str(context or "").split():
+        compact_term = _compact_asr_compare_text(raw_term)
+        if len(compact_term) < 2 or compact_term in seen_terms:
+            continue
+        seen_terms.add(compact_term)
+        context_terms.append(compact_term)
+    if len(context_terms) < 3:
+        return False
+
+    text_compact = _compact_asr_compare_text(text)
+    if not text_compact:
+        return False
+
+    used_spans: List[Tuple[int, int]] = []
+    matched_terms = 0
+    matched_chars = 0
+    for compact_term in sorted(context_terms, key=len, reverse=True):
+        if _consume_unmatched_compact_occurrence(
+            text_compact,
+            compact_term,
+            used_spans,
+        ):
+            matched_terms += 1
+            matched_chars += len(compact_term)
+
+    if matched_terms < 3:
+        return False
+    return matched_chars / float(len(text_compact)) >= 0.5
+
+
+def _find_consecutive_context_term_run(
+    text: str,
+    terms: Sequence[str],
+    *,
+    minimum_terms: int = 3,
+) -> Optional[Tuple[int, int, int]]:
+    source = str(text or "")
+    required = max(1, int(minimum_terms))
+    normalized_terms: List[str] = []
+    seen: set[str] = set()
+    for raw_term in terms or ():
+        term = " ".join(str(raw_term or "").split())
+        key = term.casefold()
+        if not term or key in seen:
+            continue
+        seen.add(key)
+        normalized_terms.append(term)
+    if not source or len(normalized_terms) < 1:
+        return None
+
+    normalized_terms.sort(
+        key=lambda item: (len("".join(item.split())), len(item)),
+        reverse=True,
+    )
+
+    def _match_at(offset: int, term: str) -> Optional[int]:
+        cursor = int(offset)
+        chunks = term.split()
+        for chunk_index, chunk in enumerate(chunks):
+            end = cursor + len(chunk)
+            if source[cursor:end].casefold() != chunk.casefold():
+                return None
+            cursor = end
+            if chunk_index >= len(chunks) - 1:
+                continue
+            whitespace_start = cursor
+            while cursor < len(source) and source[cursor].isspace():
+                cursor += 1
+            if cursor == whitespace_start:
+                return None
+        return cursor
+
+    def _longest_match_at(offset: int) -> Optional[int]:
+        for term in normalized_terms:
+            end = _match_at(offset, term)
+            if end is not None:
+                return end
+        return None
+
+    best: Optional[Tuple[int, int, int]] = None
+    for start in range(len(source)):
+        first_end = _longest_match_at(start)
+        if first_end is None:
+            continue
+        cursor = int(first_end)
+        count = 1
+        while cursor < len(source):
+            while cursor < len(source) and source[cursor].isspace():
+                cursor += 1
+            next_end = _longest_match_at(cursor)
+            if next_end is None:
+                break
+            count += 1
+            cursor = int(next_end)
+        if count >= required and (best is None or count > best[2]):
+            best = (int(start), int(cursor), int(count))
+    return best
+
+
+def _contains_unsubstantiated_asr_context_fragment(
+    context: str,
+    text: str,
+    previous_text: str = "",
+) -> bool:
+    source = str(text or "").strip()
+    if not source:
+        return False
+
+    completed, tail = _split_sentences_and_tail(source)
+    candidates = [str(item or "").strip() for item in completed]
+    if str(tail or "").strip():
+        candidates.append(str(tail or "").strip())
+
+    previous_completed, previous_tail = _split_sentences_and_tail(previous_text)
+    previous_candidates = [str(item or "").strip() for item in previous_completed]
+    if str(previous_tail or "").strip():
+        previous_candidates.append(str(previous_tail or "").strip())
+
+    for candidate in candidates:
+        if not _looks_like_asr_context_fragment_echo(context, candidate):
+            continue
+        candidate_compact = _compact_asr_compare_text(candidate)
+        substantiated = False
+        for previous_candidate in previous_candidates:
+            previous_compact = _compact_asr_compare_text(previous_candidate)
+            if not previous_compact:
+                continue
+            length_ratio = len(previous_compact) / float(len(candidate_compact))
+            similarity = difflib.SequenceMatcher(
+                None,
+                previous_compact,
+                candidate_compact,
+            ).ratio()
+            if 0.6 <= length_ratio <= 1.6 and similarity >= 0.55:
+                substantiated = True
+                break
+        if not substantiated:
+            return True
+    return False
+
+
+def _should_quarantine_asr_context_resume_partial(
+    context: str,
+    text: str,
+    *,
+    guard_active: bool,
+    silero_available: bool,
+    speech_confirmed: bool,
+    fallback_window_active: bool,
+) -> bool:
+    if not guard_active or not _looks_like_asr_context_fragment_echo(context, text):
+        return False
+    if silero_available:
+        return not speech_confirmed
+    return fallback_window_active
 
 
 def _filter_asr_context_echo_sentences(
@@ -584,6 +746,99 @@ def _split_sentences_and_tail(text: str) -> Tuple[List[str], str]:
         tail = _join_segments([carry, tail]) if tail else carry
 
     return sentences, tail
+
+
+def _translation_unit_size(text: str, *, cjk: bool) -> int:
+    src = str(text or "")
+    if cjk:
+        return len(re.sub(r"\s+", "", src))
+    return len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", src))
+
+
+def _split_long_clause_text(text: str, *, target_size: int, cjk: bool) -> Tuple[List[str], str]:
+    src = str(text or "").strip()
+    if not src or target_size <= 0 or _translation_unit_size(src, cjk=cjk) <= target_size:
+        return [], src
+
+    completed: List[str] = []
+    start = 0
+    for match in SOFT_CLAUSE_BOUNDARY_PATTERN.finditer(src):
+        end = int(match.end())
+        prev_char = src[int(match.start()) - 1] if int(match.start()) > 0 else ""
+        next_char = src[end] if end < len(src) else ""
+        if str(match.group(0) or "").startswith(",") and prev_char.isdigit() and next_char.isdigit():
+            continue
+        candidate = src[start:end].strip()
+        candidate_size = _translation_unit_size(candidate, cjk=cjk)
+        if candidate_size < target_size:
+            continue
+        completed.append(candidate)
+        start = end
+
+    return completed, src[start:].strip()
+
+
+def _split_translation_units_and_tail(
+    text: str,
+    *,
+    target_cjk_chars: int = 32,
+    target_latin_words: int = 24,
+) -> Tuple[List[str], str]:
+    """Split long stable text at clause punctuation without rotating ASR state."""
+    sentences, tail = _split_sentences_and_tail(text)
+    completed: List[str] = []
+
+    for sentence in sentences:
+        use_cjk = _has_cjk(sentence)
+        target = int(target_cjk_chars if use_cjk else target_latin_words)
+        clauses, remainder = _split_long_clause_text(
+            sentence,
+            target_size=target,
+            cjk=use_cjk,
+        )
+        completed.extend(clauses)
+        if remainder:
+            completed.append(remainder)
+
+    if tail:
+        use_cjk = _has_cjk(tail)
+        target = int(target_cjk_chars if use_cjk else target_latin_words)
+        clauses, tail = _split_long_clause_text(
+            tail,
+            target_size=target,
+            cjk=use_cjk,
+        )
+        completed.extend(clauses)
+
+    return completed, tail
+
+
+def _translation_unit_boundary_kind(text: str) -> str:
+    src = str(text or "").strip()
+    if not src:
+        return "tail"
+    if any(end == len(src) for _, end, _ in _iter_sentence_boundaries(src, SENTENCE_BOUNDARY_PATTERN)):
+        return "sentence"
+    soft_matches = list(SOFT_CLAUSE_BOUNDARY_PATTERN.finditer(src))
+    if soft_matches and int(soft_matches[-1].end()) == len(src):
+        return "stable_clause"
+    return "tail"
+
+
+def _count_tokenizer_tokens(tokenizer: Any, text: str) -> Optional[int]:
+    src = str(text or "").strip()
+    if not src:
+        return 0
+    if tokenizer is None:
+        return None
+    try:
+        try:
+            token_ids = tokenizer.encode(src, add_special_tokens=False)
+        except TypeError:
+            token_ids = tokenizer.encode(src)
+        return max(0, int(len(token_ids)))
+    except Exception:
+        return None
 
 
 def _terminal_core(token: str) -> str:
@@ -986,6 +1241,19 @@ def _strip_short_english_fragment_period(
     ):
         return src
     return re.sub(r"\.[\"'”’)\]）】》]*$", "", src).strip()
+
+
+def _strip_terminal_boundary_for_continuation(text: str) -> str:
+    src = str(text or "").strip()
+    if not src:
+        return src
+    boundaries = list(_iter_sentence_boundaries(src, SENTENCE_BOUNDARY_PATTERN))
+    if not boundaries:
+        return src
+    start, end, _ = boundaries[-1]
+    if int(end) != len(src):
+        return src
+    return src[: int(start)].strip()
 
 
 def _trace_preview(text: str, max_chars: int = 72) -> str:
@@ -4480,6 +4748,7 @@ def _create_app(
         listener_queue_size=max(1, int(getattr(args, "tts_listener_queue_size", 128))),
     )
     app.state.tts_synthesizer = tts_synthesizer
+    asr_tokenizer = getattr(getattr(asr, "processor", None), "tokenizer", None)
     runtime = SimpleNamespace(active_connections=0)
     translator_accepts_direction = False
     if translator is not None:
@@ -4497,7 +4766,7 @@ def _create_app(
     asr_context_max_chars = max(0, int(getattr(args, "asr_context_max_chars", 160)))
     asr_context_lookaround_sec = max(0.0, float(getattr(args, "asr_context_lookaround_sec", 30.0)))
     asr_context_apply_mode = _normalize_asr_context_apply_mode(
-        getattr(args, "asr_context_apply_mode", "segment_final")
+        getattr(args, "asr_context_apply_mode", "streaming")
     )
     auth_sessions: Dict[str, float] = {}
 
@@ -4623,25 +4892,17 @@ def _create_app(
             max_chars=asr_context_max_chars,
         )
 
-    def _context_for(
-        force_language: Optional[str],
-        elapsed_sec: float,
-        session_context_terms: Optional[Tuple[str, ...]],
-    ) -> str:
-        return " ".join(
-            _context_terms_for(force_language, elapsed_sec, session_context_terms)
-        )
-
     def _new_vllm_state(
         force_language: Optional[str],
         elapsed_sec: float = 0.0,
         session_context_terms: Optional[Tuple[str, ...]] = None,
     ):
-        selected_context = _context_for(
+        selected_terms = _context_terms_for(
             force_language,
             elapsed_sec,
             session_context_terms,
         )
+        selected_context = " ".join(selected_terms)
         streaming_context = selected_context if asr_context_apply_mode == "streaming" else ""
         kwargs = dict(
             context=streaming_context,
@@ -4657,6 +4918,7 @@ def _create_app(
             "_voxbridge_final_context",
             selected_context if asr_context_apply_mode == "segment_final" else "",
         )
+        setattr(streaming_state, "_voxbridge_context_terms", tuple(selected_terms))
         setattr(streaming_state, "_voxbridge_context_elapsed_sec", float(elapsed_sec))
         return streaming_state
 
@@ -4665,16 +4927,18 @@ def _create_app(
         elapsed_sec: float = 0.0,
         session_context_terms: Optional[Tuple[str, ...]] = None,
     ):
-        selected_context = _context_for(
+        selected_terms = _context_terms_for(
             force_language,
             elapsed_sec,
             session_context_terms,
         )
+        selected_context = " ".join(selected_terms)
         return SimpleNamespace(
             audio_accum=np.zeros((0,), dtype=np.float32),
             language="",
             text="",
             force_language=force_language,
+            _voxbridge_context_terms=tuple(selected_terms),
             streaming_context=(
                 selected_context if asr_context_apply_mode == "streaming" else ""
             ),
@@ -5008,6 +5272,26 @@ def _create_app(
         segment_hard_cut_sec = max(1.0, float(getattr(args, "segment_hard_cut_sec", max(rollover_sec, 30.0) or 30.0)))
         segment_overlap_sec = max(0.0, float(getattr(args, "segment_overlap_sec", 0.8)))
         segment_overlap_samples = int(segment_overlap_sec * SAMPLE_RATE)
+        silent_decode_pre_roll_sec = max(
+            0.0,
+            float(getattr(args, "silent_decode_pre_roll_sec", 0.4)),
+        )
+        decode_pre_roll = AudioPreRollBuffer(
+            sample_rate=SAMPLE_RATE,
+            duration_sec=silent_decode_pre_roll_sec,
+        )
+        silero_shadow_enabled = bool(getattr(args, "silero_vad_shadow", False))
+        silero_shadow_threshold = min(
+            1.0,
+            max(0.0, float(getattr(args, "silero_vad_shadow_threshold", 0.5))),
+        )
+        silero_shadow_log_sec = max(
+            0.1,
+            float(getattr(args, "silero_vad_shadow_log_sec", 1.0)),
+        )
+        silero_shadow_observer = None
+        silero_shadow_last_log_at = 0.0
+        silero_shadow_last_disagreement: Optional[bool] = None
         queue_target_sec = max(0.2, float(getattr(args, "backpressure_target_queue_sec", 3.0)))
         queue_max_sec = max(queue_target_sec, float(getattr(args, "backpressure_max_queue_sec", 5.0)))
         total_consumed_samples = 0
@@ -5020,6 +5304,14 @@ def _create_app(
         full_audio_samples = 0
         full_audio_overflow = False
         segment_final_context_applied = False
+        context_resume_guard = SimpleNamespace(
+            active=False,
+            until=0.0,
+            skipped=0,
+            speech_confirmed=False,
+            silero_speech_samples=0,
+            last_text_hash8="",
+        )
         send_lock = asyncio.Lock()
         tts_transition_lock = asyncio.Lock()
         state_lock = asyncio.Lock()
@@ -5044,6 +5336,26 @@ def _create_app(
             1,
             int(getattr(args, "early_translation_min_english_chars", 32)),
         )
+        early_translation_required_lookahead_tokens = max(
+            1,
+            int(getattr(args, "unfixed_token_num", 5)),
+        )
+        stable_clause_target_cjk_chars = max(
+            0,
+            int(getattr(args, "stable_clause_target_cjk_chars", 32)),
+        )
+        stable_clause_target_latin_words = max(
+            0,
+            int(getattr(args, "stable_clause_target_latin_words", 24)),
+        )
+
+        def _split_subtitle_units(text: str) -> Tuple[List[str], str]:
+            return _split_translation_units_and_tail(
+                text,
+                target_cjk_chars=int(stable_clause_target_cjk_chars),
+                target_latin_words=int(stable_clause_target_latin_words),
+            )
+
         last_text_snapshot = ""
         last_text_advance_at = time.monotonic()
         last_idle_commit_at = 0.0
@@ -5147,6 +5459,7 @@ def _create_app(
             pending_prefix_miss_count=0,
             pending_prefix_terminal_text="",
             pending_prefix_is_separate=False,
+            pending_prefix_retain_for_alignment=False,
             boundary_anchor_text="",
             boundary_anchor_segment_id=0,
             boundary_overlap_cap_chars=max(4, min(24, int(round(segment_overlap_sec * 14.0)))),
@@ -5174,6 +5487,7 @@ def _create_app(
         def _clear_pending_prefix_boundary_evidence() -> None:
             subtitle_state.pending_prefix_terminal_text = ""
             subtitle_state.pending_prefix_is_separate = False
+            subtitle_state.pending_prefix_retain_for_alignment = False
 
         def _reset_completed_candidate_cursor() -> None:
             subtitle_state.processed_completed_count = 0
@@ -5216,6 +5530,39 @@ def _create_app(
                 merged.append(text)
                 backfilled += 1
             return merged, int(backfilled)
+
+        def _remap_completed_cursor_after_resegmentation(
+            completed: List[str],
+            processed_count: int,
+        ) -> int:
+            count = max(0, int(processed_count))
+            candidate_texts = list(getattr(subtitle_state, "candidate_texts", []) or [])
+            if count <= 0 or count > len(candidate_texts) or count >= len(completed):
+                return count
+            previous_compact = _compact_asr_compare_text(
+                _join_segments(candidate_texts[:count])
+            )
+            if not previous_compact:
+                return count
+            for end in range(count + 1, len(completed) + 1):
+                current_compact = _compact_asr_compare_text(
+                    _join_segments(completed[:end])
+                )
+                if current_compact == previous_compact:
+                    return int(end)
+                length_ratio = len(current_compact) / float(len(previous_compact))
+                if (
+                    0.8 <= length_ratio <= 1.25
+                    and difflib.SequenceMatcher(
+                        None,
+                        previous_compact,
+                        current_compact,
+                    ).ratio() >= 0.9
+                ):
+                    return int(end)
+                if length_ratio > 1.25:
+                    break
+            return count
 
         alignment_runtime = SimpleNamespace(
             model_seen={},
@@ -5366,6 +5713,32 @@ def _create_app(
             except Exception:
                 logger.info("subtitle_trace %s", row)
 
+        if silero_shadow_enabled:
+            try:
+                silero_shadow_observer = await asyncio.to_thread(
+                    create_silero_onnx_observer,
+                    threshold=silero_shadow_threshold,
+                )
+                _trace_event(
+                    "silero_shadow_ready",
+                    sample_rate=SAMPLE_RATE,
+                    frame_samples=int(silero_shadow_observer.frame_samples),
+                    threshold=round(float(silero_shadow_threshold), 3),
+                    control_mode="observe_only",
+                )
+            except Exception as exc:
+                silero_shadow_observer = None
+                _trace_event(
+                    "silero_shadow_unavailable",
+                    phase="load",
+                    error_type=type(exc).__name__,
+                )
+                logger.warning(
+                    "Silero shadow VAD unavailable peer=%s phase=load error=%s",
+                    peer,
+                    type(exc).__name__,
+                )
+
         def _reset_deferred_sentence_upgrade(
             sentence_id: str,
             *,
@@ -5442,6 +5815,184 @@ def _create_app(
             )
             return int(removed)
 
+        def _streaming_context_for_state(local_state: Any) -> str:
+            return str(
+                getattr(local_state, "context", "")
+                or getattr(local_state, "streaming_context", "")
+                or ""
+            ).strip()
+
+        def _release_context_resume_guard(*, reason: str, seq_no: int = 0) -> None:
+            if not bool(context_resume_guard.active):
+                return
+            _trace_event(
+                "asr_context_resume_guard_released",
+                seq=int(seq_no),
+                reason=str(reason or ""),
+                resume_skipped=int(context_resume_guard.skipped),
+                speech_confirmed=bool(context_resume_guard.speech_confirmed),
+                silero_speech_ms=int(
+                    round(
+                        float(context_resume_guard.silero_speech_samples)
+                        * 1000.0
+                        / SAMPLE_RATE
+                    )
+                ),
+            )
+            context_resume_guard.active = False
+            context_resume_guard.until = 0.0
+            context_resume_guard.skipped = 0
+            context_resume_guard.silero_speech_samples = 0
+            context_resume_guard.last_text_hash8 = ""
+
+        def _arm_context_resume_guard(
+            local_state: Any,
+            *,
+            skipped: int,
+            reason: str,
+            seq_no: int = 0,
+        ) -> None:
+            skipped_count = int(skipped or 0)
+            context = _streaming_context_for_state(local_state)
+            if skipped_count < 3 or not context:
+                return
+            if (
+                str(reason or "") == "decode_resume"
+                and not bool(context_resume_guard.active)
+                and bool(context_resume_guard.speech_confirmed)
+            ):
+                return
+
+            was_active = bool(context_resume_guard.active)
+            guard_sec = max(0.1, float(getattr(args, "chunk_size_sec", 1.0)))
+            context_resume_guard.active = True
+            context_resume_guard.until = time.monotonic() + guard_sec
+            context_resume_guard.skipped = max(
+                int(context_resume_guard.skipped),
+                skipped_count,
+            )
+            if not was_active:
+                context_resume_guard.speech_confirmed = False
+                context_resume_guard.silero_speech_samples = 0
+                context_resume_guard.last_text_hash8 = ""
+                _trace_event(
+                    "asr_context_resume_guard_armed",
+                    seq=int(seq_no),
+                    reason=str(reason or ""),
+                    skipped=int(skipped_count),
+                    silero_available=bool(silero_shadow_observer is not None),
+                    guard_fallback_ms=int(round(guard_sec * 1000.0)),
+                )
+
+        def _quarantine_resumed_context_partial(
+            local_state: Any,
+            text: str,
+            *,
+            seq_no: int,
+        ) -> bool:
+            now_mono = time.monotonic()
+            if not bool(context_resume_guard.active):
+                return False
+            context = _streaming_context_for_state(local_state)
+            candidate = str(text or "").strip()
+            context_fragment = _looks_like_asr_context_fragment_echo(context, candidate)
+            if not context_fragment:
+                _release_context_resume_guard(
+                    reason="non_context_text",
+                    seq_no=int(seq_no),
+                )
+                return False
+
+            silero_available = silero_shadow_observer is not None
+            fallback_window_active = now_mono < float(context_resume_guard.until)
+            if not _should_quarantine_asr_context_resume_partial(
+                context,
+                candidate,
+                guard_active=bool(context_resume_guard.active),
+                silero_available=bool(silero_available),
+                speech_confirmed=bool(context_resume_guard.speech_confirmed),
+                fallback_window_active=bool(fallback_window_active),
+            ):
+                _release_context_resume_guard(
+                    reason="fallback_window_elapsed",
+                    seq_no=int(seq_no),
+                )
+                return False
+
+            text_hash8 = _hash8(candidate)
+            if text_hash8 != str(context_resume_guard.last_text_hash8 or ""):
+                _trace_event(
+                    "asr_context_resume_partial_quarantined",
+                    seq=int(seq_no),
+                    text_chars=len(candidate),
+                    text_hash8=text_hash8,
+                    context_terms=len(str(context or "").split()),
+                    context_chars=len(context),
+                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    resume_skipped=int(context_resume_guard.skipped),
+                    awaiting_speech_confirmation=bool(
+                        silero_available and not context_resume_guard.speech_confirmed
+                    ),
+                    guard_remaining_ms=max(
+                        0,
+                        int(round((float(context_resume_guard.until) - now_mono) * 1000.0)),
+                    ),
+                )
+                context_resume_guard.last_text_hash8 = text_hash8
+            return True
+
+        def _guard_context_final_candidate(
+            local_state: Any,
+            candidate_text: str,
+            *,
+            snapshot_text: str,
+            reason: str,
+            seq_no: int,
+            segment_id: int,
+        ) -> str:
+            candidate = str(candidate_text or "").strip()
+            context = _streaming_context_for_state(local_state)
+            if not _should_quarantine_asr_context_resume_partial(
+                context,
+                candidate,
+                guard_active=bool(context_resume_guard.active),
+                silero_available=bool(silero_shadow_observer is not None),
+                speech_confirmed=bool(context_resume_guard.speech_confirmed),
+                # An active guard means no trustworthy resumed output has been
+                # observed. Finalization itself must not bypass that gate.
+                fallback_window_active=True,
+            ):
+                return candidate
+
+            fallback_snapshot = str(snapshot_text or "").strip()
+            fallback_snapshot_used = bool(
+                fallback_snapshot
+                and not _looks_like_asr_context_fragment_echo(
+                    context,
+                    fallback_snapshot,
+                )
+            )
+            _trace_event(
+                "asr_context_silent_segment_discarded",
+                seq=int(seq_no),
+                reason=str(reason or ""),
+                segment_id=int(segment_id),
+                text_chars=len(candidate),
+                text_hash8=_hash8(candidate),
+                context_chars=len(context),
+                context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                resume_skipped=int(context_resume_guard.skipped),
+                speech_confirmed=bool(context_resume_guard.speech_confirmed),
+                fallback_snapshot_used=bool(fallback_snapshot_used),
+                fallback_snapshot_chars=(
+                    len(fallback_snapshot) if fallback_snapshot_used else 0
+                ),
+                fallback_snapshot_hash8=(
+                    _hash8(fallback_snapshot) if fallback_snapshot_used else "00000000"
+                ),
+            )
+            return fallback_snapshot if fallback_snapshot_used else ""
+
         async def _apply_segment_final_context(local_state: Any, *, reason: str) -> bool:
             context = str(getattr(local_state, "_voxbridge_final_context", "") or "")
             if asr_context_apply_mode != "segment_final" or not context:
@@ -5502,14 +6053,23 @@ def _create_app(
                         context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
                     )
                     return False
+                context_echo_reason = ""
                 if _looks_like_asr_context_echo(
                     context,
                     corrected_text,
                     previous_text=previous_text,
                 ):
+                    context_echo_reason = "context_echo"
+                elif _contains_unsubstantiated_asr_context_fragment(
+                    context,
+                    corrected_text,
+                    previous_text=previous_text,
+                ):
+                    context_echo_reason = "context_fragment_echo"
+                if context_echo_reason:
                     _trace_event(
                         "asr_context_final_redecode_skipped",
-                        reason="context_echo",
+                        reason=str(context_echo_reason),
                         cut_reason=str(reason or ""),
                         audio_samples=int(segment_wav.size),
                         corrected_text_chars=len(corrected_text),
@@ -5640,7 +6200,7 @@ def _create_app(
             snapshot = str(text or "").strip()
             if not snapshot:
                 return
-            completed, _ = _split_sentences_and_tail(snapshot)
+            completed, _ = _split_subtitle_units(snapshot)
             if not completed:
                 return
             new_unique = 0
@@ -6006,6 +6566,44 @@ def _create_app(
                     broadcast=bool(broadcast_job is not None),
                     private=bool(private_job is not None),
                 )
+
+        async def _confirm_tts_source(
+            sentence_id: str,
+            *,
+            reason: str,
+            lookahead_tokens: int,
+        ) -> None:
+            def _transition() -> List[Any]:
+                registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
+                if not _tts_output_active() or registered is None:
+                    return []
+                source_order, registered_generation = registered
+                if int(registered_generation) != int(tts_runtime.generation):
+                    return []
+                changed = tts_runtime.ordered.confirm_through(int(source_order))
+                if not changed:
+                    return []
+                tts_runtime.last_wait_key = None
+                tts_runtime.stability_wake.set()
+                _trace_event(
+                    "tts_source_confirmed",
+                    sentence_hash8=_opaque_identifier_hash8(str(sentence_id)),
+                    source_order=int(source_order),
+                    reason=str(reason or ""),
+                    lookahead_tokens=int(lookahead_tokens),
+                    required_lookahead_tokens=int(
+                        early_translation_required_lookahead_tokens
+                    ),
+                    generation=int(tts_runtime.generation),
+                    pending_count=int(tts_runtime.ordered.pending_count),
+                )
+                return tts_runtime.ordered.drain()
+
+            await _run_ordered_tts_transition(
+                tts_transition_lock,
+                _transition,
+                _publish_tts_ready,
+            )
 
         async def _mark_tts_translation_ready(
             sentence_id: str,
@@ -7018,6 +7616,9 @@ def _create_app(
                         merged = _join_segments([pending_prefix, str(trimmed or "").strip()]).strip()
                         pending_miss_count = 0
                         _clear_pending_prefix_boundary_evidence()
+                        subtitle_state.pending_prefix_retain_for_alignment = bool(
+                            pending_reason == "hard_cut" and merged != raw
+                        )
                         _trace_event(
                             "pending_prefix_overlap_trimmed",
                             seq=int(seq_no or 0),
@@ -7077,6 +7678,9 @@ def _create_app(
                                 )
                             elif _should_hard_cut_fallback_merge(pending_prefix, raw):
                                 merged = dedup_segment_join(pending_prefix, raw, min_overlap=2).strip()
+                                subtitle_state.pending_prefix_retain_for_alignment = bool(
+                                    merged != raw
+                                )
                                 _trace_event(
                                     "pending_prefix_hard_cut_fallback_merge",
                                     seq=int(seq_no or 0),
@@ -7422,7 +8026,14 @@ def _create_app(
 
             seq = max(int(seq), int(seq_hint or 0)) + 1
             raw_final_text = str(getattr(local_state, "text", "") or snapshot_text or "").strip()
-            final_text = str(raw_final_text or "")
+            final_text = _guard_context_final_candidate(
+                local_state,
+                raw_final_text,
+                snapshot_text=str(snapshot_text or ""),
+                reason=str(reason or ""),
+                seq_no=int(seq),
+                segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+            )
             punct_cut_carry_text = ""
             punct_cut_resolved_end = 0
             if str(reason or "") == "punct_timeout_cut" and int(cut_boundary_end or 0) > 0 and raw_final_text:
@@ -7450,6 +8061,11 @@ def _create_app(
                 force_finalize=bool(force_finalize),
             )
             finalize_completed_preview, finalize_tail_preview = _split_sentences_and_tail(final_text)
+            hard_cut_mid_speech = bool(
+                str(reason or "") == "hard_cut"
+                and bool(getattr(backend_vad, "in_speech", False))
+                and float(getattr(backend_vad, "silence_ms", 0.0) or 0.0) < 80.0
+            )
             defer_short_english_slice_commit = bool(
                 str(reason or "") in {"vad_silence", "hard_cut", "punct_timeout_cut"}
                 and len(finalize_completed_preview) == 1
@@ -7473,20 +8089,24 @@ def _create_app(
                     min_english_chars=int(early_translation_min_english_chars),
                 )
 
+            holdback_newest_on_finalize = bool(
+                defer_short_english_slice_commit or hard_cut_mid_speech
+            )
             _track_text_progress(final_text)
             tentative_after_finalize = await _update_sentence_commits(
                 final_text,
                 final_language,
                 seq,
                 force_tail=bool(commit_tail_on_finalize),
-                holdback_newest=bool(defer_short_english_slice_commit),
+                holdback_newest=bool(holdback_newest_on_finalize),
                 commit_tail_if_no_completed=bool(commit_tail_on_finalize),
                 commit_tail_always=bool(commit_tail_on_finalize),
-                commit_all_completed=not bool(defer_short_english_slice_commit),
+                commit_all_completed=True,
                 slice_commit=True,
                 translate_now=False,
                 canonical_segment_correction=bool(context_final_applied),
                 final_reconcile=True,
+                allow_early_translation_promotion=not bool(hard_cut_mid_speech),
             )
             await _seal_tts_sources_through_current_segment(reason=str(reason or ""))
             pending_prefix = ""
@@ -7511,9 +8131,28 @@ def _create_app(
                 if (
                     pending_prefix
                     and continuation_candidate != terminal_candidate
-                    and pending_prefix == continuation_candidate
+                    and pending_prefix in {terminal_candidate, continuation_candidate}
                 ):
+                    pending_prefix = continuation_candidate
                     pending_prefix_terminal_text = terminal_candidate
+                elif hard_cut_mid_speech and pending_prefix == terminal_candidate:
+                    continuation_candidate = _strip_terminal_boundary_for_continuation(terminal_candidate)
+                    if continuation_candidate != terminal_candidate:
+                        pending_prefix = continuation_candidate
+                    _trace_event(
+                        "hard_cut_mid_speech_tail_held",
+                        seq=int(seq),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        silence_ms=round(
+                            float(getattr(backend_vad, "silence_ms", 0.0) or 0.0),
+                            1,
+                        ),
+                        terminal_chars=len(terminal_candidate),
+                        carry_chars=len(pending_prefix),
+                        boundary_removed=bool(continuation_candidate != terminal_candidate),
+                        terminal_hash8=_hash8(terminal_candidate),
+                        carry_hash8=_hash8(pending_prefix),
+                    )
             overlap_cap_chars = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
             boundary_anchor_chars = max(4, overlap_cap_chars * 2)
             boundary_anchor = str(final_text[-boundary_anchor_chars:] if final_text else "").strip()
@@ -7523,6 +8162,7 @@ def _create_app(
             subtitle_state.pending_prefix_miss_count = 0
             subtitle_state.pending_prefix_terminal_text = str(pending_prefix_terminal_text or "")
             subtitle_state.pending_prefix_is_separate = False
+            subtitle_state.pending_prefix_retain_for_alignment = False
             subtitle_state.boundary_anchor_text = str(boundary_anchor or "")
             subtitle_state.boundary_anchor_segment_id = int(getattr(segment_runtime, "id", 0) or 0)
             _trace_text_pool(
@@ -7604,6 +8244,7 @@ def _create_app(
                 overlap_samples=int(overlap_audio.size),
                 commit_tail=bool(commit_tail_on_finalize),
                 defer_short_english_slice_commit=bool(defer_short_english_slice_commit),
+                hard_cut_mid_speech=bool(hard_cut_mid_speech),
                 pending_prefix_chars=len(str(subtitle_state.pending_prefix_text or "").strip()),
                 pending_prefix_terminal_chars=len(
                     str(getattr(subtitle_state, "pending_prefix_terminal_text", "") or "").strip()
@@ -7690,6 +8331,15 @@ def _create_app(
         def _is_committed_sentence_upgrade(old_text: str, new_text: str) -> bool:
             return _should_accept_sentence_upgrade(old_text, new_text)
 
+        def _streaming_context_run(text: str) -> Optional[Tuple[int, int, int]]:
+            if asr_context_apply_mode != "streaming":
+                return None
+            active_state = state
+            context_terms = tuple(
+                getattr(active_state, "_voxbridge_context_terms", ()) or ()
+            )
+            return _find_consecutive_context_term_run(text, context_terms)
+
         async def _update_sentence_commits(
             full_text: str,
             language: str,
@@ -7703,6 +8353,7 @@ def _create_app(
             translate_now: bool = False,
             canonical_segment_correction: bool = False,
             final_reconcile: bool = False,
+            allow_early_translation_promotion: bool = True,
         ) -> str:
             seq_no = int(seq_hint or 0)
             raw_full_text = str(full_text or "").strip()
@@ -7721,7 +8372,7 @@ def _create_app(
             pending_prefix_reason = str(getattr(subtitle_state, "pending_prefix_reason", "") or "")
             boundary_anchor_before = str(getattr(subtitle_state, "boundary_anchor_text", "") or "").strip()
             effective_full_text = _compose_effective_text_for_commit(full_text, seq_no)
-            completed, tail = _split_sentences_and_tail(effective_full_text)
+            completed, tail = _split_subtitle_units(effective_full_text)
             if commit_tail_always and not force_tail and tail:
                 tail_text = str(tail or "").strip()
                 if tail_text:
@@ -7883,7 +8534,25 @@ def _create_app(
                             total_committed_count=int(total_committed_count),
                         )
             processed_count = int(getattr(subtitle_state, "processed_completed_count", 0) or 0)
-            effective_committed_count = max(int(processed_count), int(carry_overlap_skip))
+            remapped_processed_count = int(processed_count)
+            if canonical_segment_correction:
+                remapped_processed_count = _remap_completed_cursor_after_resegmentation(
+                    completed,
+                    processed_count,
+                )
+                if remapped_processed_count != processed_count:
+                    _trace_event(
+                        "canonical_candidate_cursor_remapped",
+                        seq=seq_no,
+                        processed_count=int(processed_count),
+                        remapped_count=int(remapped_processed_count),
+                        completed_count=len(completed),
+                    )
+            effective_committed_count = max(
+                int(processed_count),
+                int(remapped_processed_count),
+                int(carry_overlap_skip),
+            )
 
             ready_end = effective_committed_count
             if force_tail or commit_all_completed:
@@ -7902,6 +8571,13 @@ def _create_app(
                 ready_end = min(ready_end, newest_holdback)
                 ready_end = max(ready_end, effective_committed_count)
 
+            hard_cut_boundary_commit_wait = bool(
+                not force_tail
+                and pending_prefix_reason == "hard_cut"
+                and pending_prefix_before
+                and len(completed) == 1
+                and not str(tail or "").strip()
+            )
             early_translation_promoted = False
             early_translation_waiting = False
             early_translation_short_english = False
@@ -7909,8 +8585,12 @@ def _create_app(
             early_translation_required_hits = int(early_translation_stable_hits)
             early_translation_stable_age_ms = 0
             early_translation_terminal_first_seen_ms = 0
+            early_translation_lookahead_tokens = 0
+            early_translation_tokenizer_available = bool(asr_tokenizer is not None)
+            early_translation_rollback_safe = False
             if (
                 not force_tail
+                and bool(allow_early_translation_promotion)
                 and bool(holdback_newest)
                 and int(ready_end) == int(len(completed) - 1)
                 and int(ready_end) >= int(effective_committed_count)
@@ -7949,10 +8629,20 @@ def _create_app(
                     if early_translation_short_english
                     else int(early_translation_stable_hits)
                 )
+                lookahead_token_count = _count_tokenizer_tokens(asr_tokenizer, tail)
+                early_translation_tokenizer_available = lookahead_token_count is not None
+                early_translation_lookahead_tokens = max(0, int(lookahead_token_count or 0))
+                early_translation_rollback_safe = bool(
+                    lookahead_token_count is not None
+                    and int(lookahead_token_count)
+                    >= int(early_translation_required_lookahead_tokens)
+                )
                 if (
                     candidate
                     and stable_hits >= int(early_translation_required_hits)
                     and stable_sec >= float(early_translation_required_sec)
+                    and early_translation_rollback_safe
+                    and not hard_cut_boundary_commit_wait
                 ):
                     ready_end += 1
                     early_translation_promoted = True
@@ -7967,10 +8657,27 @@ def _create_app(
                         required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
                         short_english=bool(early_translation_short_english),
                         english_words=int(_english_word_count(candidate)),
+                        lookahead_tokens=int(early_translation_lookahead_tokens),
+                        required_lookahead_tokens=int(early_translation_required_lookahead_tokens),
+                        rollback_safe=bool(early_translation_rollback_safe),
+                        tokenizer_available=bool(early_translation_tokenizer_available),
                     )
                     _reset_early_translation_holdback_state()
                 elif candidate:
                     early_translation_waiting = True
+                    if hard_cut_boundary_commit_wait:
+                        _trace_event(
+                            "hard_cut_boundary_commit_wait",
+                            seq=seq_no,
+                            pending_chars=len(pending_prefix_before),
+                            candidate_chars=len(candidate),
+                            completed_count=len(completed),
+                            tail_chars=len(str(tail or "").strip()),
+                            stable_age_ms=int(early_translation_stable_age_ms),
+                            stable_hits=int(stable_hits),
+                            required_hits=int(early_translation_required_hits),
+                            required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
+                        )
                     _trace_event(
                         "early_translation_stability_wait",
                         seq=seq_no,
@@ -7982,6 +8689,20 @@ def _create_app(
                         required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
                         short_english=bool(early_translation_short_english),
                         english_words=int(_english_word_count(candidate)),
+                        hard_cut_boundary_wait=bool(hard_cut_boundary_commit_wait),
+                        lookahead_tokens=int(early_translation_lookahead_tokens),
+                        required_lookahead_tokens=int(early_translation_required_lookahead_tokens),
+                        rollback_safe=bool(early_translation_rollback_safe),
+                        tokenizer_available=bool(early_translation_tokenizer_available),
+                        wait_reason=(
+                            "hard_cut_boundary"
+                            if hard_cut_boundary_commit_wait
+                            else (
+                                "rollback_window"
+                                if not early_translation_rollback_safe
+                                else "time_or_hits"
+                            )
+                        ),
                     )
             else:
                 _reset_early_translation_holdback_state()
@@ -8014,6 +8735,44 @@ def _create_app(
                     )
                     break
 
+            stable_clause_rollback_waiting = False
+            stable_clause_rollback_wait_index = -1
+            stable_clause_rollback_lookahead_tokens = 0
+            if not force_tail and int(ready_end) > int(effective_committed_count):
+                for idx in range(int(effective_committed_count), int(ready_end)):
+                    candidate = str(completed[int(idx)] or "").strip()
+                    if _translation_unit_boundary_kind(candidate) != "stable_clause":
+                        continue
+                    following_text = _join_segments(
+                        [
+                            *[str(item or "").strip() for item in completed[int(idx) + 1 :]],
+                            str(tail or "").strip(),
+                        ]
+                    )
+                    lookahead_count = _count_tokenizer_tokens(asr_tokenizer, following_text)
+                    lookahead_tokens = max(0, int(lookahead_count or 0))
+                    if (
+                        lookahead_count is not None
+                        and int(lookahead_count) >= int(early_translation_required_lookahead_tokens)
+                    ):
+                        continue
+                    ready_end = int(idx)
+                    stable_clause_rollback_waiting = True
+                    stable_clause_rollback_wait_index = int(idx)
+                    stable_clause_rollback_lookahead_tokens = int(lookahead_tokens)
+                    _trace_event(
+                        "stable_clause_rollback_wait",
+                        seq=seq_no,
+                        idx=int(idx),
+                        sentence_chars=len(candidate),
+                        lookahead_tokens=int(lookahead_tokens),
+                        required_lookahead_tokens=int(
+                            early_translation_required_lookahead_tokens
+                        ),
+                        tokenizer_available=bool(lookahead_count is not None),
+                    )
+                    break
+
             ready_new_commits = max(0, int(ready_end - effective_committed_count))
             suppressed_new_commits = max(0, int(len(completed) - ready_end))
             completed_underflow = max(0, int(prev_completed_count - len(completed)))
@@ -8036,7 +8795,9 @@ def _create_app(
                 or bool(carry_duplicate_dropped)
                 or bool(early_translation_promoted)
                 or bool(early_translation_waiting)
+                or bool(hard_cut_boundary_commit_wait)
                 or bool(short_english_slice_fragment_held)
+                or bool(stable_clause_rollback_waiting)
                 or ready_end != effective_committed_count
             )
             if completed_underflow > 0:
@@ -8123,6 +8884,8 @@ def _create_app(
             if suppressed_new_commits > 0 and (should_sample or suppressed_new_commits > 1):
                 if short_english_slice_fragment_held:
                     suppressed_reason = "short_english_slice_fragment"
+                elif hard_cut_boundary_commit_wait:
+                    suppressed_reason = "hard_cut_boundary_wait"
                 else:
                     suppressed_reason = "holdback_newest" if bool(holdback_newest and not force_tail) else "stability_guard"
                 _trace_event(
@@ -8168,8 +8931,20 @@ def _create_app(
                     early_translation_stable_age_ms=int(early_translation_stable_age_ms),
                     early_translation_required_hits=int(early_translation_required_hits),
                     early_translation_required_stable_ms=int(float(early_translation_required_sec) * 1000.0),
+                    early_translation_lookahead_tokens=int(early_translation_lookahead_tokens),
+                    early_translation_required_lookahead_tokens=int(
+                        early_translation_required_lookahead_tokens
+                    ),
+                    early_translation_rollback_safe=bool(early_translation_rollback_safe),
+                    early_translation_tokenizer_available=bool(early_translation_tokenizer_available),
+                    hard_cut_boundary_commit_wait=bool(hard_cut_boundary_commit_wait),
                     short_english_slice_fragment_held=bool(short_english_slice_fragment_held),
                     short_english_slice_fragment_index=int(short_english_slice_fragment_index),
+                    stable_clause_rollback_waiting=bool(stable_clause_rollback_waiting),
+                    stable_clause_rollback_wait_index=int(stable_clause_rollback_wait_index),
+                    stable_clause_rollback_lookahead_tokens=int(
+                        stable_clause_rollback_lookahead_tokens
+                    ),
                     pending_prefix_chars=len(pending_prefix_before),
                     boundary_anchor_chars=len(boundary_anchor_before),
                     duplicate_filter_paused=bool(duplicate_filter_paused),
@@ -8200,8 +8975,20 @@ def _create_app(
                     early_translation_waiting=bool(early_translation_waiting),
                     early_translation_short_english=bool(early_translation_short_english),
                     early_translation_stable_age_ms=int(early_translation_stable_age_ms),
+                    early_translation_lookahead_tokens=int(early_translation_lookahead_tokens),
+                    early_translation_required_lookahead_tokens=int(
+                        early_translation_required_lookahead_tokens
+                    ),
+                    early_translation_rollback_safe=bool(early_translation_rollback_safe),
+                    early_translation_tokenizer_available=bool(early_translation_tokenizer_available),
+                    hard_cut_boundary_commit_wait=bool(hard_cut_boundary_commit_wait),
                     short_english_slice_fragment_held=bool(short_english_slice_fragment_held),
                     short_english_slice_fragment_hash8=_hash8(short_english_slice_fragment_text),
+                    stable_clause_rollback_waiting=bool(stable_clause_rollback_waiting),
+                    stable_clause_rollback_wait_index=int(stable_clause_rollback_wait_index),
+                    stable_clause_rollback_lookahead_tokens=int(
+                        stable_clause_rollback_lookahead_tokens
+                    ),
                     completed_underflow=int(completed_underflow),
                     raw_hash8=_hash8(raw_full_text),
                     effective_hash8=_hash8(effective_full_text),
@@ -8231,6 +9018,37 @@ def _create_app(
                 evaluated_sentence_ids.add(sentence_id)
                 upgraded = str(completed[i] or "").strip()
                 current = str(subtitle_state.committed_sentences[global_idx] or "").strip()
+                context_run = _streaming_context_run(upgraded)
+                if context_run is not None:
+                    run_start, run_end, run_count = context_run
+                    _reset_deferred_sentence_upgrade(
+                        sentence_id,
+                        seq_no=seq_no,
+                        reason="streaming_context_echo",
+                        replacement_text=upgraded,
+                    )
+                    _trace_event(
+                        "context_run_upgrade_rejected",
+                        seq=seq_no,
+                        idx=int(i),
+                        sentence_id=sentence_id,
+                        candidate_chars=len(upgraded),
+                        candidate_hash8=_hash8(upgraded),
+                        context_term_count=int(run_count),
+                        run_chars=max(0, int(run_end) - int(run_start)),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    _trace_event(
+                        "candidate_action",
+                        seq=seq_no,
+                        idx=int(i),
+                        action="streaming_context_echo_upgrade_reject",
+                        sentence_id=sentence_id,
+                        text_hash8=_hash8(upgraded),
+                        context_term_count=int(run_count),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    continue
                 accepted_upgrade = _is_committed_sentence_upgrade(current, upgraded)
                 accepted_context_correction = bool(
                     canonical_segment_correction
@@ -8453,6 +9271,32 @@ def _create_app(
                             segment_id=int(getattr(segment_runtime, "id", 0) or 0),
                         )
                         continue
+                context_run = _streaming_context_run(sentence)
+                if context_run is not None:
+                    run_start, run_end, run_count = context_run
+                    _record_completed_candidate(i, sentence, "")
+                    _trace_event(
+                        "context_run_commit_dropped",
+                        seq=seq_no,
+                        idx=int(i),
+                        sentence_chars=len(sentence),
+                        sentence_hash8=_hash8(sentence),
+                        context_term_count=int(run_count),
+                        run_chars=max(0, int(run_end) - int(run_start)),
+                        slice_commit=bool(slice_commit),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    _trace_event(
+                        "candidate_action",
+                        seq=seq_no,
+                        idx=int(i),
+                        action="streaming_context_echo_drop",
+                        sentence_id="",
+                        text_hash8=_hash8(sentence),
+                        context_term_count=int(run_count),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    continue
                 candidate_compact = _compact_asr_compare_text(sentence)
                 covered_min_chars = 6 if _has_cjk(sentence) else 12
                 if (
@@ -8487,6 +9331,24 @@ def _create_app(
                 sentence_id = _new_sentence_id()
                 revision = 1
                 commit_ts_ms = int(time.time() * 1000)
+                boundary_kind = _translation_unit_boundary_kind(sentence)
+                following_text = _join_segments(
+                    [
+                        *[str(item or "").strip() for item in completed[i + 1 :]],
+                        str(tail or "").strip(),
+                    ]
+                )
+                commit_lookahead_token_count = _count_tokenizer_tokens(
+                    asr_tokenizer,
+                    following_text,
+                )
+                commit_lookahead_tokens = max(0, int(commit_lookahead_token_count or 0))
+                commit_rollback_safe = bool(
+                    not force_tail
+                    and commit_lookahead_token_count is not None
+                    and int(commit_lookahead_token_count)
+                    >= int(early_translation_required_lookahead_tokens)
+                )
                 subtitle_state.committed_sentences.append(sentence)
                 subtitle_state.sentence_items.append(
                     {
@@ -8499,6 +9361,12 @@ def _create_app(
                     }
                 )
                 await _register_tts_source(sentence_id, revision)
+                if commit_rollback_safe:
+                    await _confirm_tts_source(
+                        sentence_id,
+                        reason="rollback_safe_commit",
+                        lookahead_tokens=int(commit_lookahead_tokens),
+                    )
                 committed_added += 1
                 _trace_event(
                     "sentence_new_commit",
@@ -8509,6 +9377,13 @@ def _create_app(
                     revision=int(revision),
                     chars=len(sentence),
                     slice_commit=bool(slice_commit),
+                    lookahead_tokens=int(commit_lookahead_tokens),
+                    required_lookahead_tokens=int(
+                        early_translation_required_lookahead_tokens
+                    ),
+                    rollback_safe=bool(commit_rollback_safe),
+                    tokenizer_available=bool(commit_lookahead_token_count is not None),
+                    boundary_kind=str(boundary_kind),
                 )
                 _track_committed_sentence(
                     sentence,
@@ -8536,6 +9411,7 @@ def _create_app(
                     "seq": int(seq_hint or 0),
                     "ts_ms": int(commit_ts_ms),
                     "slice_commit": bool(slice_commit),
+                    "boundary_kind": str(boundary_kind),
                 }
                 _attach_stability(
                     event,
@@ -8593,13 +9469,20 @@ def _create_app(
                 )
 
             if pending_prefix_before and (committed_added > 0 or bool(force_tail)):
-                if bool(getattr(subtitle_state, "pending_prefix_is_separate", False)):
+                retain_prefix_for_alignment = bool(
+                    getattr(subtitle_state, "pending_prefix_is_separate", False)
+                    or getattr(subtitle_state, "pending_prefix_retain_for_alignment", False)
+                )
+                if retain_prefix_for_alignment and not bool(force_tail):
                     _trace_event(
                         "pending_prefix_retained_for_candidate_alignment",
                         seq=seq_no,
                         pending_prefix_chars=len(pending_prefix_before),
                         terminal_chars=len(
                             str(getattr(subtitle_state, "pending_prefix_terminal_text", "") or "")
+                        ),
+                        carry_alignment=bool(
+                            getattr(subtitle_state, "pending_prefix_retain_for_alignment", False)
                         ),
                         committed_added=int(committed_added),
                         force_tail=bool(force_tail),
@@ -8908,6 +9791,8 @@ def _create_app(
             nonlocal total_consumed_samples, queue_samples
             nonlocal last_text_snapshot, last_text_advance_at, last_idle_commit_at, last_partial_emit_at
             nonlocal backpressure_runtime
+            nonlocal silero_shadow_observer, silero_shadow_last_log_at
+            nonlocal silero_shadow_last_disagreement
 
             def _relieve_hard_overflow_if_needed() -> None:
                 hard_since = float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0)
@@ -8989,8 +9874,75 @@ def _create_app(
                     vad_exit_snr_db=float(vad_exit_snr_db),
                     has_pending_text=bool(pending_text_snapshot),
                 )
+                if silero_shadow_observer is not None:
+                    shadow = silero_shadow_observer.feed(wav)
+                    if not shadow.available:
+                        _trace_event(
+                            "silero_shadow_unavailable",
+                            phase="inference",
+                            error_type=str(shadow.error or "unknown").split(":", 1)[0],
+                        )
+                        logger.warning(
+                            "Silero shadow VAD unavailable peer=%s phase=inference error=%s",
+                            peer,
+                            str(shadow.error or "unknown").split(":", 1)[0],
+                        )
+                        silero_shadow_observer = None
+                    elif shadow.frames > 0:
+                        if bool(context_resume_guard.active):
+                            shadow_confirms_speech = bool(
+                                shadow.is_speech
+                                and float(shadow.mean_probability or 0.0)
+                                >= float(silero_shadow_threshold)
+                            )
+                            if shadow_confirms_speech:
+                                context_resume_guard.silero_speech_samples += int(wav.size)
+                            else:
+                                context_resume_guard.silero_speech_samples = 0
+                            if int(context_resume_guard.silero_speech_samples) >= int(
+                                0.2 * SAMPLE_RATE
+                            ):
+                                context_resume_guard.speech_confirmed = True
+                                _release_context_resume_guard(
+                                    reason="silero_speech_confirmed",
+                                    seq_no=int(seq or 0),
+                                )
+                        energy_gate_speech = not bool(should_skip_decode)
+                        disagreement = bool(shadow.is_speech) != bool(energy_gate_speech)
+                        now_shadow = time.monotonic()
+                        common_shadow_fields = {
+                            "probability": round(float(shadow.last_probability or 0.0), 4),
+                            "mean_probability": round(float(shadow.mean_probability or 0.0), 4),
+                            "max_probability": round(float(shadow.max_probability or 0.0), 4),
+                            "silero_speech": bool(shadow.is_speech),
+                            "snr_db": round(float(vad_signal.get("snr_db", 0.0) or 0.0), 2),
+                            "snr_in_speech": bool(getattr(backend_vad, "in_speech", False)),
+                            "energy_gate_speech": bool(energy_gate_speech),
+                            "decode_skipped": bool(should_skip_decode),
+                            "disagreement": bool(disagreement),
+                            "frames": int(shadow.frames),
+                            "pending_samples": int(shadow.pending_samples),
+                            "control_mode": "observe_only",
+                        }
+                        if shadow.state_changed:
+                            _trace_event("silero_shadow_transition", **common_shadow_fields)
+                        if silero_shadow_last_disagreement is None or (
+                            bool(disagreement) != bool(silero_shadow_last_disagreement)
+                        ):
+                            _trace_event("silero_shadow_disagreement", **common_shadow_fields)
+                            silero_shadow_last_disagreement = bool(disagreement)
+                        if (now_shadow - float(silero_shadow_last_log_at)) >= silero_shadow_log_sec:
+                            _trace_event("silero_shadow_observation", **common_shadow_fields)
+                            silero_shadow_last_log_at = now_shadow
                 if should_skip_decode:
+                    decode_pre_roll.append(wav)
                     stats.silent_decode_skipped += 1
+                    _arm_context_resume_guard(
+                        local_state,
+                        skipped=int(stats.silent_decode_skipped),
+                        reason="silent_decode",
+                        seq_no=int(seq or 0),
+                    )
                     if stats.silent_decode_skipped <= 3 or stats.silent_decode_skipped % 40 == 0:
                         _trace_event(
                             "silent_decode_skipped",
@@ -8999,6 +9951,10 @@ def _create_app(
                             snr_db=round(float(vad_signal.get("snr_db", 0.0) or 0.0), 2),
                             queue_depth=int(audio_queue.qsize()),
                             queue_sec=round(float(backpressure.evaluate(int(queue_samples)).queue_sec), 3),
+                            pre_roll_samples=int(decode_pre_roll.buffered_samples),
+                            pre_roll_ms=int(
+                                round(float(decode_pre_roll.buffered_samples) * 1000.0 / SAMPLE_RATE)
+                            ),
                         )
                     await _maybe_vad_silence_cut(
                         vad_signal,
@@ -9009,11 +9965,28 @@ def _create_app(
                     await _maybe_idle_tail_commit()
                     continue
                 if stats.silent_decode_skipped > 0:
+                    resumed_skipped = int(stats.silent_decode_skipped)
+                    wav, replayed_samples = decode_pre_roll.prepend_to(wav)
+                    if replayed_samples > 0:
+                        _trace_event(
+                            "audio_preroll_replayed",
+                            replayed_samples=int(replayed_samples),
+                            replayed_ms=int(round(float(replayed_samples) * 1000.0 / SAMPLE_RATE)),
+                            current_samples=int(wav.size - replayed_samples),
+                            combined_samples=int(wav.size),
+                            skipped=int(stats.silent_decode_skipped),
+                        )
                     _trace_event(
                         "silent_decode_resumed",
-                        skipped=int(stats.silent_decode_skipped),
+                        skipped=int(resumed_skipped),
                         queue_depth=int(audio_queue.qsize()),
                         queue_sec=round(float(backpressure.evaluate(int(queue_samples)).queue_sec), 3),
+                    )
+                    _arm_context_resume_guard(
+                        local_state,
+                        skipped=int(resumed_skipped),
+                        reason="decode_resume",
+                        seq_no=int(seq or 0),
                     )
                 stats.silent_decode_skipped = 0
 
@@ -9033,6 +10006,19 @@ def _create_app(
                         }
                     payload_text = str(payload.get("text", "") or "").strip()
                     if not payload_text:
+                        await _maybe_vad_silence_cut(
+                            vad_signal,
+                            "",
+                            payload.get("language", ""),
+                            payload.get("seq", 0),
+                        )
+                        await _maybe_idle_tail_commit()
+                        continue
+                    if _quarantine_resumed_context_partial(
+                        local_state,
+                        payload_text,
+                        seq_no=int(payload.get("seq", 0) or 0),
+                    ):
                         await _maybe_vad_silence_cut(
                             vad_signal,
                             "",
@@ -9136,6 +10122,19 @@ def _create_app(
                     }
                 payload_text = str(payload.get("text", "") or "").strip()
                 if not payload_text:
+                    await _maybe_vad_silence_cut(
+                        vad_signal,
+                        "",
+                        payload.get("language", ""),
+                        payload.get("seq", 0),
+                    )
+                    await _maybe_idle_tail_commit()
+                    continue
+                if _quarantine_resumed_context_partial(
+                    local_state,
+                    payload_text,
+                    seq_no=int(payload.get("seq", 0) or 0),
+                ):
                     await _maybe_vad_silence_cut(
                         vad_signal,
                         "",
@@ -9337,6 +10336,19 @@ def _create_app(
                 alignment_runtime.committed_seen = {}
                 alignment_runtime.committed_events = 0
                 await _send_json({"type": "sentence_reset", "reason": "final_redecode"})
+
+            if not canonical_redecode_applied:
+                guarded_stop_text = _guard_context_final_candidate(
+                    local_state,
+                    str(getattr(local_state, "text", "") or ""),
+                    snapshot_text=str(last_text_snapshot or ""),
+                    reason=str(finish_reason or finish_mode or "stop"),
+                    seq_no=int(seq) + 1,
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                )
+                local_state.text = guarded_stop_text
+                if hasattr(local_state, "_raw_decoded"):
+                    local_state._raw_decoded = guarded_stop_text
 
             async with state_lock:
                 if local_state is not state or local_gen != state_generation:
@@ -9699,6 +10711,12 @@ def _create_app(
                             full_audio_samples = 0
                             full_audio_overflow = False
                             segment_final_context_applied = False
+                            context_resume_guard.until = 0.0
+                            context_resume_guard.active = False
+                            context_resume_guard.skipped = 0
+                            context_resume_guard.speech_confirmed = False
+                            context_resume_guard.silero_speech_samples = 0
+                            context_resume_guard.last_text_hash8 = ""
                             async with state_lock:
                                 state_generation += 1
                                 state = new_state
@@ -10048,11 +11066,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--asr-context-apply-mode",
-        default="segment_final",
+        default="streaming",
         choices=["segment_final", "streaming"],
         help=(
-            "Apply glossary context once to complete segments (safe default), or expose it to every "
-            "streaming decode for compatibility"
+            "Apply glossary context to every streaming decode (default), or only once to complete "
+            "segments (segment_final compatibility mode)"
         ),
     )
     p.add_argument(
@@ -10167,6 +11185,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32,
         help="Do not early-commit English completed sentences shorter than this many characters unless they also meet the word threshold",
+    )
+    p.add_argument(
+        "--stable-clause-target-cjk-chars",
+        type=int,
+        default=32,
+        help="Target CJK length before a rollback-safe comma/semicolon/colon subtitle unit may be committed; 0 disables",
+    )
+    p.add_argument(
+        "--stable-clause-target-latin-words",
+        type=int,
+        default=24,
+        help="Target Latin word count before a rollback-safe comma/semicolon/colon subtitle unit may be committed; 0 disables",
     )
     p.add_argument(
         "--enable-tts",
@@ -10360,6 +11390,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.45,
         help="Text stability time before backend VAD applies a silence cut.",
+    )
+    p.add_argument(
+        "--silent-decode-pre-roll-sec",
+        type=_non_negative_float_arg,
+        default=0.4,
+        help="Retain this much skipped audio and replay it once when ASR decoding resumes.",
+    )
+    p.add_argument(
+        "--silero-vad-shadow",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Run Silero VAD for structured observations without affecting control decisions.",
+    )
+    p.add_argument(
+        "--silero-vad-shadow-threshold",
+        type=float,
+        default=0.5,
+        help="Speech probability threshold used only in Silero shadow logs.",
+    )
+    p.add_argument(
+        "--silero-vad-shadow-log-sec",
+        type=_non_negative_float_arg,
+        default=1.0,
+        help="Minimum interval between periodic Silero shadow observations.",
     )
     p.add_argument(
         "--punct-cut-start-sec",

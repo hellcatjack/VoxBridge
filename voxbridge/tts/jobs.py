@@ -110,6 +110,7 @@ class RevisionStableTTSBuffer:
         self._released: dict[str, tuple[int, int, float]] = {}
         self._next_order = 0
         self._highest_source_order = -1
+        self._confirmed_through = -1
         self._sealed_through = -1
         self._lock = threading.RLock()
 
@@ -230,6 +231,15 @@ class RevisionStableTTSBuffer:
             self._sealed_through = next_value
             return changed
 
+    def confirm_through(self, source_order: int) -> bool:
+        if source_order < 0:
+            raise ValueError("source_order must not be negative")
+        with self._lock:
+            next_value = max(self._confirmed_through, int(source_order))
+            changed = next_value != self._confirmed_through
+            self._confirmed_through = next_value
+            return changed
+
     def mark_ready(
         self,
         sentence_id: str,
@@ -290,6 +300,8 @@ class RevisionStableTTSBuffer:
     ) -> tuple[float, str, bool]:
         if entry.source_order <= self._sealed_through:
             return 0.0, "source_sealed", False
+        if entry.source_order <= self._confirmed_through:
+            return self._stable_sec, "rollback_safe", False
         if (
             entry.source_order == self._highest_source_order
             and self._latest_revision_grace_sec > 0
@@ -385,6 +397,7 @@ class RevisionStableTTSBuffer:
             self._released.clear()
             self._next_order = 0
             self._highest_source_order = -1
+            self._confirmed_through = -1
             self._sealed_through = -1
 
 

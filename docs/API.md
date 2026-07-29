@@ -374,6 +374,7 @@ one stable subtitle row keyed by `sentence_id`.
   "seq": 43,
   "ts_ms": 1781901842000,
   "slice_commit": false,
+  "boundary_kind": "sentence",
   "is_stable": true,
   "stability": {
     "is_stable": true,
@@ -392,6 +393,11 @@ one stable subtitle row keyed by `sentence_id`.
 `revision` starts at `1`. Candidate position, rather than source-text equality,
 is authoritative, so intentionally repeated speech remains as separate sentence
 events with separate `sentence_id` values.
+
+`boundary_kind` is `sentence` for a strong terminal boundary or
+`stable_clause` for a long clause committed at a comma, semicolon, or colon.
+Both are backend-authoritative stable units. A stable clause does not rotate or
+finish the ASR streaming state.
 
 ### `sentence_updated`
 
@@ -668,26 +674,34 @@ when its `language` does not match the session's forced ASR language.
 Term validation rejects sentence punctuation, including sentence-final ASCII
 periods and colons. Dotted uppercase initialisms such as `U.S.` remain valid.
 
-Context is applied in `segment_final` mode by default. Live partial recognition
-uses an empty context, preserving natural low-latency output. After VAD or hard
-cut flushes the complete state, the backend runs one context-assisted decode on
-that complete segment and sends the corrected result through the existing text
-pool and translation pipeline. This avoids exposing a glossary to every 0.6
-second decode, which can make uncertain audio copy the glossary as speech.
-If a multi-term correction still closely matches the glossary itself and the
-context-free streaming output provides no comparable acoustic evidence, the
-backend rejects it as `context_echo` and keeps the streaming text. Accepted
-same-length lexical corrections update the existing `sentence_id`, increment
-its revision, and enqueue a replacement translation.
+Context is applied in `streaming` mode by default. The selected terms are sent
+to every streaming decode, so terminology can affect the generating subtitle
+before VAD or hard-cut finalization. The exact selected term tuple is also kept
+on the streaming state; the backend does not reconstruct the list by parsing
+the prompt.
 
-`--asr-context-apply-mode streaming` restores the original compatibility
-behavior and sends the selected context to every streaming decode. Do not use
-that mode for an unverified glossary. A glossary-shaped output is filtered only
-when it appears without similar incremental text from the preceding decode, so
-a speaker who audibly enumerates the same terms is retained. After at least one `segment_final`
-correction is accepted, the backend skips the context-free whole-session stop
-re-decode so it cannot overwrite already corrected segments. If no schedule
-window matched, normal stop-time re-decode remains enabled.
+Streaming context can occasionally make uncertain audio copy several glossary
+terms. Before a completed sentence receives a `sentence_id`, the backend scans
+it using longest-term-first matching. If one run contains at least three context
+terms and every separator in that run is either whitespace or zero length, the
+candidate is discarded. Punctuation or any non-context text between terms
+breaks the run. The discarded candidate is absent from solidified source text,
+translation requests, and TTS jobs. It may appear temporarily in the generating
+partial subtitle because partial output intentionally reflects the live model
+state. The same gate rejects a context-shaped revision of an already solidified
+sentence.
+
+This rule is language-independent and uses only the active session terms. It
+does not contain a fixed vocabulary, language-specific tokenization, or known
+phrase replacements. The existing silence-resume quarantine and whole-glossary
+echo checks remain as earlier defenses.
+
+`--asr-context-apply-mode segment_final` remains available as an explicit
+compatibility mode. It keeps context out of live partial recognition and runs a
+context-assisted decode only after VAD or hard cut flushes a complete segment.
+Accepted lexical corrections can revise existing sentence IDs and replacement
+translations, so this mode is not suitable when terminology must affect the
+first translation and TTS publication.
 
 Safety and tuning options:
 
@@ -696,12 +710,16 @@ Safety and tuning options:
   retained.
 - `--asr-context-lookaround-sec 30`: includes nearby windows to tolerate timing
   drift at state boundaries.
-- `--asr-context-apply-mode segment_final`: safe default; accepted values are
-  `segment_final` and `streaming`.
+- `--asr-context-apply-mode streaming`: default; accepted values are
+  `streaming` and `segment_final`.
 
 Invalid schedules fail startup before model loading. The `asr_context_selected`
 trace event contains elapsed audio time, language, apply mode, term/character
-counts, and a SHA-256 fingerprint. Segment-final correction emits
+counts, and a SHA-256 fingerprint. `context_run_commit_dropped` records a new
+candidate rejected by the streaming commit gate; `context_run_upgrade_rejected`
+records a rejected revision. Both events contain only candidate hashes, lengths,
+matched-term counts, and segment metadata, never the context terms themselves.
+Segment-final compatibility correction emits
 `asr_context_final_redecode_done`, `asr_context_final_redecode_skipped`, or
 `asr_context_final_redecode_failed`; these events also omit context text and
 store only exception type/fingerprint on failures. `sentence_upgrade_commit`
@@ -752,11 +770,25 @@ an observation-count threshold:
 - `--early-translation-stable-hits 3`
 - `--early-translation-short-stable-sec 1.2`
 - `--early-translation-short-stable-hits 4`
+- `--stable-clause-target-cjk-chars 32`
+- `--stable-clause-target-latin-words 24`
 
 The stricter pair applies structurally to short English terminal sentences.
-Text without terminal punctuation remains the generating tail and is not
-promoted by this gate. These decisions are backend-authoritative; clients must
-not maintain word lists, punctuation rules, or fixed timers to infer stability.
+A terminal sentence or long clause is not promoted until unchanged-duration and
+observation gates pass and following tokenizer output reaches at least
+`--unfixed-token-num`. This keeps the committed unit outside the model rollback
+window.
+
+Long text can be exposed as smaller stable translation units at generic comma,
+semicolon, or colon boundaries. The target is selected by script, not by words
+or phrases. The splitter chooses the first eligible boundary at or after the
+target, so later text cannot move an earlier boundary. It leaves the newest unit
+tentative, requires the full tokenizer rollback lookahead, and never cuts the
+ASR audio/state at a soft boundary. Setting the corresponding target to `0`
+disables this behavior.
+Short text without strong terminal punctuation remains the generating tail.
+These decisions are backend-authoritative; clients must not maintain word
+lists, punctuation rules, or fixed timers to infer stability.
 
 ### Stable Small Sentence-tail Revisions
 
@@ -792,10 +824,39 @@ When `--subtitle-trace-log` is enabled, logs contain two structured topics:
 
 Relevant recent events:
 
+- `silero_shadow_ready`: the per-WebSocket ONNX observer loaded successfully;
+  `control_mode` remains `observe_only` for VAD cuts and ASR decode scheduling.
+  Its speech evidence can release the context-only output guard described below.
+- `silero_shadow_observation`: sampled speech probability, SNR state, current
+  decode-skip decision, and whether the two detectors disagree.
+- `silero_shadow_transition`: immediate Silero speech/non-speech state change.
+- `silero_shadow_disagreement`: transition into or out of disagreement between
+  Silero and the existing SNR decode gate.
+- `silero_shadow_unavailable`: model loading or inference failed. ASR continues
+  with the existing VAD because the shadow observer is fail-open.
+- `audio_preroll_replayed`: the number and duration of previously skipped
+  samples prepended once when ASR decoding resumes.
+- `asr_context_resume_guard_armed`: at least three consecutive silent decode
+  skips activated the context-output guard. Arming happens before either a
+  resumed decode or segment finalization, so a VAD/Hard Cut cannot bypass it.
+- `asr_context_resume_partial_quarantined`: a partial dominated by at least
+  three session-context terms was withheld after silent decoding. When the
+  Silero observer is available, the guard remains active until 200 ms of speech
+  is confirmed. Without Silero, it uses one `chunk_size_sec` fallback window.
+  Ordinary non-context text is released immediately.
+- `asr_context_resume_guard_released`: the guard was released by confirmed
+  speech, ordinary non-context output, or expiry of the fallback window.
+- `asr_context_silent_segment_discarded`: segment or stop finalization produced
+  a context-dominated candidate while no resumed speech had been confirmed.
+  The candidate was not committed or translated. A prior non-context subtitle
+  snapshot is retained when available. These events contain hashes and lengths,
+  not the context or recognized text itself.
+
 - `final_commit_reconcile_skipped_noncanonical`: final text differs from
   committed text but is not a canonical full-session decode, so the backend kept
   existing subtitles.
-- `sentence_new_commit`: a new solidified source sentence was emitted.
+- `sentence_new_commit`: a new solidified source unit was emitted; includes
+  `boundary_kind`, tokenizer lookahead, required lookahead, and rollback safety.
 - `sentence_updated`: an existing source sentence was upgraded.
 - `candidate_action`: records whether a completed candidate was committed,
   upgraded, or skipped as structural segment overlap, including its candidate
@@ -808,6 +869,8 @@ Relevant recent events:
   terminal sentence remains tentative.
 - `early_translation_stable_commit`: records the same readiness evidence when
   the terminal sentence becomes solidified.
+- `stable_clause_rollback_wait`: records a deterministic clause held because
+  its following tokenizer output has not yet crossed `--unfixed-token-num`.
 - `pending_prefix_terminal_boundary_preserved`: records when a short terminal
   sentence immediately before a hard cut is kept as its own candidate because
   the next segment starts with a distinct completed sentence. The associated

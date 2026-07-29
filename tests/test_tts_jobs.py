@@ -186,6 +186,30 @@ def test_successor_removes_latest_grace_from_preceding_source():
     assert ready[0].release_reason == "quiet_window"
 
 
+def test_rollback_confirmed_newest_source_uses_base_quiet_window():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "first", "English")
+
+    assert buffer.confirm_through(0) is True
+    assert buffer.next_deadline() == pytest.approx(103.0)
+    wait = buffer.wait_state("s1")
+    assert wait is not None
+    assert wait.required_quiet_ms == 3000
+    assert wait.waiting_for_latest_grace is False
+
+    clock.advance(3.0)
+    ready = buffer.drain()
+
+    assert [item.text for item in ready] == ["first"]
+    assert ready[0].release_reason == "rollback_safe"
+
+
 def test_sealed_newest_source_releases_without_arbitrary_timer():
     clock = FakeClock(100.0)
     buffer = RevisionStableTTSBuffer(

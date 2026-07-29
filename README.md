@@ -8,6 +8,7 @@ VoxBridge 是一个面向会议、新闻和演讲场景的实时语音识别与�
 - 支持 `中文 -> 英文` 和 `英文 -> 中文`；启动后锁定方向，避免 ASR 语言与翻译方向漂移。
 - 每个 WebSocket 会话维护独立的 streaming state；VAD、硬时长轮转、最终 flush 和重叠处理均由后端负责。
 - 使用有界音频队列和背压机制，避免长时间会话无限积压。
+- 静音省算力期间保留最近 400 ms 未送入 ASR 的音频，恢复时一次补送，保护轻声起音；可选 Silero VAD 只写影子日志，不参与在线切段。
 - 后端通过 `sentence_id` 和 `revision` 明确区分新句、稳定修订和对应翻译，前端不使用固定词表猜测稳定性。
 - 支持页面输入会话级专业术语 Context，也支持后端加载有界、分时段的 context schedule。
 - 最近 100 条字幕可滚动查询；默认跟随最新内容，用户手动滚动时暂停自动跟随。
@@ -32,7 +33,7 @@ Browser PCM audio
   -> independent device FIFO playback
 ```
 
-浏览器只负责持续发送 PCM 音频和渲染后端事件。生成中的 `partial` 可以变化；已固化句子通过 `sentence_committed` 创建，通过 `sentence_updated` 更新同一个 `sentence_id`。翻译结果绑定具体 `revision`，过期结果不会覆盖新文本。
+浏览器只负责持续发送 PCM 音频和渲染后端事件。生成中的 `partial` 可以变化；已固化句子或长句中的稳定子句通过 `sentence_committed` 创建，通过 `sentence_updated` 更新同一个 `sentence_id`。稳定子句只影响字幕与翻译单元，不会在逗号处切换 ASR state。翻译结果绑定具体 `revision`，过期结果不会覆盖新文本。
 
 ## 系统要求
 
@@ -62,6 +63,14 @@ uv pip install --python .venv/bin/python -e .
 uv pip install --python .venv/bin/python -e '.[tts]'
 ```
 
+需要启用 Silero VAD 影子观测时，在已经验证好的加速环境中只安装其包和 ONNX 资源：
+
+```bash
+uv pip install --python .venv/bin/python --no-deps 'silero-vad==6.2.1'
+```
+
+不要在 ROCm 环境中直接解析安装 `.[vad-shadow]`；Silero 的通用依赖可能让解析器用 CUDA 版 Torch/Triton 替换现有 ROCm 版本。安装后必须重新核对 `torch`、`triton`、`torchaudio` 和 `onnxruntime` 版本。
+
 安装前建议先加 `--dry-run`，确认求解结果不会卸载或替换已有的 Torch、Triton、ROCm/CUDA 包。
 
 如果 VoxBridge 位于现有 Qwen3-ASR 工作区内，可直接执行
@@ -87,6 +96,17 @@ ss -lntp | rg ':8024'
 ```
 
 浏览器访问 `http://127.0.0.1:8024`。公网部署必须先阅读 [部署指南](docs/DEPLOYMENT.md)，启用认证并使用 HTTPS/WSS。
+
+生产 trace 已开启时，可以追加以下参数观测 VAD，而不改变当前 SNR 切段判断：
+
+```bash
+--silent-decode-pre-roll-sec 0.4 \
+--silero-vad-shadow \
+--silero-vad-shadow-threshold 0.5 \
+--silero-vad-shadow-log-sec 1.0
+```
+
+pre-roll 只缓存现有门控原本会跳过的音频，恢复推理后立即清空。Silero 加载或推理失败只会产生 `silero_shadow_unavailable`，不会阻断 ASR、翻译或 TTS。
 
 ## 翻译与 Context
 

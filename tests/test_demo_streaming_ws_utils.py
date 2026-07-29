@@ -37,6 +37,7 @@ from voxbridge.cli.demo_streaming_ws import (
     _should_skip_stream_decode,
     _should_use_high_batch_merge,
     _split_sentences_and_tail,
+    _split_translation_units_and_tail,
     _find_first_boundary_after,
     _hash_auth_password,
     _trim_leading_boundary_overlap,
@@ -127,6 +128,76 @@ def test_context_echo_guard_rejects_glossary_copy_but_not_natural_speech():
         "Amram Moses Aaron",
         "Amram, Moses, and Aaron.",
         previous_text="Amron, Moses, and Aaron.",
+    ) is False
+
+
+def test_context_fragment_echo_guard_requires_three_terms_and_dominant_coverage():
+    context = "尼希米 城墙 羊门 粪门 祭司 圣经"
+
+    assert demo_streaming_ws._looks_like_asr_context_fragment_echo(
+        context,
+        "所以说，城墙、羊门、粪门。",
+    ) is True
+    assert demo_streaming_ws._looks_like_asr_context_fragment_echo(
+        context,
+        "所以说，城墙和羊门。",
+    ) is False
+    assert demo_streaming_ws._looks_like_asr_context_fragment_echo(
+        context,
+        "城墙需要重建，祭司从羊门开始服侍，粪门随后也需要修复。",
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "terms", "expected_count"),
+    [
+        ("开场 城墙 羊门 粪门 后续", ("城墙", "羊门", "粪门"), 3),
+        ("开场城墙羊门粪门后续", ("城墙", "羊门", "粪门"), 3),
+        ("Elisha JORDAN Jericho.", ("Elisha", "Jordan", "Jericho"), 3),
+        ("城墙 城墙 城墙。", ("城墙", "羊门", "粪门"), 3),
+        ("城墙、羊门、粪门。", ("城墙", "羊门", "粪门"), None),
+        ("城墙 需要 羊门 粪门。", ("城墙", "羊门", "粪门"), None),
+        ("城墙 羊门。", ("城墙", "羊门", "粪门"), None),
+        ("abc", ("a", "ab", "b", "c"), None),
+    ],
+)
+def test_context_term_run_requires_three_terms_with_only_whitespace_between(
+    text,
+    terms,
+    expected_count,
+):
+    match = demo_streaming_ws._find_consecutive_context_term_run(text, terms)
+
+    assert (match[2] if match is not None else None) == expected_count
+
+
+def test_context_resume_guard_waits_for_speech_when_silero_is_available():
+    context = "尼希米 城墙 羊门 粪门 祭司 圣经"
+    fragment = "所以说，城墙、羊门、粪门。"
+
+    assert demo_streaming_ws._should_quarantine_asr_context_resume_partial(
+        context,
+        fragment,
+        guard_active=True,
+        silero_available=True,
+        speech_confirmed=False,
+        fallback_window_active=False,
+    ) is True
+    assert demo_streaming_ws._should_quarantine_asr_context_resume_partial(
+        context,
+        fragment,
+        guard_active=True,
+        silero_available=True,
+        speech_confirmed=True,
+        fallback_window_active=True,
+    ) is False
+    assert demo_streaming_ws._should_quarantine_asr_context_resume_partial(
+        context,
+        "整本圣经的作用和要求正在这里继续说明。",
+        guard_active=True,
+        silero_available=True,
+        speech_confirmed=False,
+        fallback_window_active=True,
     ) is False
 
 
@@ -797,7 +868,7 @@ def test_parse_args_uses_safe_asr_context_defaults(monkeypatch):
     assert args.asr_context_max_terms == 24
     assert args.asr_context_max_chars == 160
     assert args.asr_context_lookaround_sec == 30.0
-    assert args.asr_context_apply_mode == "segment_final"
+    assert args.asr_context_apply_mode == "streaming"
 
 
 def test_parse_args_accepts_asr_context_options(monkeypatch):
@@ -844,6 +915,12 @@ def test_parse_args_uses_balanced_early_translation_defaults(monkeypatch):
     assert args.early_translation_stable_hits == 3
     assert args.early_translation_short_stable_sec == 1.2
     assert args.early_translation_short_stable_hits == 4
+
+
+def test_parse_args_uses_streaming_context_by_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    assert parse_args().asr_context_apply_mode == "streaming"
 
 
 def test_parse_args_accepts_consumer_batch_and_rollover(monkeypatch):
@@ -898,6 +975,29 @@ def test_parse_args_accepts_backend_vad_thresholds(monkeypatch):
     assert args.backend_vad_enter_snr_db == 9.5
     assert args.backend_vad_exit_snr_db == 4.8
     assert args.backend_cut_stable_sec == 0.6
+
+
+def test_parse_args_accepts_decode_preroll_and_silero_shadow(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--silent-decode-pre-roll-sec",
+            "0.4",
+            "--silero-vad-shadow",
+            "--silero-vad-shadow-threshold",
+            "0.55",
+            "--silero-vad-shadow-log-sec",
+            "1.5",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.silent_decode_pre_roll_sec == 0.4
+    assert args.silero_vad_shadow is True
+    assert args.silero_vad_shadow_threshold == 0.55
+    assert args.silero_vad_shadow_log_sec == 1.5
 
 
 def test_parse_args_accepts_auto_slice_and_overlap(monkeypatch):
@@ -1533,6 +1633,89 @@ def test_split_sentences_keeps_original_punctuation_without_style_rewrite():
     assert tail == ""
     joined = "".join(sentences)
     assert "第五。次测试翻译" in joined
+
+
+def test_split_translation_units_breaks_long_cjk_tail_only_at_clause_boundaries():
+    text = (
+        "一个在南边的家，一个在 P C C 的教会，另外一个家在 P C C O 的家，"
+        "都是神托付给我看管的家，我有责任看顾家人的灵命成长，"
+        "我也有责任看顾两个儿子与神的关系，但是最重要的是，"
+        "我在教会中也有责任看管神所托付给我的羊，我也需要帮助牧者，"
+        "我也需要分担他们的责任，所以刚开始必须建立好自己属灵的家"
+    )
+
+    completed, tail = _split_translation_units_and_tail(
+        text,
+        target_cjk_chars=32,
+        target_latin_words=24,
+    )
+
+    assert len(completed) >= 3
+    assert all(part.endswith(("，", "；", "：")) for part in completed)
+    assert all(len("".join(part.split())) <= 50 for part in completed)
+    assert tail.endswith("所以刚开始必须建立好自己属灵的家")
+    assert "".join([*completed, tail]).replace(" ", "") == text.replace(" ", "")
+
+
+def test_split_translation_units_keeps_short_comma_text_tentative():
+    text = "这是一个自然停顿，但后面的内容还在生成"
+
+    completed, tail = _split_translation_units_and_tail(
+        text,
+        target_cjk_chars=32,
+        target_latin_words=24,
+    )
+
+    assert completed == []
+    assert tail == text
+
+
+def test_split_translation_units_does_not_retroactively_move_a_clause_boundary():
+    first_clause = f"{'甲' * 21}，"
+    initial = f"{first_clause}{'乙' * 11}"
+    grown = f"{initial}乙，"
+    extended = f"{grown}{'丙' * 32}，"
+
+    initial_completed, initial_tail = _split_translation_units_and_tail(
+        initial,
+        target_cjk_chars=32,
+        target_latin_words=24,
+    )
+    grown_completed, _ = _split_translation_units_and_tail(
+        grown,
+        target_cjk_chars=32,
+        target_latin_words=24,
+    )
+    extended_completed, _ = _split_translation_units_and_tail(
+        extended,
+        target_cjk_chars=32,
+        target_latin_words=24,
+    )
+
+    assert initial_completed == []
+    assert initial_tail == initial
+    assert grown_completed == [grown]
+    assert extended_completed[:1] == grown_completed
+
+
+def test_split_translation_units_supports_long_english_without_language_phrases():
+    text = (
+        "We care for the people entrusted to us, and we help their families grow in faith, "
+        "while we also support the leaders who share this responsibility, because healthy "
+        "communities begin with faithful care"
+    )
+
+    completed, tail = _split_translation_units_and_tail(
+        text,
+        target_cjk_chars=32,
+        target_latin_words=12,
+    )
+
+    assert len(completed) >= 1
+    assert all(part.endswith((",", ";", ":")) for part in completed)
+    assert all(len(re.findall(r"[A-Za-z0-9]+", part)) <= 18 for part in completed)
+    assert tail
+    assert " ".join([*completed, tail]).replace("  ", " ") == text
 
 
 def test_split_sentences_uses_generic_closing_quote_boundaries():
