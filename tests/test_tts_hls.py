@@ -15,11 +15,13 @@ import pytest
 
 from voxbridge.tts.hls import (
     FFmpegHLSEncoder,
+    HLSAppendReceipt,
     HLSListenerCapacityExceeded,
     HLSListenerNotFound,
     HLSQueueFull,
     SharedHLSTTSPublisher,
     decode_mono_pcm16_wav,
+    parse_hls_live_edge_at_ms,
 )
 from voxbridge.tts.jobs import TTSReadyItem
 
@@ -629,6 +631,62 @@ async def test_shared_publisher_queue_is_bounded(tmp_path):
 def test_decode_mono_pcm16_wav_rejects_incompatible_audio():
     with pytest.raises(ValueError, match="sample rate"):
         decode_mono_pcm16_wav(make_wav(sample_rate=16000), expected_rate=24000)
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_append_receipts_follow_pending_pcm_fifo(tmp_path):
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+        wall_clock=lambda: 100.0,
+    )
+    encoder._process = SimpleNamespace(returncode=None)
+
+    first = await encoder.append_pcm(bytes(8000 * 2))
+    second = await encoder.append_pcm(bytes(4000 * 2))
+
+    assert first == HLSAppendReceipt(start_at_ms=100_000, end_at_ms=101_000)
+    assert second == HLSAppendReceipt(start_at_ms=101_000, end_at_ms=101_500)
+    encoder._process = None
+
+
+def test_hls_live_edge_uses_last_complete_program_date_time_segment():
+    playlist = """#EXTM3U
+#EXT-X-PROGRAM-DATE-TIME:2026-08-11T10:00:00.000-04:00
+#EXTINF:1.024,
+segment_000000001.ts
+#EXT-X-PROGRAM-DATE-TIME:2026-08-11T10:00:01.024-04:00
+#EXTINF:0.512,
+segment_000000002.ts
+"""
+
+    assert parse_hls_live_edge_at_ms(playlist) == 1_786_456_801_536
+
+
+@pytest.mark.parametrize(
+    "playlist",
+    [
+        "",
+        "#EXTM3U\n#EXTINF:1.0,\nsegment_000000001.ts\n",
+        (
+            "#EXTM3U\n"
+            "#EXT-X-PROGRAM-DATE-TIME:not-a-date\n"
+            "#EXTINF:1.0,\nsegment_000000001.ts\n"
+        ),
+        (
+            "#EXTM3U\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-08-11T10:00:00\n"
+            "#EXTINF:1.0,\nsegment_000000001.ts\n"
+        ),
+        (
+            "#EXTM3U\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-08-11T10:00:00-04:00\n"
+            "#EXTINF:1.0,\n"
+        ),
+    ],
+)
+def test_hls_live_edge_rejects_incomplete_or_invalid_playlist(playlist):
+    assert parse_hls_live_edge_at_ms(playlist) is None
 
 
 @pytest.mark.asyncio

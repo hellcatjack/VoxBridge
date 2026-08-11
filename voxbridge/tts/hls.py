@@ -9,6 +9,7 @@ import time
 import uuid
 import wave
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -46,6 +47,12 @@ class HLSListenerLease:
 
 
 @dataclass(frozen=True, slots=True)
+class HLSAppendReceipt:
+    start_at_ms: int
+    end_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class HLSStreamStatus:
     available: bool
     listener_count: int
@@ -67,11 +74,13 @@ class HLSEncoder(Protocol):
 
     async def start(self) -> None: ...
 
-    async def append_pcm(self, pcm: bytes) -> None: ...
+    async def append_pcm(self, pcm: bytes) -> HLSAppendReceipt | None: ...
 
     async def wait_ready(self, timeout: float = 5.0) -> None: ...
 
     def playlist_text(self) -> str: ...
+
+    def live_edge_at_ms(self) -> int | None: ...
 
     def segment_path(self, name: str) -> Path: ...
 
@@ -113,6 +122,44 @@ def decode_mono_pcm16_wav(wav_bytes: bytes, *, expected_rate: int) -> bytes:
     return frames
 
 
+def parse_hls_live_edge_at_ms(playlist: str) -> int | None:
+    """Return the wall-clock end of the last complete HLS media segment."""
+
+    program_time: datetime | None = None
+    duration_sec: float | None = None
+    last_end_ms: int | None = None
+    for raw_line in str(playlist or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            value = line.split(":", 1)[1].strip()
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                program_time = None
+            else:
+                program_time = parsed if parsed.tzinfo is not None else None
+            duration_sec = None
+            continue
+        if line.startswith("#EXTINF:"):
+            value = line.split(":", 1)[1].split(",", 1)[0].strip()
+            try:
+                parsed_duration = float(value)
+            except ValueError:
+                duration_sec = None
+            else:
+                duration_sec = parsed_duration if parsed_duration > 0 else None
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if program_time is not None and duration_sec is not None:
+            last_end_ms = round(
+                (program_time.timestamp() + duration_sec) * 1000.0
+            )
+        program_time = None
+        duration_sec = None
+    return last_end_ms
+
+
 class FFmpegHLSEncoder:
     """Encode one real-time mono PCM timeline into shared audio-only HLS."""
 
@@ -127,6 +174,7 @@ class FFmpegHLSEncoder:
         ffmpeg_path: str = "ffmpeg",
         frame_ms: int = 100,
         pcm_queue_size: int = 8,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.root = Path(root)
         self.sample_rate = max(8000, int(sample_rate))
@@ -135,6 +183,7 @@ class FFmpegHLSEncoder:
         self.bitrate = str(bitrate or "64k")
         self.ffmpeg_path = str(ffmpeg_path or "ffmpeg")
         self.frame_ms = max(20, int(frame_ms))
+        self._wall_clock = wall_clock
         self._pcm_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=max(1, int(pcm_queue_size))
         )
@@ -201,14 +250,23 @@ class FFmpegHLSEncoder:
         self._writer_task = asyncio.create_task(self._writer_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-    async def append_pcm(self, pcm: bytes) -> None:
+    async def append_pcm(self, pcm: bytes) -> HLSAppendReceipt:
         if self._closed or self._process is None:
             raise HLSUnavailable("HLS encoder is not running")
         data = bytes(pcm)
         if not data or len(data) % 2:
             raise ValueError("PCM payload must contain complete signed-16 samples")
         await self._pcm_queue.put(data)
+        bytes_per_second = self.sample_rate * 2
+        start_at_ms = round(
+            self._wall_clock() * 1000.0
+            + self._pending_pcm_bytes * 1000.0 / bytes_per_second
+        )
         self._pending_pcm_bytes += len(data)
+        end_at_ms = round(
+            start_at_ms + len(data) * 1000.0 / bytes_per_second
+        )
+        return HLSAppendReceipt(start_at_ms=start_at_ms, end_at_ms=end_at_ms)
 
     async def _writer_loop(self) -> None:
         frame_samples = max(1, round(self.sample_rate * self.frame_ms / 1000))
@@ -279,6 +337,12 @@ class FFmpegHLSEncoder:
             return self.playlist_path.read_text(encoding="utf-8")
         except OSError as exc:
             raise HLSUnavailable("HLS playlist is unavailable") from exc
+
+    def live_edge_at_ms(self) -> int | None:
+        try:
+            return parse_hls_live_edge_at_ms(self.playlist_text())
+        except HLSUnavailable:
+            return None
 
     def segment_path(self, name: str) -> Path:
         value = str(name or "")
@@ -803,6 +867,7 @@ class SharedHLSTTSPublisher:
 
 __all__ = [
     "FFmpegHLSEncoder",
+    "HLSAppendReceipt",
     "HLSError",
     "HLSListenerCapacityExceeded",
     "HLSListenerLease",
@@ -812,4 +877,5 @@ __all__ = [
     "HLSUnavailable",
     "SharedHLSTTSPublisher",
     "decode_mono_pcm16_wav",
+    "parse_hls_live_edge_at_ms",
 ]
