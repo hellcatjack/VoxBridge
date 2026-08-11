@@ -237,16 +237,24 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     .now-playing strong {
       display: block;
       min-width: 0;
-      max-height: 4.6em;
       color: var(--forest);
       font-family: Georgia, "Times New Roman", serif;
       font-size: clamp(17px, 3.4vw, 28px);
       font-weight: 500;
       line-height: 1.15;
-      overflow: hidden;
       overflow-wrap: break-word;
       text-wrap: pretty;
       transition: color 180ms ease, opacity 180ms ease;
+    }
+
+    .now-playing[data-caption-fitting="compact"] {
+      padding: 8px;
+    }
+
+    .now-playing[data-caption-fitting="compact"] small,
+    .now-playing[data-caption-fitting="compact"] .playback-state,
+    .now-playing[data-caption-fitting="compact"] .pulse {
+      display: none;
     }
 
     .now-playing[data-speaking="false"] strong {
@@ -424,7 +432,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       main {
         width: min(1020px, 100%);
         grid-template-columns: minmax(240px, 0.8fr) minmax(420px, 1.35fr);
-        grid-template-rows: auto auto minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr) auto;
         column-gap: 12px;
         row-gap: 7px;
       }
@@ -532,6 +540,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const CATCH_UP_STOP_LAG_SEC = 5;
     const CATCH_UP_RATE = 1.2;
     const CAPTION_POLL_INTERVAL_MS = 500;
+    const MIN_CAPTION_FONT_PX = 8;
 
     let playbackRate = readPlaybackRate();
     let listenerId = "";
@@ -542,6 +551,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let catchingUp = false;
     let captionSnapshot = null;
     let captionCueId = "";
+    let captionResizeFrame = null;
     playbackRateInput.value = String(playbackRate);
 
     function normalizePlaybackRate(value) {
@@ -599,6 +609,51 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       liveCaption.classList.add("caption-reveal");
     }
 
+    function captionFitsCard() {
+      return nowPlaying.scrollHeight <= nowPlaying.clientHeight + 1
+        && nowPlaying.scrollWidth <= nowPlaying.clientWidth + 1;
+    }
+
+    function fitLiveCaption() {
+      nowPlaying.dataset.captionFitting = "";
+      liveCaption.style.fontSize = "";
+      const maximumFontPx = Number.parseFloat(
+        window.getComputedStyle(liveCaption).fontSize
+      );
+      if (!Number.isFinite(maximumFontPx) || captionFitsCard()) return;
+
+      const fitAtSmallestSize = () => {
+        liveCaption.style.fontSize = `${MIN_CAPTION_FONT_PX}px`;
+        return captionFitsCard();
+      };
+      if (!fitAtSmallestSize()) {
+        nowPlaying.dataset.captionFitting = "compact";
+        liveCaption.style.fontSize = "";
+        if (captionFitsCard()) return;
+        if (!fitAtSmallestSize()) return;
+      }
+
+      let smallestFitPx = MIN_CAPTION_FONT_PX;
+      let largestOverflowPx = maximumFontPx;
+      for (let index = 0; index < 8; index += 1) {
+        const candidatePx = (smallestFitPx + largestOverflowPx) / 2;
+        liveCaption.style.fontSize = `${candidatePx}px`;
+        if (captionFitsCard()) smallestFitPx = candidatePx;
+        else largestOverflowPx = candidatePx;
+      }
+      liveCaption.style.fontSize = `${smallestFitPx.toFixed(2)}px`;
+    }
+
+    function scheduleCaptionFit() {
+      if (captionResizeFrame !== null) {
+        window.cancelAnimationFrame(captionResizeFrame);
+      }
+      captionResizeFrame = window.requestAnimationFrame(() => {
+        captionResizeFrame = null;
+        fitLiveCaption();
+      });
+    }
+
     function setLiveCaption(text, cueId = "") {
       const nextText = String(text || "").trim();
       if (!nextText) return;
@@ -606,6 +661,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (liveCaption.textContent === nextText && captionCueId === nextCueId) return;
       liveCaption.textContent = nextText;
       captionCueId = nextCueId;
+      fitLiveCaption();
       revealCaption();
     }
 
@@ -875,6 +931,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       producerStatus.textContent = "Waiting";
       queueStatus.textContent = "Not joined";
       liveCaption.textContent = "Waiting to start";
+      fitLiveCaption();
       playbackStatus.textContent = "Start listening to join the shared stream";
       setCard(connectionCard, "warn");
       setCard(producerCard, "warn");
@@ -948,7 +1005,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       updateLiveLatencyGuard();
       if (!document.hidden) void pollCaptions();
     });
+    window.addEventListener("resize", scheduleCaptionFit);
     window.addEventListener("beforeunload", () => {
+      if (captionResizeFrame !== null) {
+        window.cancelAnimationFrame(captionResizeFrame);
+      }
       stopStatusPolling();
       stopCaptionPolling();
       releaseListenerLease(listenerId);

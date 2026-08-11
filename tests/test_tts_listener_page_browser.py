@@ -10,6 +10,16 @@ from voxbridge.tts.listener_page import TTS_LISTENER_HTML
 sync_api = pytest.importorskip("playwright.sync_api")
 sync_playwright = sync_api.sync_playwright
 
+LONG_CAPTION = (
+    (
+        "When the congregation had gathered together, the speaker explained that "
+        "faithfulness in ordinary work, patient service to one another, and careful "
+        "attention to the teaching of Scripture are not separate duties, but parts "
+        "of the same calling that shapes the life of the whole church. "
+    )
+    * 4
+)[:1000].rstrip()
+
 
 @pytest.fixture
 def listener_page():
@@ -235,6 +245,106 @@ def test_listener_fits_viewport_without_document_scrollbars(
         "bodyX": False,
         "bodyY": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(1440, 900), (390, 844), (844, 390), (320, 568)],
+)
+def test_listener_fits_complete_long_caption_inside_live_audio_card(
+    listener_page,
+    width,
+    height,
+):
+    _install_hls_harness(
+        listener_page,
+        caption_snapshot={
+            "live_edge_at_ms": 1_000_000,
+            "cues": [
+                {
+                    "cue_id": "long-caption",
+                    "text": LONG_CAPTION,
+                    "start_at_ms": 990_000,
+                    "end_at_ms": 999_000,
+                }
+            ],
+        },
+    )
+    listener_page.set_viewport_size({"width": width, "height": height})
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=95, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.startsWith('When the congregation')"
+    )
+
+    metrics = listener_page.evaluate(
+        """() => {
+          const caption = document.querySelector('#liveCaption');
+          const card = document.querySelector('#nowPlaying');
+          const controls = document.querySelector('.controls');
+          const cardRect = card.getBoundingClientRect();
+          const controlsRect = controls.getBoundingClientRect();
+          return {
+            captionClipped: caption.scrollHeight > caption.clientHeight + 1,
+            cardClipped: card.scrollHeight > card.clientHeight + 1,
+            controlsOverlap: cardRect.bottom > controlsRect.top + 1,
+            controlsOutsideViewport:
+              controlsRect.left < 0
+              || controlsRect.right > window.innerWidth + 1
+              || controlsRect.top < 0
+              || controlsRect.bottom > window.innerHeight + 1,
+            documentOverflow:
+              document.documentElement.scrollHeight > window.innerHeight
+              || document.documentElement.scrollWidth > window.innerWidth,
+          };
+        }"""
+    )
+    assert listener_page.text_content("#liveCaption") == LONG_CAPTION
+    assert metrics == {
+        "captionClipped": False,
+        "cardClipped": False,
+        "controlsOverlap": False,
+        "controlsOutsideViewport": False,
+        "documentOverflow": False,
+    }
+
+
+def test_listener_refits_long_caption_after_device_rotation(listener_page):
+    _install_hls_harness(
+        listener_page,
+        caption_snapshot={
+            "live_edge_at_ms": 1_000_000,
+            "cues": [
+                {
+                    "cue_id": "rotated-long-caption",
+                    "text": LONG_CAPTION,
+                    "start_at_ms": 990_000,
+                    "end_at_ms": 999_000,
+                }
+            ],
+        },
+    )
+    listener_page.set_viewport_size({"width": 390, "height": 844})
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=95, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.startsWith('When the congregation')"
+    )
+
+    listener_page.set_viewport_size({"width": 844, "height": 390})
+    listener_page.wait_for_function(
+        """() => {
+          const caption = document.querySelector('#liveCaption');
+          const card = document.querySelector('#nowPlaying');
+          const controls = document.querySelector('.controls');
+          const cardRect = card.getBoundingClientRect();
+          const controlsRect = controls.getBoundingClientRect();
+          return caption.scrollHeight <= caption.clientHeight + 1
+            && card.scrollHeight <= card.clientHeight + 1
+            && cardRect.bottom <= controlsRect.top + 1;
+        }"""
+    )
+    assert listener_page.text_content("#liveCaption") == LONG_CAPTION
 
 
 def test_rate_change_updates_persistent_media_element(listener_page):
