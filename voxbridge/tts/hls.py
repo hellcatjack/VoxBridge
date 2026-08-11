@@ -153,7 +153,6 @@ def parse_hls_live_edge_at_ms(playlist: str) -> int | None:
                 program_time = None
             else:
                 program_time = parsed if parsed.tzinfo is not None else None
-            duration_sec = None
             continue
         if line.startswith("#EXTINF:"):
             value = line.split(":", 1)[1].split(",", 1)[0].strip()

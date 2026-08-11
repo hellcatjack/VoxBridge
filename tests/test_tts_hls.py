@@ -755,6 +755,16 @@ segment_000000002.ts
     assert parse_hls_live_edge_at_ms(playlist) == 1_786_456_801_536
 
 
+def test_hls_live_edge_accepts_ffmpeg_program_time_after_extinf():
+    playlist = """#EXTM3U
+#EXTINF:1.024000,
+#EXT-X-PROGRAM-DATE-TIME:2026-08-11T00:29:06.816-0400
+segment_000000000.ts
+"""
+
+    assert parse_hls_live_edge_at_ms(playlist) == 1_786_422_547_840
+
+
 @pytest.mark.parametrize(
     "playlist",
     [
