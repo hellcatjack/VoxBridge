@@ -6,6 +6,9 @@ All notable public changes to VoxBridge are documented here.
 
 ### Fixed
 
+- Added a bounded HLS caption timeline and synchronized the PCCS Live Audio text
+  to each listener's actual playhead, retaining the previous sentence between
+  cues without making advisory caption polling a dependency of lock-screen audio.
 - Prepared exact translated-sentence revisions on the existing single Kokoro
   worker while the backend stability gate is still active, then reused only an
   exact cache hit at ordered HLS release. Revised text invalidates stale audio,

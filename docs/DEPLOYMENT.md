@@ -259,6 +259,15 @@ so the listener applies a non-skipping live-latency guard: at a 12-second gap
 from the live edge it temporarily uses `1.2x`, restores the selected rate inside
 five seconds, and uses at least `1.0x` while the page is hidden or locked.
 
+The publisher also retains at most 256 caption cues for audio already released
+to the current HLS encoder epoch. Each cue uses the encoder's wall-clock audio
+receipt and excludes the fixed 300ms sentence pause. `/listen` polls the
+listener-scoped caption snapshot only while the page is visible and maps the
+device's `seekable.end - currentTime` lag onto that timeline. A failed caption
+request must not stop or restart HLS playback. Monitor caption endpoint errors
+separately from FFmpeg and audio backlog; a caption failure is a display
+degradation, not an audio-stream outage.
+
 With an active listener, translation completion also queues bounded speculative
 Kokoro preparation for the exact sentence revision. It does not append PCM to
 HLS or bypass `--tts-revision-stable-sec`; stable ordered release consumes the

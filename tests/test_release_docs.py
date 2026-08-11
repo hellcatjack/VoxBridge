@@ -115,6 +115,12 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert '"pending_audio_ms"' in api
     assert "does not seek or discard translated speech" in api
     assert "GET /api/tts/live/{listener_id}/index.m3u8" in api
+    assert "GET /api/tts/live/{listener_id}/captions" in api
+    assert '"live_edge_at_ms"' in api
+    assert '"cues"' in api
+    assert "256" in api
+    assert "seekable.end - currentTime" in api
+    assert "does not gate HLS audio" in api
     assert "GET /api/tts/live/{listener_id}/segments/{segment_name}" in api
     assert "DELETE /api/tts/live/{listener_id}" in api
     assert "persistent native media element" in api
@@ -149,6 +155,8 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "90-second lease" in deployment
     assert "12-second" in deployment
     assert "live edge" in deployment
+    assert "caption cue" in deployment.lower()
+    assert "256" in deployment
     assert "--tts-hls-max-listeners 128" in deployment
     assert "bounded pre-listener backlog" in deployment
     assert "public bearer capability" in deployment

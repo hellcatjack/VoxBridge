@@ -118,6 +118,41 @@ release can publish it. Stable release reuses an exact cache hit, including work
 already in flight, so it does not create a second Kokoro synthesis. The cache is
 bounded to eight entries and is cleared with the listener epoch.
 
+### `GET /api/tts/live/{listener_id}/captions`
+
+Returns the recent translated caption cues for the matching live HLS lease:
+
+```json
+{
+  "live_edge_at_ms": 1786400000123,
+  "cues": [
+    {
+      "cue_id": "a3f85d7f59ee7f29",
+      "start_at_ms": 1786399995200,
+      "end_at_ms": 1786399997880,
+      "text": "The sentence currently being spoken."
+    }
+  ]
+}
+```
+
+`live_edge_at_ms` is the wall-clock end of the newest complete HLS segment.
+Each cue spans only its synthesized speech; `end_at_ms` excludes the fixed
+`300ms` inter-sentence pause. The server retains at most 256 caption cues for
+the current encoder epoch and clears them when that shared stream ends.
+
+The listener estimates its device-local playhead as
+`live_edge_at_ms - (seekable.end - currentTime) * 1000`, then selects the newest
+cue whose start is not later than that playhead. It therefore displays what that
+device is hearing instead of the newest server translation. Between cues the
+page keeps the previous sentence visible in a subdued state rather than clearing
+the text. The response uses `Cache-Control: no-store`. Caption polling is
+advisory and does not gate HLS audio; lock-screen playback continues if polling
+is suspended or temporarily fails.
+
+The endpoint requires an existing matching public bearer capability and returns
+`404` for an unknown or expired listener. It does not create or refresh a lease.
+
 ### `GET /api/tts/live/{listener_id}/segments/{segment_name}`
 
 Refreshes the matching lease and returns one shared MPEG-TS/AAC segment. Segment
