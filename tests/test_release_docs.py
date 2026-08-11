@@ -119,7 +119,10 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert '"live_edge_at_ms"' in api
     assert '"cues"' in api
     assert "256" in api
-    assert "seekable.end - currentTime" in api
+    assert "getStartDate() + currentTime" in api
+    assert "PCM media timeline" in api
+    assert "1024-sample" in api
+    assert "edge silence" in api
     assert "does not gate HLS audio" in api
     assert "GET /api/tts/live/{listener_id}/segments/{segment_name}" in api
     assert "DELETE /api/tts/live/{listener_id}" in api
@@ -156,6 +159,8 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "12-second" in deployment
     assert "live edge" in deployment
     assert "caption cue" in deployment.lower()
+    assert "getStartDate()" in deployment
+    assert "PCM media timeline" in deployment
     assert "256" in deployment
     assert "--tts-hls-max-listeners 128" in deployment
     assert "bounded pre-listener backlog" in deployment

@@ -369,6 +369,42 @@ def test_listener_caption_follows_device_playhead_instead_of_newest_cue(listener
     )
 
 
+def test_listener_uses_hls_start_date_when_server_playlist_is_ahead(listener_page):
+    _install_hls_harness(
+        listener_page,
+        caption_snapshot={
+            "live_edge_at_ms": 115_000,
+            "cues": [
+                {
+                    "cue_id": "device-cue",
+                    "start_at_ms": 103_000,
+                    "end_at_ms": 105_000,
+                    "text": "The sentence this device is actually playing.",
+                },
+                {
+                    "cue_id": "server-cue",
+                    "start_at_ms": 107_000,
+                    "end_at_ms": 109_000,
+                    "text": "The sentence only the server has reached.",
+                },
+            ],
+        },
+    )
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    listener_page.locator("#ttsPlayback").evaluate(
+        "node => { node.getStartDate = () => new Date(10_000); }"
+    )
+    listener_page.locator("#ttsPlayback").dispatch_event("timeupdate")
+
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.includes('actually playing')"
+    )
+    assert listener_page.text_content("#liveCaption") == (
+        "The sentence this device is actually playing."
+    )
+
+
 def test_listener_retains_caption_between_cues_without_empty_transition(listener_page):
     _install_hls_harness(
         listener_page,

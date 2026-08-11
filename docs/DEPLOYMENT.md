@@ -260,12 +260,16 @@ from the live edge it temporarily uses `1.2x`, restores the selected rate inside
 five seconds, and uses at least `1.0x` while the page is hidden or locked.
 
 The publisher also retains at most 256 caption cues for audio already released
-to the current HLS encoder epoch. Each cue uses the encoder's wall-clock audio
-receipt and excludes the fixed 300ms sentence pause. `/listen` polls the
-listener-scoped caption snapshot only while the page is visible and maps the
-device's `seekable.end - currentTime` lag onto that timeline. A failed caption
-request must not stop or restart HLS playback. Monitor caption endpoint errors
-separately from FFmpeg and audio backlog; a caption failure is a display
+to the current HLS encoder epoch. Each cue uses the PCM media timeline submitted
+to FFmpeg, includes the AAC 1024-sample presentation delay, removes synthesized
+edge silence by waveform activity, and excludes the fixed 300ms sentence pause.
+`/listen` polls the listener-scoped caption snapshot only while the page is
+visible. Safari maps its native media timeline with `getStartDate() +
+currentTime`, so a stale device playlist or a listener-side playback rate does
+not move captions ahead of audible speech. The server live-edge calculation is
+only a fallback for media implementations without a valid start date. A failed
+caption request must not stop or restart HLS playback. Monitor caption endpoint
+errors separately from FFmpeg and audio backlog; a caption failure is a display
 degradation, not an audio-stream outage.
 
 With an active listener, translation completion also queues bounded speculative

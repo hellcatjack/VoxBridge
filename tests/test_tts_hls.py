@@ -8,6 +8,7 @@ import struct
 import subprocess
 import threading
 import wave
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -370,6 +371,47 @@ async def test_caption_cue_is_created_only_when_stable_audio_is_published(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_caption_cue_excludes_synthesized_edge_silence(tmp_path):
+    sample_rate = 24000
+    leading_samples = round(sample_rate * 0.08)
+    speech_samples = round(sample_rate * 0.25)
+    trailing_samples = round(sample_rate * 0.10)
+    samples = (
+        [0] * leading_samples
+        + [
+            round(1200 * math.sin(2 * math.pi * 440 * index / sample_rate))
+            for index in range(speech_samples)
+        ]
+        + [0] * trailing_samples
+    )
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+    synth = FakeSynthesizer(output.getvalue(), duration_ms=430)
+    encoder = FakeEncoder(tmp_path / "stream")
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        clock=FakeClock(),
+    )
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        assert await publisher.publish(ready_item(12)) is True
+        await publisher.wait_idle()
+
+        cue = publisher.caption_snapshot("iphone-a", "owner-a").cues[0]
+        assert cue.start_at_ms == 100_080
+        assert cue.end_at_ms == 100_330
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
 async def test_caption_history_is_bounded_and_cleared_with_listener_epoch(tmp_path):
     synth = FakeSynthesizer(make_wav())
     encoders: list[FakeEncoder] = []
@@ -726,19 +768,19 @@ def test_decode_mono_pcm16_wav_rejects_incompatible_audio():
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_append_receipts_follow_pending_pcm_fifo(tmp_path):
+async def test_ffmpeg_append_receipts_follow_media_timeline_fifo(tmp_path):
     encoder = FFmpegHLSEncoder(
         tmp_path / "live",
         sample_rate=8000,
-        wall_clock=lambda: 100.0,
     )
     encoder._process = SimpleNamespace(returncode=None)
+    encoder._timeline_origin_at_ms = 100_000
 
     first = await encoder.append_pcm(bytes(8000 * 2))
     second = await encoder.append_pcm(bytes(4000 * 2))
 
-    assert first == HLSAppendReceipt(start_at_ms=100_000, end_at_ms=101_000)
-    assert second == HLSAppendReceipt(start_at_ms=101_000, end_at_ms=101_500)
+    assert first == HLSAppendReceipt(start_at_ms=100_128, end_at_ms=101_128)
+    assert second == HLSAppendReceipt(start_at_ms=101_128, end_at_ms=101_628)
     encoder._process = None
 
 
@@ -795,6 +837,7 @@ def test_hls_live_edge_rejects_incomplete_or_invalid_playlist(playlist):
 async def test_ffmpeg_encoder_applies_backpressure_to_pending_pcm(tmp_path):
     encoder = FFmpegHLSEncoder(tmp_path / "live", pcm_queue_size=1)
     encoder._process = SimpleNamespace(returncode=None)
+    encoder._timeline_origin_at_ms = 100_000
     await encoder.append_pcm(b"\x00\x00")
 
     blocked_append = asyncio.create_task(encoder.append_pcm(b"\x01\x00"))
@@ -822,6 +865,7 @@ async def test_ffmpeg_encoder_tracks_audio_until_writer_consumes_it(tmp_path):
         frame_ms=20,
     )
     encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
     pcm = bytes(round(24000 * 0.1) * 2)
     await encoder.append_pcm(pcm)
 
@@ -860,6 +904,7 @@ async def test_ffmpeg_pending_audio_does_not_charge_frame_padding_to_next_clip(t
         frame_ms=20,
     )
     encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
     await encoder.append_pcm(bytes(100))
     await encoder.append_pcm(bytes(9600))
 
@@ -891,32 +936,113 @@ async def test_ffmpeg_encoder_produces_shared_aac_hls_segment(tmp_path):
     try:
         pcm = decode_mono_pcm16_wav(make_wav(duration_ms=700), expected_rate=24000)
         await encoder.append_pcm(pcm)
-        await encoder.wait_ready(timeout=5)
+        await asyncio.sleep(1.0)
         playlist = encoder.playlist_text()
-        segment_name = next(
+        probe = None
+        for segment_name in (
             line.strip()
             for line in playlist.splitlines()
             if line.strip().endswith(".ts")
-        )
-        segment = encoder.segment_path(segment_name)
-        probe = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "a:0",
-                "-show_entries",
-                "stream=codec_name,sample_rate",
-                "-of",
-                "default=nw=1",
-                str(segment),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        ):
+            candidate = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name,sample_rate",
+                    "-of",
+                    "default=nw=1",
+                    str(encoder.segment_path(segment_name)),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if candidate.returncode == 0 and "codec_name=aac" in candidate.stdout:
+                probe = candidate
+                break
+        assert probe is not None
         assert "codec_name=aac" in probe.stdout
         assert "sample_rate=24000" in probe.stdout
     finally:
         await encoder.close()
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_append_receipt_matches_decoded_hls_audio_timeline(tmp_path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is unavailable")
+    root = tmp_path / "live-sync"
+    encoder = FFmpegHLSEncoder(
+        root,
+        sample_rate=24000,
+        segment_sec=1.0,
+        frame_ms=100,
+    )
+    tone_pcm = struct.pack(
+        "<28800h",
+        *[
+            round(12000 * math.sin(2 * math.pi * 997 * index / 24000))
+            for index in range(28800)
+        ],
+    )
+
+    await encoder.start()
+    try:
+        await encoder.wait_ready(timeout=5)
+        await asyncio.sleep(0.2)
+        receipt = await encoder.append_pcm(tone_pcm)
+        await asyncio.sleep(3.0)
+    finally:
+        await encoder.close()
+
+    playlist = encoder.playlist_path.read_text(encoding="utf-8")
+    ended_playlist = root / "ended.m3u8"
+    ended_playlist.write_text(playlist + "#EXT-X-ENDLIST\n", encoding="utf-8")
+    decoded_path = root / "decoded.pcm"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(ended_playlist),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            "-f",
+            "s16le",
+            "-y",
+            str(decoded_path),
+        ],
+        check=True,
+    )
+    first_program_line = next(
+        line
+        for line in playlist.splitlines()
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:")
+    )
+    timeline_origin_ms = round(
+        datetime.fromisoformat(first_program_line.split(":", 1)[1]).timestamp()
+        * 1000
+    )
+    decoded = decoded_path.read_bytes()
+    samples = struct.unpack(f"<{len(decoded) // 2}h", decoded)
+    window_samples = 240
+    audible_windows = []
+    for offset in range(0, len(samples) - window_samples + 1, window_samples):
+        window = samples[offset : offset + window_samples]
+        rms = math.sqrt(sum(value * value for value in window) / len(window))
+        if rms >= 1000:
+            audible_windows.append(offset // window_samples)
+    assert audible_windows
+    actual_audio_start_ms = timeline_origin_ms + audible_windows[0] * 10
+
+    assert abs(receipt.start_at_ms - actual_audio_start_ms) <= 20

@@ -5,9 +5,11 @@ import hashlib
 import io
 import logging
 import shutil
+import sys
 import time
 import uuid
 import wave
+from array import array
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -106,6 +108,8 @@ class HLSEncoder(Protocol):
 class _PreparedAudio:
     pcm: bytes
     audio_ms: int
+    cue_start_offset_ms: int
+    cue_end_offset_ms: int
     synthesis_ms: int
     prepared_at: float
 
@@ -137,11 +141,50 @@ def decode_mono_pcm16_wav(wav_bytes: bytes, *, expected_rate: int) -> bytes:
     return frames
 
 
-def parse_hls_live_edge_at_ms(playlist: str) -> int | None:
-    """Return the wall-clock end of the last complete HLS media segment."""
+def _pcm_activity_bounds_ms(pcm: bytes, *, sample_rate: int) -> tuple[int, int]:
+    """Find synthesized speech edges without interpreting its language or text."""
 
+    data = bytes(pcm)
+    duration_ms = max(1, round(len(data) * 1000 / (sample_rate * 2)))
+    samples = array("h")
+    samples.frombytes(data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    window_samples = max(1, round(sample_rate * 0.01))
+    window_energy: list[float] = []
+    for start in range(0, len(samples), window_samples):
+        window = samples[start : start + window_samples]
+        if len(window) < window_samples:
+            break
+        window_energy.append(
+            sum(int(value) * int(value) for value in window) / len(window)
+        )
+    if not window_energy:
+        return 0, duration_ms
+    peak_rms = max(window_energy) ** 0.5
+    threshold_rms = max(32.0, peak_rms * 0.03)
+    threshold_energy = threshold_rms * threshold_rms
+    active = [
+        index
+        for index, energy in enumerate(window_energy)
+        if energy >= threshold_energy
+    ]
+    if not active:
+        return 0, duration_ms
+    start_ms = round(active[0] * window_samples * 1000 / sample_rate)
+    end_ms = min(
+        duration_ms,
+        round((active[-1] + 1) * window_samples * 1000 / sample_rate),
+    )
+    return start_ms, max(start_ms + 1, end_ms)
+
+
+def _parse_hls_timeline_bounds_at_ms(
+    playlist: str,
+) -> tuple[int, int] | None:
     program_time: datetime | None = None
     duration_sec: float | None = None
+    first_start_ms: int | None = None
     last_end_ms: int | None = None
     for raw_line in str(playlist or "").splitlines():
         line = raw_line.strip()
@@ -166,12 +209,31 @@ def parse_hls_live_edge_at_ms(playlist: str) -> int | None:
         if not line or line.startswith("#"):
             continue
         if program_time is not None and duration_sec is not None:
+            start_ms = round(program_time.timestamp() * 1000.0)
+            if first_start_ms is None:
+                first_start_ms = start_ms
             last_end_ms = round(
                 (program_time.timestamp() + duration_sec) * 1000.0
             )
         program_time = None
         duration_sec = None
-    return last_end_ms
+    if first_start_ms is None or last_end_ms is None:
+        return None
+    return first_start_ms, last_end_ms
+
+
+def parse_hls_timeline_origin_at_ms(playlist: str) -> int | None:
+    """Return the wall-clock start of the first complete HLS media segment."""
+
+    bounds = _parse_hls_timeline_bounds_at_ms(playlist)
+    return bounds[0] if bounds is not None else None
+
+
+def parse_hls_live_edge_at_ms(playlist: str) -> int | None:
+    """Return the wall-clock end of the last complete HLS media segment."""
+
+    bounds = _parse_hls_timeline_bounds_at_ms(playlist)
+    return bounds[1] if bounds is not None else None
 
 
 class FFmpegHLSEncoder:
@@ -188,7 +250,6 @@ class FFmpegHLSEncoder:
         ffmpeg_path: str = "ffmpeg",
         frame_ms: int = 100,
         pcm_queue_size: int = 8,
-        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.root = Path(root)
         self.sample_rate = max(8000, int(sample_rate))
@@ -197,7 +258,10 @@ class FFmpegHLSEncoder:
         self.bitrate = str(bitrate or "64k")
         self.ffmpeg_path = str(ffmpeg_path or "ffmpeg")
         self.frame_ms = max(20, int(frame_ms))
-        self._wall_clock = wall_clock
+        self._frame_bytes = max(
+            1,
+            round(self.sample_rate * self.frame_ms / 1000),
+        ) * 2
         self._pcm_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=max(1, int(pcm_queue_size))
         )
@@ -206,6 +270,9 @@ class FFmpegHLSEncoder:
         self._stderr_task: asyncio.Task[None] | None = None
         self._stderr_tail = bytearray()
         self._pending_pcm_bytes = 0
+        self._submitted_pcm_bytes = 0
+        self._scheduled_end_pcm_bytes = 0
+        self._timeline_origin_at_ms: int | None = None
         self._closed = False
 
     @property
@@ -270,21 +337,35 @@ class FFmpegHLSEncoder:
         data = bytes(pcm)
         if not data or len(data) % 2:
             raise ValueError("PCM payload must contain complete signed-16 samples")
+        if self._timeline_origin_at_ms is None:
+            await self.wait_ready(timeout=5.0)
+        timeline_origin_at_ms = self._timeline_origin_at_ms
+        if timeline_origin_at_ms is None:
+            raise HLSUnavailable("HLS media timeline is unavailable")
         await self._pcm_queue.put(data)
         bytes_per_second = self.sample_rate * 2
-        start_at_ms = round(
-            self._wall_clock() * 1000.0
-            + self._pending_pcm_bytes * 1000.0 / bytes_per_second
+        start_pcm_bytes = max(
+            self._submitted_pcm_bytes,
+            self._scheduled_end_pcm_bytes,
         )
+        padded_bytes = (
+            (len(data) + self._frame_bytes - 1) // self._frame_bytes
+        ) * self._frame_bytes
+        self._scheduled_end_pcm_bytes = start_pcm_bytes + padded_bytes
         self._pending_pcm_bytes += len(data)
+        # MPEG-TS AAC exposes one 1024-sample encoder frame before new PCM is audible.
+        aac_priming_bytes = 1024 * 2
+        start_at_ms = timeline_origin_at_ms + round(
+            (start_pcm_bytes + aac_priming_bytes) * 1000.0 / bytes_per_second
+        )
         end_at_ms = round(
             start_at_ms + len(data) * 1000.0 / bytes_per_second
         )
         return HLSAppendReceipt(start_at_ms=start_at_ms, end_at_ms=end_at_ms)
 
     async def _writer_loop(self) -> None:
-        frame_samples = max(1, round(self.sample_rate * self.frame_ms / 1000))
-        frame_bytes = frame_samples * 2
+        frame_bytes = self._frame_bytes
+        frame_samples = frame_bytes // 2
         frame_sec = frame_samples / self.sample_rate
         silence = bytes(frame_bytes)
         active = b""
@@ -305,6 +386,7 @@ class FFmpegHLSEncoder:
                 if process is None or process.returncode is not None or process.stdin is None:
                     raise HLSUnavailable("FFmpeg exited while streaming")
                 process.stdin.write(chunk)
+                self._submitted_pcm_bytes += len(chunk)
                 await process.stdin.drain()
                 if writing_audio:
                     self._pending_pcm_bytes = max(
@@ -341,7 +423,10 @@ class FFmpegHLSEncoder:
                 raise HLSUnavailable("FFmpeg exited before producing a playlist")
             if self.playlist_path.is_file():
                 text = self.playlist_path.read_text(encoding="utf-8", errors="replace")
-                if ".ts" in text:
+                timeline_origin_at_ms = parse_hls_timeline_origin_at_ms(text)
+                if timeline_origin_at_ms is not None:
+                    if self._timeline_origin_at_ms is None:
+                        self._timeline_origin_at_ms = timeline_origin_at_ms
                     return
             await asyncio.sleep(0.05)
         raise HLSUnavailable("HLS playlist was not ready in time")
@@ -374,6 +459,9 @@ class FFmpegHLSEncoder:
             return
         self._closed = True
         self._pending_pcm_bytes = 0
+        self._submitted_pcm_bytes = 0
+        self._scheduled_end_pcm_bytes = 0
+        self._timeline_origin_at_ms = None
         writer = self._writer_task
         self._writer_task = None
         if writer is not None:
@@ -763,6 +851,10 @@ class SharedHLSTTSPublisher:
                         audio.wav_bytes,
                         expected_rate=self._sample_rate,
                     )
+                    cue_start_offset_ms, cue_end_offset_ms = _pcm_activity_bounds_ms(
+                        pcm,
+                        sample_rate=self._sample_rate,
+                    )
                     pause_samples = round(
                         self._sample_rate * self._sentence_pause_ms / 1000
                     )
@@ -779,6 +871,8 @@ class SharedHLSTTSPublisher:
                     prepared = _PreparedAudio(
                         pcm=pcm,
                         audio_ms=audio_ms,
+                        cue_start_offset_ms=cue_start_offset_ms,
+                        cue_end_offset_ms=cue_end_offset_ms,
                         synthesis_ms=synthesis_ms,
                         prepared_at=self._clock(),
                     )
@@ -810,22 +904,27 @@ class SharedHLSTTSPublisher:
 
                 receipt = await encoder.append_pcm(prepared.pcm)
                 if isinstance(receipt, HLSAppendReceipt):
+                    cue_start_at_ms = (
+                        int(receipt.start_at_ms)
+                        + int(prepared.cue_start_offset_ms)
+                    )
                     cue_end_at_ms = min(
                         int(receipt.end_at_ms),
-                        int(receipt.start_at_ms) + int(prepared.audio_ms),
+                        int(receipt.start_at_ms)
+                        + int(prepared.cue_end_offset_ms),
                     )
-                    if cue_end_at_ms > int(receipt.start_at_ms):
+                    if cue_end_at_ms > cue_start_at_ms:
                         epoch = self._active_root.name if self._active_root else ""
                         cue_key = (
                             f"{epoch}:{item.sentence_id}:{int(item.revision)}:"
-                            f"{int(receipt.start_at_ms)}"
+                            f"{cue_start_at_ms}"
                         )
                         self._caption_cues.append(
                             HLSCaptionCue(
                                 cue_id=hashlib.sha256(
                                     cue_key.encode("utf-8")
                                 ).hexdigest()[:16],
-                                start_at_ms=int(receipt.start_at_ms),
+                                start_at_ms=cue_start_at_ms,
                                 end_at_ms=cue_end_at_ms,
                                 text=str(item.text),
                             )
@@ -939,4 +1038,5 @@ __all__ = [
     "SharedHLSTTSPublisher",
     "decode_mono_pcm16_wav",
     "parse_hls_live_edge_at_ms",
+    "parse_hls_timeline_origin_at_ms",
 ]

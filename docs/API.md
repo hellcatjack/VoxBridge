@@ -137,18 +137,26 @@ Returns the recent translated caption cues for the matching live HLS lease:
 ```
 
 `live_edge_at_ms` is the wall-clock end of the newest complete HLS segment.
-Each cue spans only its synthesized speech; `end_at_ms` excludes the fixed
-`300ms` inter-sentence pause. The server retains at most 256 caption cues for
-the current encoder epoch and clears them when that shared stream ends.
+Each cue is derived from the PCM media timeline actually submitted to FFmpeg,
+not from the wall clock when a sentence entered the queue. The mapping includes
+the MPEG-TS AAC `1024-sample` encoder frame and language-independent waveform
+edge silence detection. A cue therefore starts at synthesized speech activity
+and ends after its final activity; `end_at_ms` excludes trailing model silence
+and the fixed `300ms` inter-sentence pause. The server retains at most 256
+caption cues for the current encoder epoch and clears them when that shared
+stream ends.
 
-The listener estimates its device-local playhead as
-`live_edge_at_ms - (seekable.end - currentTime) * 1000`, then selects the newest
-cue whose start is not later than that playhead. It therefore displays what that
-device is hearing instead of the newest server translation. Between cues the
-page keeps the previous sentence visible in a subdued state rather than clearing
-the text. The response uses `Cache-Control: no-store`. Caption polling is
-advisory and does not gate HLS audio; lock-screen playback continues if polling
-is suspended or temporarily fails.
+On Safari, the listener maps the native media timeline to an absolute playhead
+using `getStartDate() + currentTime` and selects the newest cue whose start is
+not later than that device-local position. This remains correct when the
+device's loaded playlist is several segments behind the server and at any local
+playback rate. The server-live-edge estimate is only a compatibility fallback
+when the media element cannot provide a valid start date. The page therefore
+displays what that device is hearing instead of the newest server translation.
+Between cues it keeps the previous sentence visible in a subdued state rather
+than clearing the text. The response uses `Cache-Control: no-store`. Caption
+polling is advisory and does not gate HLS audio; lock-screen playback continues
+if polling is suspended or temporarily fails.
 
 The endpoint requires an existing matching public bearer capability and returns
 `404` for an unknown or expired listener. It does not create or refresh a lease.

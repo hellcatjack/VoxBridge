@@ -574,6 +574,19 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     }
 
     function estimatedPlaybackAtMs(snapshot) {
+      const currentTime = Number(playbackElement.currentTime);
+      if (
+        Number.isFinite(currentTime)
+        && typeof playbackElement.getStartDate === "function"
+      ) {
+        try {
+          const startDate = playbackElement.getStartDate();
+          const startAtMs = startDate instanceof Date ? startDate.getTime() : NaN;
+          if (Number.isFinite(startAtMs)) {
+            return startAtMs + currentTime * 1000;
+          }
+        } catch (error) {}
+      }
       const liveEdgeAtMs = Number(snapshot && snapshot.live_edge_at_ms);
       const lag = liveLagSec();
       if (!Number.isFinite(liveEdgeAtMs) || lag === null) return null;
