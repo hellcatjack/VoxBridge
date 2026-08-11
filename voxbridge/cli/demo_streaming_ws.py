@@ -5680,6 +5680,33 @@ def _create_app(
             headers={"Cache-Control": "private, max-age=300, immutable"},
         )
 
+    @app.get("/api/tts/live/{listener_id}/captions")
+    async def shared_tts_hls_captions(listener_id: str) -> JSONResponse:
+        listener = _validated_tts_client_id(listener_id)
+        owner_key = _public_hls_owner_key(listener)
+        try:
+            snapshot = app.state.tts_hls.caption_snapshot(listener, owner_key)
+        except HLSListenerNotFound as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="HLS listener not found",
+            ) from exc
+        return JSONResponse(
+            {
+                "live_edge_at_ms": snapshot.live_edge_at_ms,
+                "cues": [
+                    {
+                        "cue_id": cue.cue_id,
+                        "start_at_ms": int(cue.start_at_ms),
+                        "end_at_ms": int(cue.end_at_ms),
+                        "text": cue.text,
+                    }
+                    for cue in snapshot.cues
+                ],
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.delete("/api/tts/live/{listener_id}")
     async def remove_shared_tts_hls_listener(
         listener_id: str,

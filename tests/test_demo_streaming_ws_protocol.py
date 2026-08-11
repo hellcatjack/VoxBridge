@@ -1,11 +1,13 @@
 from types import SimpleNamespace
 import asyncio
 import hashlib
+import io
 import inspect
 import json
 import re
 import threading
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 
 import voxbridge.cli.demo_streaming_ws as demo_streaming_ws
 from voxbridge.cli.demo_streaming_ws import _create_app, _hash_auth_password
+from voxbridge.tts.hls import HLSAppendReceipt
 from voxbridge.tts.jobs import RevisionStableTTSBuffer, TTSReadyItem
 from voxbridge.tts.kokoro_onnx import SynthesizedAudio
 from voxbridge.streaming.vad_support import SileroShadowObserver
@@ -104,6 +107,7 @@ class _FakeHLSEncoder:
         self.closed = 0
         self.appended = []
         self.pending_audio_ms = 1750
+        self.next_start_at_ms = 100_000
 
     async def start(self):
         self.started += 1
@@ -115,7 +119,15 @@ class _FakeHLSEncoder:
         )
 
     async def append_pcm(self, pcm):
-        self.appended.append(bytes(pcm))
+        data = bytes(pcm)
+        self.appended.append(data)
+        duration_ms = round(len(data) * 1000 / (24000 * 2))
+        receipt = HLSAppendReceipt(
+            start_at_ms=self.next_start_at_ms,
+            end_at_ms=self.next_start_at_ms + duration_ms,
+        )
+        self.next_start_at_ms = receipt.end_at_ms
+        return receipt
 
     async def wait_ready(self, timeout=5.0):
         del timeout
@@ -123,11 +135,24 @@ class _FakeHLSEncoder:
     def playlist_text(self):
         return (self.root / "index.m3u8").read_text(encoding="utf-8")
 
+    def live_edge_at_ms(self):
+        return self.next_start_at_ms
+
     def segment_path(self, name):
         return self.root / name
 
     async def close(self):
         self.closed += 1
+
+
+def _silent_wav_bytes(duration_ms: int = 250) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(24000)
+        wav.writeframes(bytes(round(24000 * duration_ms / 1000) * 2))
+    return output.getvalue()
 
 
 def _args():
@@ -1834,6 +1859,63 @@ def test_shared_hls_playlist_and_segments_are_public_capabilities(tmp_path):
     ).status_code == 404
     assert second.get("/api/tts/live/status").status_code == 200
     assert len(encoders) == 1
+
+
+def test_public_hls_caption_feed_requires_matching_listener_lease(tmp_path):
+    class ValidHLSSynthesizer:
+        def synthesize(self, text, target_language):
+            del text, target_language
+            return SynthesizedAudio(
+                _silent_wav_bytes(250),
+                sample_rate=24000,
+                duration_ms=250,
+            )
+
+    args = _args()
+    args.auth_enabled = True
+    args.auth_username = "admin"
+    args.auth_password_hash = _hash_auth_password("secret")
+    args.tts_hls_root_dir = str(tmp_path)
+    args.tts_hls_encoder_factory = lambda root: _FakeHLSEncoder(root)
+    app = _create_app(
+        args,
+        _FakeASR(),
+        tts_synthesizer=ValidHLSSynthesizer(),
+    )
+    listener_id = "iphone-caption-12345678"
+    item = TTSReadyItem(
+        sentence_id="caption-source-1",
+        revision=2,
+        source_order=0,
+        target_language="English",
+        text="The stable translated sentence being spoken.",
+    )
+
+    with TestClient(app) as client:
+        playlist = client.get(f"/api/tts/live/{listener_id}/index.m3u8")
+        assert playlist.status_code == 200
+        client.portal.call(app.state.tts_hls.publish, item)
+        client.portal.call(app.state.tts_hls.wait_idle)
+
+        captions = client.get(f"/api/tts/live/{listener_id}/captions")
+        unknown = client.get(
+            "/api/tts/live/iphone-caption-unknown-12345678/captions"
+        )
+
+    assert captions.status_code == 200
+    assert captions.headers["cache-control"] == "no-store"
+    payload = captions.json()
+    assert payload["live_edge_at_ms"] == 100_550
+    assert payload["cues"] == [
+        {
+            "cue_id": payload["cues"][0]["cue_id"],
+            "start_at_ms": 100_000,
+            "end_at_ms": 100_250,
+            "text": "The stable translated sentence being spoken.",
+        }
+    ]
+    assert re.fullmatch(r"[0-9a-f]{16}", payload["cues"][0]["cue_id"])
+    assert unknown.status_code == 404
 
 
 def test_public_hls_capacity_rejects_only_new_listener_ids(tmp_path):
