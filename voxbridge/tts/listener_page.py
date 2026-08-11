@@ -713,6 +713,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       setCard(connectionCard, "ok");
       playbackStatus.textContent = "Listening to live translation";
       nowPlaying.dataset.playing = "true";
+      beginCaptionPolling();
       refreshCaptionForPlayhead();
       setMediaPlaybackState("playing");
     }
@@ -768,7 +769,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     }
 
     function beginCaptionPolling() {
-      if (captionTimer !== null) window.clearInterval(captionTimer);
+      if (captionTimer !== null) return;
       void pollCaptions();
       captionTimer = window.setInterval(
         () => void pollCaptions(),
@@ -812,7 +813,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       // iOS requires the native stream to start directly inside the user's gesture.
       const playPromise = playbackElement.play();
       beginStatusPolling();
-      beginCaptionPolling();
       if (playPromise) {
         playPromise.then(markPlaying).catch(markPlaybackBlocked);
       } else {

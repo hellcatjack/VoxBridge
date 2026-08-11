@@ -39,6 +39,7 @@ def _install_hls_harness(
     reject_first_play: bool = False,
     caption_snapshot: dict | None = None,
     defer_caption_fetch: bool = False,
+    defer_first_play: bool = False,
 ):
     snapshot = caption_snapshot or {"live_edge_at_ms": None, "cues": []}
     listener_page.add_init_script(
@@ -50,6 +51,8 @@ def _install_hls_harness(
         window.__ttsCaptionSnapshot = {json.dumps(snapshot)};
         window.__ttsDeferCaptionFetch = {json.dumps(defer_caption_fetch)};
         window.__ttsCaptionRequestAborted = false;
+        window.__ttsDeferFirstPlay = {json.dumps(defer_first_play)};
+        window.__ttsResolveFirstPlay = null;
         window.__ttsMediaActions = {{}};
         window.__ttsMediaSession = {{
           metadata: null,
@@ -78,6 +81,11 @@ def _install_hls_harness(
           window.__ttsEvents.push("play");
           if ({str(reject_first_play).lower()} && window.__ttsPlayCalls.length === 1) {{
             return Promise.reject(new DOMException("blocked", "NotAllowedError"));
+          }}
+          if (window.__ttsDeferFirstPlay && window.__ttsPlayCalls.length === 1) {{
+            return new Promise(resolve => {{
+              window.__ttsResolveFirstPlay = resolve;
+            }});
           }}
           return Promise.resolve();
         }};
@@ -461,6 +469,22 @@ def test_listener_stop_aborts_inflight_caption_request_before_releasing_lease(
 
     listener_page.wait_for_function("window.__ttsCaptionRequestAborted === true")
     assert listener_page.evaluate("window.__ttsCaptionRequestAborted") is True
+
+
+def test_listener_waits_for_hls_playback_before_polling_captions(listener_page):
+    _install_hls_harness(listener_page, defer_first_play=True)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.locator("#startListening").click()
+    listener_page.wait_for_function("typeof window.__ttsResolveFirstPlay === 'function'")
+
+    assert listener_page.evaluate(
+        "window.__ttsFetchCalls.some(call => call.url.includes('/captions'))"
+    ) is False
+
+    listener_page.evaluate("window.__ttsResolveFirstPlay()")
+    listener_page.wait_for_function(
+        "window.__ttsFetchCalls.some(call => call.url.includes('/captions'))"
+    )
 
 
 def test_listener_starts_one_unmuted_hls_stream_inside_click(listener_page):
