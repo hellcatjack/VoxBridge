@@ -38,6 +38,7 @@ def _install_hls_harness(
     *,
     reject_first_play: bool = False,
     caption_snapshot: dict | None = None,
+    defer_caption_fetch: bool = False,
 ):
     snapshot = caption_snapshot or {"live_edge_at_ms": None, "cues": []}
     listener_page.add_init_script(
@@ -47,6 +48,8 @@ def _install_hls_harness(
         window.__ttsPauseCalls = 0;
         window.__ttsFetchCalls = [];
         window.__ttsCaptionSnapshot = {json.dumps(snapshot)};
+        window.__ttsDeferCaptionFetch = {json.dumps(defer_caption_fetch)};
+        window.__ttsCaptionRequestAborted = false;
         window.__ttsMediaActions = {{}};
         window.__ttsMediaSession = {{
           metadata: null,
@@ -89,6 +92,15 @@ def _install_hls_harness(
           }};
           window.__ttsFetchCalls.push(call);
           window.__ttsEvents.push(`fetch:${{call.method}}`);
+          if (window.__ttsDeferCaptionFetch && call.url.includes("/captions")) {{
+            return new Promise((resolve, reject) => {{
+              if (!options.signal) return;
+              options.signal.addEventListener("abort", () => {{
+                window.__ttsCaptionRequestAborted = true;
+                reject(new DOMException("aborted", "AbortError"));
+              }}, {{ once: true }});
+            }});
+          }}
           const payload = call.url.includes("/captions")
             ? window.__ttsCaptionSnapshot
             : {{
@@ -434,6 +446,21 @@ def test_listener_stop_resets_caption_and_stops_caption_polling(listener_page):
     assert listener_page.evaluate(
         "window.__ttsFetchCalls.filter(call => call.url.includes('/captions')).length"
     ) == caption_calls_at_stop
+
+
+def test_listener_stop_aborts_inflight_caption_request_before_releasing_lease(
+    listener_page,
+):
+    _install_hls_harness(listener_page, defer_caption_fetch=True)
+    _start_hls_harness(listener_page)
+    listener_page.wait_for_function(
+        "window.__ttsFetchCalls.some(call => call.url.includes('/captions'))"
+    )
+
+    listener_page.locator("#stopListening").click()
+
+    listener_page.wait_for_function("window.__ttsCaptionRequestAborted === true")
+    assert listener_page.evaluate("window.__ttsCaptionRequestAborted") is True
 
 
 def test_listener_starts_one_unmuted_hls_stream_inside_click(listener_page):

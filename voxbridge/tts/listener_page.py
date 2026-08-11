@@ -538,6 +538,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let running = false;
     let statusTimer = null;
     let captionTimer = null;
+    let captionAbortController = null;
     let catchingUp = false;
     let captionSnapshot = null;
     let captionCueId = "";
@@ -629,12 +630,18 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     }
 
     async function pollCaptions() {
-      if (!running || document.hidden || !listenerId) return;
+      if (!running || document.hidden || !listenerId || captionAbortController) return;
       const requestListenerId = listenerId;
+      const controller = new AbortController();
+      captionAbortController = controller;
       try {
         const response = await fetch(
           `/api/tts/live/${encodeURIComponent(requestListenerId)}/captions`,
-          { credentials: "same-origin", cache: "no-store" }
+          {
+            credentials: "same-origin",
+            cache: "no-store",
+            signal: controller.signal,
+          }
         );
         if (!response.ok) throw new Error(`caption request failed: ${response.status}`);
         const snapshot = await response.json();
@@ -643,6 +650,10 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         applyCaptionSnapshot(snapshot, requestListenerId);
       } catch (error) {
         // Caption metadata is advisory; native HLS playback remains independent.
+      } finally {
+        if (captionAbortController === controller) {
+          captionAbortController = null;
+        }
       }
     }
 
@@ -766,9 +777,14 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     }
 
     function stopCaptionPolling() {
-      if (captionTimer === null) return;
-      window.clearInterval(captionTimer);
-      captionTimer = null;
+      if (captionTimer !== null) {
+        window.clearInterval(captionTimer);
+        captionTimer = null;
+      }
+      if (captionAbortController !== null) {
+        captionAbortController.abort();
+        captionAbortController = null;
+      }
     }
 
     function startListeningFromGesture() {
