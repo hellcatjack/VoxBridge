@@ -8,6 +8,7 @@ import shutil
 import time
 import uuid
 import wave
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +51,20 @@ class HLSListenerLease:
 class HLSAppendReceipt:
     start_at_ms: int
     end_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class HLSCaptionCue:
+    cue_id: str
+    start_at_ms: int
+    end_at_ms: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class HLSCaptionSnapshot:
+    live_edge_at_ms: int | None
+    cues: tuple[HLSCaptionCue, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +423,7 @@ class SharedHLSTTSPublisher:
         max_listeners: int = 128,
         queue_size: int = 128,
         preparation_cache_size: int = 8,
+        caption_history_size: int = 256,
         sample_rate: int = 24000,
         sentence_pause_ms: int = 300,
         clock: Callable[[], float] = time.monotonic,
@@ -421,6 +437,8 @@ class SharedHLSTTSPublisher:
             raise ValueError("queue_size must be positive")
         if preparation_cache_size <= 0:
             raise ValueError("preparation_cache_size must be positive")
+        if caption_history_size <= 0:
+            raise ValueError("caption_history_size must be positive")
         self._synthesizer = synthesizer
         self._root_dir = Path(root_dir)
         self._encoder_factory = encoder_factory or (lambda root: FFmpegHLSEncoder(root))
@@ -433,6 +451,9 @@ class SharedHLSTTSPublisher:
         self._leases: dict[str, HLSListenerLease] = {}
         self._queue: asyncio.Queue[TTSReadyItem] = asyncio.Queue(maxsize=int(queue_size))
         self._preparation_cache_size = int(preparation_cache_size)
+        self._caption_cues: deque[HLSCaptionCue] = deque(
+            maxlen=int(caption_history_size)
+        )
         self._preparation_pending: dict[tuple[str, int, str, str], TTSReadyItem] = {}
         self._prepared_audio: dict[tuple[str, int, str, str], _PreparedAudio] = {}
         self._latest_key_by_sentence: dict[str, tuple[str, int, str, str]] = {}
@@ -640,6 +661,23 @@ class SharedHLSTTSPublisher:
             raise HLSUnavailable("shared HLS encoder is unavailable")
         return encoder.segment_path(name)
 
+    def caption_snapshot(
+        self,
+        listener_id: str,
+        owner_key: str,
+    ) -> HLSCaptionSnapshot:
+        self._require_lease(listener_id, owner_key)
+        encoder = self._encoder
+        live_edge_at_ms: int | None = None
+        if encoder is not None:
+            get_live_edge = getattr(encoder, "live_edge_at_ms", None)
+            if callable(get_live_edge):
+                live_edge_at_ms = get_live_edge()
+        return HLSCaptionSnapshot(
+            live_edge_at_ms=live_edge_at_ms,
+            cues=tuple(self._caption_cues),
+        )
+
     async def remove_listener(self, listener_id: str, owner_key: str) -> bool:
         listener = self._require_identity(listener_id, "listener_id")
         owner = self._require_identity(owner_key, "owner_key")
@@ -771,7 +809,28 @@ class SharedHLSTTSPublisher:
                     )
                     continue
 
-                await encoder.append_pcm(prepared.pcm)
+                receipt = await encoder.append_pcm(prepared.pcm)
+                if isinstance(receipt, HLSAppendReceipt):
+                    cue_end_at_ms = min(
+                        int(receipt.end_at_ms),
+                        int(receipt.start_at_ms) + int(prepared.audio_ms),
+                    )
+                    if cue_end_at_ms > int(receipt.start_at_ms):
+                        epoch = self._active_root.name if self._active_root else ""
+                        cue_key = (
+                            f"{epoch}:{item.sentence_id}:{int(item.revision)}:"
+                            f"{int(receipt.start_at_ms)}"
+                        )
+                        self._caption_cues.append(
+                            HLSCaptionCue(
+                                cue_id=hashlib.sha256(
+                                    cue_key.encode("utf-8")
+                                ).hexdigest()[:16],
+                                start_at_ms=int(receipt.start_at_ms),
+                                end_at_ms=cue_end_at_ms,
+                                text=str(item.text),
+                            )
+                        )
                 self._last_error = ""
                 preparation_age_ms = max(
                     0,
@@ -835,6 +894,7 @@ class SharedHLSTTSPublisher:
             self._preparation_pending.clear()
             self._prepared_audio.clear()
             self._latest_key_by_sentence.clear()
+            self._caption_cues.clear()
             self._work_available.clear()
         current = asyncio.current_task()
         for task in (worker, reaper):
@@ -868,6 +928,8 @@ class SharedHLSTTSPublisher:
 __all__ = [
     "FFmpegHLSEncoder",
     "HLSAppendReceipt",
+    "HLSCaptionCue",
+    "HLSCaptionSnapshot",
     "HLSError",
     "HLSListenerCapacityExceeded",
     "HLSListenerLease",

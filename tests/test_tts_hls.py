@@ -35,13 +35,18 @@ class FakeClock:
 
 
 class FakeSynthesizer:
-    def __init__(self, wav_bytes: bytes) -> None:
+    def __init__(self, wav_bytes: bytes, *, duration_ms: int = 100) -> None:
         self.wav_bytes = wav_bytes
+        self.duration_ms = int(duration_ms)
         self.calls: list[tuple[str, str]] = []
 
     def synthesize(self, text: str, target_language: str):
         self.calls.append((text, target_language))
-        return SimpleNamespace(wav_bytes=self.wav_bytes, sample_rate=24000, duration_ms=100)
+        return SimpleNamespace(
+            wav_bytes=self.wav_bytes,
+            sample_rate=24000,
+            duration_ms=self.duration_ms,
+        )
 
 
 class FakeEncoder:
@@ -50,7 +55,9 @@ class FakeEncoder:
         self.start_count = 0
         self.close_count = 0
         self.appended: list[bytes] = []
+        self.receipts: list[HLSAppendReceipt] = []
         self.pending_audio_ms = 0
+        self.next_start_at_ms = 100_000
 
     async def start(self) -> None:
         self.start_count += 1
@@ -61,14 +68,25 @@ class FakeEncoder:
             encoding="utf-8",
         )
 
-    async def append_pcm(self, pcm: bytes) -> None:
+    async def append_pcm(self, pcm: bytes) -> HLSAppendReceipt:
         self.appended.append(pcm)
+        duration_ms = round(len(pcm) * 1000 / (24000 * 2))
+        receipt = HLSAppendReceipt(
+            start_at_ms=self.next_start_at_ms,
+            end_at_ms=self.next_start_at_ms + duration_ms,
+        )
+        self.receipts.append(receipt)
+        self.next_start_at_ms = receipt.end_at_ms
+        return receipt
 
     async def wait_ready(self, timeout: float = 5.0) -> None:
         del timeout
 
     def playlist_text(self) -> str:
         return (self.root / "index.m3u8").read_text(encoding="utf-8")
+
+    def live_edge_at_ms(self) -> int:
+        return self.next_start_at_ms
 
     def segment_path(self, name: str) -> Path:
         return self.root / name
@@ -311,6 +329,80 @@ async def test_exact_revision_is_prepared_without_publishing_audio(tmp_path):
         assert synth.calls == [("Prepared exact revision.", "English")]
         assert len(encoder.appended) == 1
         assert publisher.status.prepared_audio_count == 0
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_caption_cue_is_created_only_when_stable_audio_is_published(tmp_path):
+    synth = FakeSynthesizer(make_wav(duration_ms=250), duration_ms=250)
+    encoder = FakeEncoder(tmp_path / "stream")
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        clock=FakeClock(),
+    )
+    item = ready_item(11, revision=2, text="Prepared exact revision.")
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        assert await publisher.prepare(item) is True
+        await wait_until(lambda: publisher.status.prepared_audio_count == 1)
+
+        assert publisher.caption_snapshot("iphone-a", "owner-a").cues == ()
+
+        assert await publisher.publish(item) is True
+        await publisher.wait_idle()
+        snapshot = publisher.caption_snapshot("iphone-a", "owner-a")
+
+        assert snapshot.live_edge_at_ms == 100_550
+        assert len(snapshot.cues) == 1
+        cue = snapshot.cues[0]
+        assert cue.text == "Prepared exact revision."
+        assert cue.start_at_ms == 100_000
+        assert cue.end_at_ms == 100_250
+        assert cue.cue_id
+        assert encoder.receipts == [
+            HLSAppendReceipt(start_at_ms=100_000, end_at_ms=100_550)
+        ]
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_caption_history_is_bounded_and_cleared_with_listener_epoch(tmp_path):
+    synth = FakeSynthesizer(make_wav())
+    encoders: list[FakeEncoder] = []
+
+    def encoder_factory(root: Path) -> FakeEncoder:
+        encoder = FakeEncoder(root)
+        encoders.append(encoder)
+        return encoder
+
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=encoder_factory,
+        root_dir=tmp_path,
+        queue_size=300,
+        clock=FakeClock(),
+    )
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        for order in range(257):
+            assert await publisher.publish(ready_item(order)) is True
+        await publisher.wait_idle()
+
+        snapshot = publisher.caption_snapshot("iphone-a", "owner-a")
+        assert len(snapshot.cues) == 256
+        assert snapshot.cues[0].text == "Stable translation 1."
+        assert snapshot.cues[-1].text == "Stable translation 256."
+        with pytest.raises(HLSListenerNotFound):
+            publisher.caption_snapshot("iphone-a", "owner-b")
+
+        assert await publisher.remove_listener("iphone-a", "owner-a") is True
+        await publisher.touch_listener("iphone-b", "owner-b")
+        assert publisher.caption_snapshot("iphone-b", "owner-b").cues == ()
+        assert len(encoders) == 2
     finally:
         await publisher.close()
 
