@@ -216,6 +216,15 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       overflow: hidden;
     }
 
+    .now-playing-copy {
+      min-width: 0;
+      min-height: 0;
+      flex: 1 1 auto;
+      display: grid;
+      align-content: center;
+      gap: 4px;
+    }
+
     .now-playing small {
       display: block;
       margin-bottom: 4px;
@@ -227,11 +236,37 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     .now-playing strong {
       display: block;
+      min-width: 0;
+      max-height: 4.6em;
       color: var(--forest);
       font-family: Georgia, "Times New Roman", serif;
-      font-size: clamp(18px, 3.7vw, 30px);
+      font-size: clamp(17px, 3.4vw, 28px);
       font-weight: 500;
-      line-height: 1.1;
+      line-height: 1.15;
+      overflow: hidden;
+      overflow-wrap: break-word;
+      text-wrap: pretty;
+      transition: color 180ms ease, opacity 180ms ease;
+    }
+
+    .now-playing[data-speaking="false"] strong {
+      color: #53635c;
+      opacity: 0.72;
+    }
+
+    .playback-state {
+      min-width: 0;
+      color: var(--muted);
+      font-size: clamp(9px, 1.6vw, 12px);
+      font-weight: 800;
+      line-height: 1.25;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .caption-reveal {
+      animation: captionReveal 220ms ease-out;
     }
 
     .pulse {
@@ -260,6 +295,15 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     @keyframes breathe {
       50% { transform: scale(1.06); box-shadow: 0 0 0 7px rgba(244, 207, 67, 0.16); }
+    }
+
+    @keyframes captionReveal {
+      from { opacity: 0.58; transform: translateY(3px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .caption-reveal, .now-playing[data-playing="true"] .pulse { animation: none; }
     }
 
     .controls {
@@ -437,10 +481,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       </div>
     </section>
 
-    <section id="nowPlaying" class="now-playing" data-playing="false" aria-live="polite">
-      <div>
+    <section id="nowPlaying" class="now-playing" data-playing="false" data-speaking="false">
+      <div class="now-playing-copy">
         <small>LIVE AUDIO</small>
-        <strong id="playbackStatus">Waiting to start</strong>
+        <strong id="liveCaption" aria-live="polite" aria-atomic="true">Waiting to start</strong>
+        <span id="playbackStatus" class="playback-state">Start listening to join the shared stream</span>
       </div>
       <div class="pulse" aria-hidden="true"></div>
     </section>
@@ -476,6 +521,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const connectionStatus = document.getElementById("connectionStatus");
     const producerStatus = document.getElementById("producerStatus");
     const queueStatus = document.getElementById("queueStatus");
+    const liveCaption = document.getElementById("liveCaption");
     const playbackStatus = document.getElementById("playbackStatus");
     const nowPlaying = document.getElementById("nowPlaying");
     const playbackRateInput = document.getElementById("playbackRate");
@@ -485,12 +531,16 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const CATCH_UP_START_LAG_SEC = 12;
     const CATCH_UP_STOP_LAG_SEC = 5;
     const CATCH_UP_RATE = 1.2;
+    const CAPTION_POLL_INTERVAL_MS = 500;
 
     let playbackRate = readPlaybackRate();
     let listenerId = "";
     let running = false;
     let statusTimer = null;
+    let captionTimer = null;
     let catchingUp = false;
+    let captionSnapshot = null;
+    let captionCueId = "";
     playbackRateInput.value = String(playbackRate);
 
     function normalizePlaybackRate(value) {
@@ -520,6 +570,80 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       const liveEdge = Number(ranges.end(ranges.length - 1));
       if (!Number.isFinite(liveEdge)) return null;
       return Math.max(0, liveEdge - playbackElement.currentTime);
+    }
+
+    function estimatedPlaybackAtMs(snapshot) {
+      const liveEdgeAtMs = Number(snapshot && snapshot.live_edge_at_ms);
+      const lag = liveLagSec();
+      if (!Number.isFinite(liveEdgeAtMs) || lag === null) return null;
+      return liveEdgeAtMs - lag * 1000;
+    }
+
+    function revealCaption() {
+      liveCaption.classList.remove("caption-reveal");
+      void liveCaption.offsetWidth;
+      liveCaption.classList.add("caption-reveal");
+    }
+
+    function setLiveCaption(text, cueId = "") {
+      const nextText = String(text || "").trim();
+      if (!nextText) return;
+      const nextCueId = String(cueId || "");
+      if (liveCaption.textContent === nextText && captionCueId === nextCueId) return;
+      liveCaption.textContent = nextText;
+      captionCueId = nextCueId;
+      revealCaption();
+    }
+
+    function applyCaptionSnapshot(snapshot, requestListenerId) {
+      if (!running || !requestListenerId || requestListenerId !== listenerId) return;
+      const playheadAtMs = estimatedPlaybackAtMs(snapshot);
+      if (playheadAtMs === null) return;
+      const cues = Array.isArray(snapshot && snapshot.cues) ? snapshot.cues : [];
+      let selected = null;
+      for (const cue of cues) {
+        const startAtMs = Number(cue && cue.start_at_ms);
+        if (!Number.isFinite(startAtMs) || startAtMs > playheadAtMs) continue;
+        if (selected === null || startAtMs >= Number(selected.start_at_ms)) {
+          selected = cue;
+        }
+      }
+      if (selected === null) {
+        if (!captionCueId) setLiveCaption("Waiting for translated speech");
+        nowPlaying.dataset.speaking = "false";
+        return;
+      }
+      setLiveCaption(selected.text, selected.cue_id);
+      const endAtMs = Number(selected.end_at_ms);
+      nowPlaying.dataset.speaking = String(
+        nowPlaying.dataset.playing === "true"
+          && Number.isFinite(endAtMs)
+          && playheadAtMs < endAtMs
+      );
+    }
+
+    function refreshCaptionForPlayhead() {
+      if (captionSnapshot !== null) {
+        applyCaptionSnapshot(captionSnapshot, listenerId);
+      }
+    }
+
+    async function pollCaptions() {
+      if (!running || document.hidden || !listenerId) return;
+      const requestListenerId = listenerId;
+      try {
+        const response = await fetch(
+          `/api/tts/live/${encodeURIComponent(requestListenerId)}/captions`,
+          { credentials: "same-origin", cache: "no-store" }
+        );
+        if (!response.ok) throw new Error(`caption request failed: ${response.status}`);
+        const snapshot = await response.json();
+        if (!running || requestListenerId !== listenerId) return;
+        captionSnapshot = snapshot;
+        applyCaptionSnapshot(snapshot, requestListenerId);
+      } catch (error) {
+        // Caption metadata is advisory; native HLS playback remains independent.
+      }
     }
 
     function effectivePlaybackRate() {
@@ -578,6 +702,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       setCard(connectionCard, "ok");
       playbackStatus.textContent = "Listening to live translation";
       nowPlaying.dataset.playing = "true";
+      refreshCaptionForPlayhead();
       setMediaPlaybackState("playing");
     }
 
@@ -590,6 +715,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         ? "Tap Resume Audio below"
         : "The shared stream is temporarily unavailable";
       nowPlaying.dataset.playing = "false";
+      nowPlaying.dataset.speaking = "false";
       resumeButton.hidden = false;
       setMediaPlaybackState("paused");
     }
@@ -630,6 +756,21 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       statusTimer = null;
     }
 
+    function beginCaptionPolling() {
+      if (captionTimer !== null) window.clearInterval(captionTimer);
+      void pollCaptions();
+      captionTimer = window.setInterval(
+        () => void pollCaptions(),
+        CAPTION_POLL_INTERVAL_MS
+      );
+    }
+
+    function stopCaptionPolling() {
+      if (captionTimer === null) return;
+      window.clearInterval(captionTimer);
+      captionTimer = null;
+    }
+
     function startListeningFromGesture() {
       if (running) return;
       running = true;
@@ -641,6 +782,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       producerStatus.textContent = "Checking service";
       queueStatus.textContent = "Joining live stream";
       playbackStatus.textContent = "Starting audio";
+      setLiveCaption("Waiting for translated speech");
+      nowPlaying.dataset.speaking = "false";
       setCard(connectionCard, "warn");
       setCard(producerCard, "warn");
 
@@ -653,6 +796,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       // iOS requires the native stream to start directly inside the user's gesture.
       const playPromise = playbackElement.play();
       beginStatusPolling();
+      beginCaptionPolling();
       if (playPromise) {
         playPromise.then(markPlaying).catch(markPlaybackBlocked);
       } else {
@@ -688,16 +832,21 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       running = false;
       catchingUp = false;
       stopStatusPolling();
+      stopCaptionPolling();
+      captionSnapshot = null;
+      captionCueId = "";
       playbackElement.pause();
       playbackElement.removeAttribute("src");
       playbackElement.load();
       releaseListenerLease(closingListenerId);
       resumeButton.hidden = true;
       nowPlaying.dataset.playing = "false";
+      nowPlaying.dataset.speaking = "false";
       connectionStatus.textContent = "Stopped";
       producerStatus.textContent = "Waiting";
       queueStatus.textContent = "Not joined";
-      playbackStatus.textContent = "Waiting to start";
+      liveCaption.textContent = "Waiting to start";
+      playbackStatus.textContent = "Start listening to join the shared stream";
       setCard(connectionCard, "warn");
       setCard(producerCard, "warn");
       startButton.disabled = false;
@@ -724,6 +873,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         navigator.mediaSession.setActionHandler("pause", () => {
           playbackElement.pause();
           nowPlaying.dataset.playing = "false";
+          nowPlaying.dataset.speaking = "false";
           playbackStatus.textContent = "Paused / resume from the lock screen";
           setMediaPlaybackState("paused");
         });
@@ -741,11 +891,13 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (!running) return;
       playbackStatus.textContent = "Buffering live audio";
       nowPlaying.dataset.playing = "false";
+      nowPlaying.dataset.speaking = "false";
     });
     playbackElement.addEventListener("stalled", () => {
       if (!running) return;
       playbackStatus.textContent = "Reconnecting to live audio";
       nowPlaying.dataset.playing = "false";
+      nowPlaying.dataset.speaking = "false";
     });
     playbackElement.addEventListener("error", () => {
       if (!running) return;
@@ -759,11 +911,21 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       } catch (error) {}
       applyPlaybackRate();
     });
-    playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard);
-    playbackElement.addEventListener("progress", updateLiveLatencyGuard);
-    document.addEventListener("visibilitychange", updateLiveLatencyGuard);
+    playbackElement.addEventListener("timeupdate", () => {
+      updateLiveLatencyGuard();
+      refreshCaptionForPlayhead();
+    });
+    playbackElement.addEventListener("progress", () => {
+      updateLiveLatencyGuard();
+      refreshCaptionForPlayhead();
+    });
+    document.addEventListener("visibilitychange", () => {
+      updateLiveLatencyGuard();
+      if (!document.hidden) void pollCaptions();
+    });
     window.addEventListener("beforeunload", () => {
       stopStatusPolling();
+      stopCaptionPolling();
       releaseListenerLease(listenerId);
       playbackElement.pause();
     });

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 
 import pytest
@@ -32,13 +33,20 @@ def listener_page():
         browser.close()
 
 
-def _install_hls_harness(listener_page, *, reject_first_play: bool = False):
+def _install_hls_harness(
+    listener_page,
+    *,
+    reject_first_play: bool = False,
+    caption_snapshot: dict | None = None,
+):
+    snapshot = caption_snapshot or {"live_edge_at_ms": None, "cues": []}
     listener_page.add_init_script(
         f"""
         window.__ttsEvents = [];
         window.__ttsPlayCalls = [];
         window.__ttsPauseCalls = 0;
         window.__ttsFetchCalls = [];
+        window.__ttsCaptionSnapshot = {json.dumps(snapshot)};
         window.__ttsMediaActions = {{}};
         window.__ttsMediaSession = {{
           metadata: null,
@@ -81,18 +89,21 @@ def _install_hls_harness(listener_page, *, reject_first_play: bool = False):
           }};
           window.__ttsFetchCalls.push(call);
           window.__ttsEvents.push(`fetch:${{call.method}}`);
+          const payload = call.url.includes("/captions")
+            ? window.__ttsCaptionSnapshot
+            : {{
+                available: true,
+                listener_count: 2,
+                queue_depth: 0,
+                pending_audio_ms: 6500,
+                encoder_active: true,
+                producer_active: true,
+                last_error: "",
+              }};
           return Promise.resolve({{
             ok: true,
             status: 200,
-            json: () => Promise.resolve({{
-              available: true,
-              listener_count: 2,
-              queue_depth: 0,
-              pending_audio_ms: 6500,
-              encoder_active: true,
-              producer_active: true,
-              last_error: "",
-            }}),
+            json: () => Promise.resolve(payload),
           }});
         }};
         """
@@ -172,6 +183,7 @@ def test_listener_fits_viewport_without_document_scrollbars(
     assert overflow == {"htmlX": False, "htmlY": False, "bodyX": False, "bodyY": False}
     for selector in (
         "#connectionStatus",
+        "#liveCaption",
         "#playbackRate",
         "#startListening",
         "#stopListening",
@@ -183,6 +195,26 @@ def test_listener_fits_viewport_without_document_scrollbars(
         assert box["x"] >= 0 and box["y"] >= 0
         assert box["x"] + box["width"] <= width + 1
         assert box["y"] + box["height"] <= height + 1
+
+    listener_page.locator("#liveCaption").evaluate(
+        """node => {
+          node.textContent = "This is a deliberately long translated sentence that verifies the Live Audio caption wraps naturally while every control remains inside the one-screen listener layout.";
+        }"""
+    )
+    overflow_after_caption = listener_page.evaluate(
+        """({
+          htmlX: document.documentElement.scrollWidth > window.innerWidth,
+          htmlY: document.documentElement.scrollHeight > window.innerHeight,
+          bodyX: document.body.scrollWidth > window.innerWidth,
+          bodyY: document.body.scrollHeight > window.innerHeight,
+        })"""
+    )
+    assert overflow_after_caption == {
+        "htmlX": False,
+        "htmlY": False,
+        "bodyX": False,
+        "bodyY": False,
+    }
 
 
 def test_rate_change_updates_persistent_media_element(listener_page):
@@ -274,6 +306,134 @@ def test_listener_status_shows_real_pending_audio_seconds(listener_page):
     listener_page.wait_for_function(
         "document.querySelector('#queueStatus').textContent.includes('7s queued')"
     )
+
+
+def test_listener_caption_follows_device_playhead_instead_of_newest_cue(listener_page):
+    _install_hls_harness(
+        listener_page,
+        caption_snapshot={
+            "live_edge_at_ms": 110_000,
+            "cues": [
+                {
+                    "cue_id": "older-cue",
+                    "start_at_ms": 103_000,
+                    "end_at_ms": 105_000,
+                    "text": "The sentence this device is hearing.",
+                },
+                {
+                    "cue_id": "newer-cue",
+                    "start_at_ms": 107_000,
+                    "end_at_ms": 109_000,
+                    "text": "The newer server-side sentence.",
+                },
+            ],
+        },
+    )
+    _start_hls_harness(listener_page)
+
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.includes('this device')"
+    )
+    assert listener_page.text_content("#liveCaption") == (
+        "The sentence this device is hearing."
+    )
+    assert listener_page.get_attribute("#nowPlaying", "data-speaking") == "true"
+
+    _set_live_lag(listener_page, current_time=98, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.includes('newer server')"
+    )
+    assert listener_page.text_content("#liveCaption") == (
+        "The newer server-side sentence."
+    )
+
+
+def test_listener_retains_caption_between_cues_without_empty_transition(listener_page):
+    _install_hls_harness(
+        listener_page,
+        caption_snapshot={
+            "live_edge_at_ms": 110_000,
+            "cues": [
+                {
+                    "cue_id": "first-cue",
+                    "start_at_ms": 103_000,
+                    "end_at_ms": 105_000,
+                    "text": "The first spoken sentence remains visible.",
+                },
+                {
+                    "cue_id": "second-cue",
+                    "start_at_ms": 107_000,
+                    "end_at_ms": 109_000,
+                    "text": "The second spoken sentence replaces it directly.",
+                },
+            ],
+        },
+    )
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.startsWith('The first')"
+    )
+    listener_page.evaluate(
+        """() => {
+          const caption = document.querySelector("#liveCaption");
+          window.__captionValues = [caption.textContent];
+          new MutationObserver(() => {
+            window.__captionValues.push(caption.textContent);
+          }).observe(caption, { childList: true, characterData: true, subtree: true });
+        }"""
+    )
+
+    _set_live_lag(listener_page, current_time=95.5, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#nowPlaying').dataset.speaking === 'false'"
+    )
+    assert listener_page.text_content("#liveCaption") == (
+        "The first spoken sentence remains visible."
+    )
+
+    _set_live_lag(listener_page, current_time=98, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.startsWith('The second')"
+    )
+    observed = listener_page.evaluate("window.__captionValues.slice()")
+    assert observed[-1] == "The second spoken sentence replaces it directly."
+    assert all(value.strip() for value in observed)
+
+
+def test_listener_stop_resets_caption_and_stops_caption_polling(listener_page):
+    _install_hls_harness(
+        listener_page,
+        caption_snapshot={
+            "live_edge_at_ms": 110_000,
+            "cues": [
+                {
+                    "cue_id": "active-cue",
+                    "start_at_ms": 107_000,
+                    "end_at_ms": 109_000,
+                    "text": "A translated sentence is currently playing.",
+                }
+            ],
+        },
+    )
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=98, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.startsWith('A translated')"
+    )
+
+    listener_page.locator("#stopListening").click()
+    caption_calls_at_stop = listener_page.evaluate(
+        "window.__ttsFetchCalls.filter(call => call.url.includes('/captions')).length"
+    )
+    listener_page.wait_for_timeout(650)
+
+    assert listener_page.text_content("#liveCaption") == "Waiting to start"
+    assert listener_page.get_attribute("#nowPlaying", "data-speaking") == "false"
+    assert listener_page.evaluate(
+        "window.__ttsFetchCalls.filter(call => call.url.includes('/captions')).length"
+    ) == caption_calls_at_stop
 
 
 def test_listener_starts_one_unmuted_hls_stream_inside_click(listener_page):
