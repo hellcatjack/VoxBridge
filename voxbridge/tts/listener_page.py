@@ -911,14 +911,10 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       } catch (error) {}
       applyPlaybackRate();
     });
-    playbackElement.addEventListener("timeupdate", () => {
-      updateLiveLatencyGuard();
-      refreshCaptionForPlayhead();
-    });
-    playbackElement.addEventListener("progress", () => {
-      updateLiveLatencyGuard();
-      refreshCaptionForPlayhead();
-    });
+    playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard);
+    playbackElement.addEventListener("timeupdate", refreshCaptionForPlayhead);
+    playbackElement.addEventListener("progress", updateLiveLatencyGuard);
+    playbackElement.addEventListener("progress", refreshCaptionForPlayhead);
     document.addEventListener("visibilitychange", () => {
       updateLiveLatencyGuard();
       if (!document.hidden) void pollCaptions();
