@@ -1,153 +1,246 @@
 """Standalone browser UI for live translated-speech listeners."""
 
 TTS_LISTENER_HTML = r"""<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>译文实时朗读</title>
+  <title>PCCS Live Translation</title>
   <style>
     :root {
       color-scheme: light;
-      --ink: #25352e;
-      --muted: #66776c;
-      --paper: #f7f5eb;
-      --panel: rgba(255, 255, 248, 0.9);
-      --line: rgba(89, 112, 95, 0.2);
-      --accent: #386f5d;
-      --accent-soft: #dceade;
-      --warn: #9a632f;
-      --danger: #934f49;
-      --shadow: 0 26px 80px rgba(58, 75, 62, 0.13);
+      --forest: #12241e;
+      --forest-soft: #1c382f;
+      --cream: #f4f5f1;
+      --paper: #fffdf7;
+      --sage: #dfe9e3;
+      --sage-deep: #b9cec3;
+      --mustard: #f4cf43;
+      --coral: #d86456;
+      --ink: #17201c;
+      --muted: #66736d;
+      --line: rgba(18, 36, 30, 0.18);
+      --shadow: 0 24px 70px rgba(18, 36, 30, 0.18);
     }
 
     * { box-sizing: border-box; }
 
-    html, body { min-height: 100%; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      height: 100dvh;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+    }
 
     body {
-      margin: 0;
-      min-height: 100vh;
       color: var(--ink);
-      font-family: "Avenir Next", "Noto Sans SC", "PingFang SC", sans-serif;
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
       background:
-        radial-gradient(circle at 15% 12%, rgba(217, 235, 213, 0.9), transparent 36%),
-        radial-gradient(circle at 88% 88%, rgba(231, 220, 188, 0.62), transparent 38%),
-        linear-gradient(145deg, #f5f3e8 0%, #edf3e7 52%, #f3efe2 100%);
+        linear-gradient(90deg, rgba(18, 36, 30, 0.035) 1px, transparent 1px),
+        linear-gradient(rgba(18, 36, 30, 0.035) 1px, transparent 1px),
+        radial-gradient(circle at 14% 12%, rgba(244, 207, 67, 0.18), transparent 28%),
+        linear-gradient(145deg, #eef2ec 0%, var(--cream) 48%, #e4ece7 100%);
+      background-size: 28px 28px, 28px 28px, auto, auto;
       display: grid;
       place-items: center;
-      padding: max(18px, env(safe-area-inset-top)) 18px max(18px, env(safe-area-inset-bottom));
+      padding:
+        max(10px, env(safe-area-inset-top))
+        max(10px, env(safe-area-inset-right))
+        max(10px, env(safe-area-inset-bottom))
+        max(10px, env(safe-area-inset-left));
     }
 
     main {
-      width: min(720px, 100%);
-      min-height: min(660px, calc(100vh - 36px));
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      background: var(--panel);
+      width: min(760px, 100%);
+      height: min(790px, 100%);
+      min-height: 0;
+      padding: clamp(16px, 3.2vh, 30px);
+      border: 1px solid rgba(18, 36, 30, 0.2);
+      border-radius: clamp(18px, 3vw, 28px);
+      background: rgba(255, 253, 247, 0.94);
       box-shadow: var(--shadow);
-      backdrop-filter: blur(18px);
-      padding: clamp(24px, 5vw, 52px);
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 28px;
+      display: grid;
+      grid-template-rows: auto auto auto minmax(72px, 1fr) auto;
+      gap: clamp(8px, 1.8vh, 16px);
+      overflow: hidden;
     }
 
-    .eyebrow {
-      margin: 0 0 10px;
-      color: var(--accent);
-      font-size: 12px;
+    .brand {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 44px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 11px;
+    }
+
+    .brand-mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 50% 50% 46% 54%;
+      background: var(--forest);
+      color: var(--mustard);
+      display: grid;
+      place-items: center;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 23px;
+      font-weight: 700;
+      transform: rotate(-3deg);
+    }
+
+    .brand-copy {
+      min-width: 0;
+      display: grid;
+      gap: 0;
+      line-height: 1.04;
+    }
+
+    .brand-copy span {
+      color: var(--muted);
+      font-size: 10px;
       font-weight: 800;
-      letter-spacing: 0.18em;
+      letter-spacing: 0.09em;
       text-transform: uppercase;
     }
 
-    h1 {
-      margin: 0;
-      font-family: "Iowan Old Style", "Noto Serif SC", "Songti SC", serif;
-      font-size: clamp(38px, 8vw, 72px);
+    .brand-copy strong {
+      color: var(--forest);
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(15px, 2.5vw, 19px);
       font-weight: 700;
-      line-height: 1.05;
-      letter-spacing: -0.035em;
+    }
+
+    .live-tag {
+      justify-self: end;
+      padding: 7px 10px;
+      border: 1px solid rgba(216, 100, 86, 0.32);
+      border-radius: 999px;
+      color: #aa4338;
+      background: rgba(216, 100, 86, 0.08);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.13em;
+      white-space: nowrap;
+    }
+
+    .hero {
+      min-width: 0;
+      padding: clamp(13px, 2.4vh, 22px);
+      border-radius: 18px;
+      color: #f9fbf7;
+      background:
+        radial-gradient(circle at 92% 14%, rgba(244, 207, 67, 0.18), transparent 24%),
+        linear-gradient(135deg, var(--forest), var(--forest-soft));
+      overflow: hidden;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--mustard);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.15em;
+    }
+
+    h1 {
+      max-width: 18em;
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(25px, 5vw, 44px);
+      font-weight: 500;
+      line-height: 1.04;
+      letter-spacing: -0.025em;
     }
 
     .intro {
-      max-width: 32em;
-      margin: 18px 0 0;
-      color: var(--muted);
-      font-size: clamp(15px, 2.4vw, 18px);
-      line-height: 1.75;
+      max-width: 45em;
+      margin: 8px 0 0;
+      color: rgba(249, 251, 247, 0.72);
+      font-size: clamp(11px, 1.8vw, 14px);
+      line-height: 1.45;
     }
 
     .status-grid {
+      min-width: 0;
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
+      gap: 7px;
     }
 
     .status-card {
-      min-height: 112px;
-      padding: 16px;
+      min-width: 0;
+      min-height: 54px;
+      padding: 9px 11px;
       border: 1px solid var(--line);
-      border-radius: 18px;
-      background: rgba(248, 250, 242, 0.74);
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 12px;
+      border-radius: 12px;
+      background: rgba(223, 233, 227, 0.52);
+      display: grid;
+      align-content: center;
+      gap: 2px;
     }
 
     .status-card span {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
+      color: var(--coral);
+      font-size: 8px;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
     }
 
     .status-card strong {
-      font-size: clamp(18px, 3vw, 24px);
-      line-height: 1.2;
-      overflow-wrap: anywhere;
+      min-width: 0;
+      color: var(--forest);
+      font-size: clamp(12px, 2vw, 15px);
+      line-height: 1.15;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    .status-card[data-state="ok"] strong { color: var(--accent); }
-    .status-card[data-state="warn"] strong { color: var(--warn); }
-    .status-card[data-state="error"] strong { color: var(--danger); }
+    .status-card[data-state="ok"] strong { color: #226b4d; }
+    .status-card[data-state="warn"] strong { color: #8a6220; }
+    .status-card[data-state="error"] strong { color: #a44339; }
 
     .now-playing {
-      min-height: 108px;
-      padding: 20px;
-      border-radius: 22px;
-      background: linear-gradient(135deg, #315f50, #477b67);
-      color: #f8fff6;
-      box-shadow: 0 18px 45px rgba(52, 94, 76, 0.2);
+      min-width: 0;
+      min-height: 0;
+      padding: clamp(13px, 2.4vh, 21px);
+      border: 1px solid rgba(18, 36, 30, 0.12);
+      border-radius: 17px;
+      background: linear-gradient(135deg, #e5eee8, #d9e7df);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 18px;
+      gap: 14px;
+      overflow: hidden;
     }
 
     .now-playing small {
       display: block;
-      margin-bottom: 7px;
-      color: rgba(244, 255, 246, 0.72);
-      font-weight: 700;
-      letter-spacing: 0.08em;
+      margin-bottom: 4px;
+      color: var(--coral);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.14em;
     }
 
     .now-playing strong {
       display: block;
-      font-size: clamp(20px, 4vw, 30px);
+      color: var(--forest);
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(18px, 3.7vw, 30px);
+      font-weight: 500;
+      line-height: 1.1;
     }
 
     .pulse {
-      width: 54px;
-      height: 54px;
+      width: clamp(40px, 7vw, 54px);
+      height: clamp(40px, 7vw, 54px);
       flex: 0 0 auto;
       border-radius: 50%;
-      border: 1px solid rgba(255, 255, 255, 0.28);
-      background: rgba(255, 255, 255, 0.11);
+      background: var(--mustard);
+      box-shadow: inset 0 0 0 1px rgba(18, 36, 30, 0.12);
       position: relative;
     }
 
@@ -157,138 +250,207 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       top: 50%;
       width: 4px;
       border-radius: 99px;
-      background: #efffed;
+      background: var(--forest);
       transform: translateY(-50%);
     }
 
-    .pulse::before { left: 18px; height: 16px; }
-    .pulse::after { right: 18px; height: 28px; }
+    .pulse::before { left: 34%; height: 29%; }
+    .pulse::after { right: 34%; height: 48%; }
     .now-playing[data-playing="true"] .pulse { animation: breathe 1.4s ease-in-out infinite; }
 
     @keyframes breathe {
-      50% { transform: scale(1.08); box-shadow: 0 0 0 9px rgba(255, 255, 255, 0.08); }
+      50% { transform: scale(1.06); box-shadow: 0 0 0 7px rgba(244, 207, 67, 0.16); }
+    }
+
+    .controls {
+      min-width: 0;
+      display: grid;
+      gap: 8px;
+    }
+
+    .playback-settings {
+      min-height: 46px;
+      padding: 6px 7px 6px 13px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(244, 245, 241, 0.9);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .playback-settings label {
+      color: var(--forest);
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: 0.03em;
+    }
+
+    .playback-settings select {
+      min-width: 104px;
+      height: 34px;
+      padding: 0 30px 0 12px;
+      border: 1px solid rgba(18, 36, 30, 0.24);
+      border-radius: 9px;
+      color: var(--forest);
+      background: var(--paper);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 850;
+      cursor: pointer;
     }
 
     .actions {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 12px;
+      gap: 8px;
     }
 
-    .playback-settings {
-      min-height: 64px;
-      margin-bottom: 12px;
-      padding: 10px 12px 10px 18px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: rgba(248, 250, 242, 0.74);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }
-
-    .playback-settings label {
-      color: var(--muted);
-      font-size: 14px;
-      font-weight: 800;
-      letter-spacing: 0.04em;
-    }
-
-    .playback-settings select {
-      min-width: 112px;
-      min-height: 42px;
-      padding: 0 34px 0 14px;
-      border: 1px solid rgba(56, 111, 93, 0.3);
-      border-radius: 12px;
-      color: var(--ink);
-      background: #fbfcf6;
-      font: inherit;
-      font-weight: 800;
-      cursor: pointer;
-    }
-
-    button, .back-link {
-      min-height: 54px;
+    button {
+      min-width: 0;
+      min-height: 46px;
+      padding: 8px 12px;
       border: 1px solid transparent;
-      border-radius: 15px;
+      border-radius: 11px;
       font: inherit;
-      font-weight: 800;
+      font-size: 12px;
+      font-weight: 900;
       cursor: pointer;
       transition: transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
     }
 
-    button:hover:not(:disabled), .back-link:hover { transform: translateY(-1px); }
-    button:disabled { cursor: default; opacity: 0.45; }
+    button:hover:not(:disabled) { transform: translateY(-1px); }
+    button:disabled { cursor: default; opacity: 0.42; }
 
     #startListening {
-      color: #f8fff6;
-      background: var(--accent);
-      box-shadow: 0 12px 28px rgba(56, 111, 93, 0.22);
+      color: var(--forest);
+      background: var(--mustard);
+      box-shadow: 0 8px 20px rgba(189, 148, 17, 0.2);
     }
 
     #stopListening {
-      color: var(--danger);
-      border-color: rgba(147, 79, 73, 0.28);
-      background: rgba(255, 250, 244, 0.8);
+      color: var(--cream);
+      background: var(--forest);
     }
 
-    .back-link {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: auto;
-      margin-top: 14px;
-      color: var(--muted);
-      text-decoration: none;
-      font-size: 13px;
+    #resumeListening {
+      grid-column: 1 / -1;
+      color: #fffdf7;
+      background: var(--coral);
     }
 
-    @media (max-width: 600px) {
-      body { padding: 0; place-items: stretch; }
-      main { min-height: 100svh; border: 0; border-radius: 0; padding: 28px 18px; }
-      .status-grid { grid-template-columns: 1fr; }
-      .status-card { min-height: 76px; flex-direction: row; align-items: center; }
-      .playback-settings { width: 100%; }
-      .playback-settings select { min-width: 0; width: min(132px, 42vw); }
-      .actions { position: sticky; bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
+    #resumeListening[hidden] { display: none; }
+
+    @media (max-width: 480px) {
+      body {
+        padding:
+          max(6px, env(safe-area-inset-top))
+          max(6px, env(safe-area-inset-right))
+          max(6px, env(safe-area-inset-bottom))
+          max(6px, env(safe-area-inset-left));
+      }
+      main { padding: 12px; border-radius: 16px; gap: 8px; }
+      .brand { grid-template-columns: 38px minmax(0, 1fr) auto; gap: 8px; }
+      .brand-mark { width: 38px; height: 38px; font-size: 20px; }
+      .brand-copy span { display: none; }
+      .brand-copy strong { font-size: 14px; }
+      .live-tag { padding: 6px 7px; font-size: 7px; }
+      .hero { padding: 13px; }
+      h1 { font-size: clamp(23px, 8.2vw, 30px); }
+      .intro { font-size: 10px; line-height: 1.35; }
+      .status-card { min-height: 48px; padding: 7px 8px; }
+      .status-card span { font-size: 7px; }
+      .status-card strong { font-size: 11px; }
+      .now-playing { padding: 12px; }
+      .now-playing strong { font-size: 19px; }
+    }
+
+    @media (max-height: 650px) {
+      main { padding: 11px; gap: 7px; }
+      .hero { padding: 11px 13px; }
+      .intro { display: none; }
+      .status-card { min-height: 44px; padding-block: 6px; }
+      .now-playing { padding: 10px 13px; }
+      .playback-settings { min-height: 40px; }
+      button { min-height: 40px; }
+    }
+
+    @media (min-width: 700px) and (max-height: 500px) {
+      main {
+        width: min(1020px, 100%);
+        grid-template-columns: minmax(240px, 0.8fr) minmax(420px, 1.35fr);
+        grid-template-rows: auto auto minmax(0, 1fr);
+        column-gap: 12px;
+        row-gap: 7px;
+      }
+      .brand { grid-column: 1; grid-row: 1; }
+      .hero { grid-column: 1; grid-row: 2 / 4; align-self: stretch; }
+      .hero h1 { font-size: clamp(27px, 4.2vw, 38px); }
+      .status-grid { grid-column: 2; grid-row: 1; }
+      .now-playing { grid-column: 2; grid-row: 2; min-height: 58px; }
+      .controls { grid-column: 2; grid-row: 3; align-self: end; }
+      .controls { grid-template-columns: minmax(170px, 0.52fr) minmax(0, 1fr); }
+      .actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #resumeListening { grid-column: 1 / -1; }
+      .brand-copy strong { font-size: 15px; }
+      .brand-copy span, .intro { display: none; }
+      .playback-settings { height: 100%; }
+    }
+
+    @media (max-height: 430px) and (min-width: 700px) {
+      .brand-mark { width: 36px; height: 36px; font-size: 19px; }
+      .brand { grid-template-columns: 36px minmax(0, 1fr); }
+      .live-tag { display: none; }
+      .eyebrow { margin-bottom: 4px; }
+      .status-card { min-height: 40px; }
+      .now-playing small { display: none; }
     }
   </style>
 </head>
 <body>
   <main>
-    <section>
-      <p class="eyebrow">VoxBridge Live Audio</p>
-      <h1>译文实时朗读</h1>
-      <p class="intro">点击开始后，本设备只朗读加入之后产生的稳定译文。停止或断线不会影响其他收听设备。</p>
+    <header class="brand">
+      <div class="brand-mark" aria-hidden="true">P</div>
+      <div class="brand-copy">
+        <span>Pittsburgh Christian Church</span>
+        <strong>Pittsburgh Christian Church South</strong>
+      </div>
+      <div class="live-tag">LIVE TRANSLATION</div>
+    </header>
+
+    <section class="hero">
+      <p class="eyebrow">SUNDAY WORSHIP / SHARED AUDIO</p>
+      <h1>Hear the message in your language.</h1>
+      <p class="intro">Start once, then keep listening from the lock screen. Every device joins the same live translated-audio stream.</p>
     </section>
 
     <section class="status-grid" aria-live="polite">
       <div id="connectionCard" class="status-card" data-state="warn">
-        <span>连接</span><strong id="connectionStatus">尚未开始</strong>
+        <span>Connection</span><strong id="connectionStatus">Not started</strong>
       </div>
       <div id="producerCard" class="status-card" data-state="warn">
-        <span>会议</span><strong id="producerStatus">等待状态</strong>
+        <span>Service</span><strong id="producerStatus">Waiting</strong>
       </div>
       <div id="queueCard" class="status-card">
-        <span>待播队列</span><strong id="queueStatus">0 条</strong>
+        <span>Listeners</span><strong id="queueStatus">Not joined</strong>
       </div>
     </section>
 
     <section id="nowPlaying" class="now-playing" data-playing="false" aria-live="polite">
       <div>
-        <small>当前播放</small>
-        <strong id="playbackStatus">等待开始</strong>
+        <small>LIVE AUDIO</small>
+        <strong id="playbackStatus">Waiting to start</strong>
       </div>
       <div class="pulse" aria-hidden="true"></div>
     </section>
 
-    <audio id="ttsPlayback" preload="auto" hidden></audio>
+    <audio id="ttsPlayback" preload="none" playsinline hidden></audio>
 
-    <section>
+    <section class="controls">
       <div class="playback-settings">
-        <label for="playbackRate">朗读速度</label>
-        <select id="playbackRate" aria-label="朗读速度">
+        <label for="playbackRate">Playback speed</label>
+        <select id="playbackRate" aria-label="Playback speed">
           <option value="0.8">0.8x</option>
           <option value="0.9">0.9x</option>
           <option value="1" selected>1.0x</option>
@@ -297,10 +459,10 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         </select>
       </div>
       <div class="actions">
-        <button id="startListening" type="button">开始收听</button>
-        <button id="stopListening" type="button" disabled>停止收听</button>
+        <button id="startListening" type="button">Start Listening</button>
+        <button id="stopListening" type="button" disabled>Stop Listening</button>
+        <button id="resumeListening" type="button" hidden>Resume Audio</button>
       </div>
-      <a class="back-link" href="/">返回字幕页面</a>
     </section>
   </main>
 
@@ -308,6 +470,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
   (() => {
     const startButton = document.getElementById("startListening");
     const stopButton = document.getElementById("stopListening");
+    const resumeButton = document.getElementById("resumeListening");
     const connectionCard = document.getElementById("connectionCard");
     const producerCard = document.getElementById("producerCard");
     const connectionStatus = document.getElementById("connectionStatus");
@@ -319,9 +482,16 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const playbackElement = document.getElementById("ttsPlayback");
     const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
     const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2]);
-    const INTER_SENTENCE_PAUSE_MS = 300;
-    const SILENT_WAV_DATA_URL =
-      "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+    const CATCH_UP_START_LAG_SEC = 12;
+    const CATCH_UP_STOP_LAG_SEC = 5;
+    const CATCH_UP_RATE = 1.2;
+
+    let playbackRate = readPlaybackRate();
+    let listenerId = "";
+    let running = false;
+    let statusTimer = null;
+    let catchingUp = false;
+    playbackRateInput.value = String(playbackRate);
 
     function normalizePlaybackRate(value) {
       const parsed = Number(value);
@@ -338,43 +508,30 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       }
     }
 
-    let playbackRate = readPlaybackRate();
-    playbackRateInput.value = String(playbackRate);
-
-    let socket = null;
-    let listenerId = "";
-    let queue = [];
-    let currentJob = null;
-    const audioPreparations = new Map();
-    let activeObjectUrl = "";
-    let cancelActivePlayback = null;
-    let cancelSentencePause = null;
-    let generation = 0;
-    let heartbeat = null;
-    const seenJobIds = new Set();
-
-    function wsUrl(path) {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      return `${protocol}//${window.location.host}${path}`;
-    }
-
     function setCard(card, value) {
       card.dataset.state = value || "";
     }
 
-    function updateQueueStatus() {
-      queueStatus.textContent = `${queue.length} 条`;
+    function liveLagSec() {
+      const ranges = playbackElement.seekable;
+      if (!ranges || ranges.length < 1 || !Number.isFinite(playbackElement.currentTime)) {
+        return null;
+      }
+      const liveEdge = Number(ranges.end(ranges.length - 1));
+      if (!Number.isFinite(liveEdge)) return null;
+      return Math.max(0, liveEdge - playbackElement.currentTime);
     }
 
-    function send(message) {
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(message));
-      }
+    function effectivePlaybackRate() {
+      if (catchingUp) return CATCH_UP_RATE;
+      if (document.hidden) return Math.max(1, playbackRate);
+      return playbackRate;
     }
 
     function applyPlaybackRate() {
-      playbackElement.defaultPlaybackRate = playbackRate;
-      playbackElement.playbackRate = playbackRate;
+      const effectiveRate = effectivePlaybackRate();
+      playbackElement.defaultPlaybackRate = effectiveRate;
+      playbackElement.playbackRate = effectiveRate;
       if ("preservesPitch" in playbackElement) playbackElement.preservesPitch = true;
       if ("mozPreservesPitch" in playbackElement) playbackElement.mozPreservesPitch = true;
       if ("webkitPreservesPitch" in playbackElement) {
@@ -382,322 +539,218 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       }
     }
 
-    function releaseActiveObjectUrl() {
-      if (!activeObjectUrl) return;
-      window.URL.revokeObjectURL(activeObjectUrl);
-      activeObjectUrl = "";
-    }
-
-    function stopActivePlayback() {
-      if (cancelActivePlayback) {
-        const cancel = cancelActivePlayback;
-        cancelActivePlayback = null;
-        cancel();
+    function updateLiveLatencyGuard() {
+      if (!running) return;
+      const lag = liveLagSec();
+      if (lag !== null) {
+        if (!catchingUp && lag >= CATCH_UP_START_LAG_SEC) catchingUp = true;
+        else if (catchingUp && lag <= CATCH_UP_STOP_LAG_SEC) catchingUp = false;
       }
-      playbackElement.pause();
-      playbackElement.removeAttribute("src");
-      playbackElement.load();
-      releaseActiveObjectUrl();
-    }
-
-    async function unlockPlaybackElement() {
-      playbackElement.muted = true;
-      playbackElement.src = SILENT_WAV_DATA_URL;
-      try {
-        await playbackElement.play();
-      } finally {
-        playbackElement.pause();
-        playbackElement.muted = false;
-        playbackElement.removeAttribute("src");
-        playbackElement.load();
-        applyPlaybackRate();
-      }
-    }
-
-    applyPlaybackRate();
-
-    async function fetchAudio(job, signal) {
-      let lastError = null;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const response = await fetch(
-          `/api/tts/broadcast/jobs/${encodeURIComponent(job.job_id)}/audio`,
-          {
-            method: "POST",
-            credentials: "same-origin",
-            cache: "no-store",
-            signal,
-            headers: { "X-TTS-Listener-ID": listenerId },
-          }
-        );
-        if (response.ok) {
-          const audioBytes = await response.arrayBuffer();
-          send({ type: "tts_received", job_id: job.job_id });
-          return audioBytes;
-        }
-        lastError = new Error(`audio request failed: ${response.status}`);
-        if (response.status !== 503 || attempt > 0) break;
-        await new Promise((resolve) => window.setTimeout(resolve, 250));
-      }
-      throw lastError || new Error("audio request failed");
-    }
-
-    function jobIdOf(job) {
-      return String((job && job.job_id) || "");
-    }
-
-    function prepareAudio(job) {
-      const jobId = jobIdOf(job);
-      if (!jobId) throw new Error("TTS job ID is missing");
-      const existing = audioPreparations.get(jobId);
-      if (existing) return existing;
-
-      const controller = new AbortController();
-      const preparation = {
-        controller,
-        audioBytes: null,
-        error: null,
-        promise: null,
-      };
-      preparation.promise = fetchAudio(job, controller.signal)
-        .then((audioBytes) => {
-          preparation.audioBytes = audioBytes;
-          return preparation;
-        })
-        .catch((error) => {
-          preparation.error = error;
-          return preparation;
-        });
-      audioPreparations.set(jobId, preparation);
-      return preparation;
-    }
-
-    function prefetchNextAudio() {
-      if (!currentJob || queue.length === 0) return;
-      const nextJob = queue[0];
-      prepareAudio(nextJob);
-    }
-
-    async function consumePreparedAudio(job) {
-      const jobId = jobIdOf(job);
-      const preparation = prepareAudio(job);
-      await preparation.promise;
-      if (audioPreparations.get(jobId) === preparation) {
-        audioPreparations.delete(jobId);
-      }
-      if (preparation.error) throw preparation.error;
-      return preparation.audioBytes;
-    }
-
-    function cancelAudioPreparations() {
-      for (const preparation of audioPreparations.values()) {
-        preparation.controller.abort();
-      }
-      audioPreparations.clear();
-    }
-
-    function cancelInterSentencePause() {
-      if (!cancelSentencePause) return;
-      const cancel = cancelSentencePause;
-      cancelSentencePause = null;
-      cancel();
-    }
-
-    async function waitForInterSentencePause() {
-      await new Promise((resolve, reject) => {
-        let settled = false;
-        let timer = null;
-        const settle = (error) => {
-          if (settled) return;
-          settled = true;
-          if (timer !== null) window.clearTimeout(timer);
-          cancelSentencePause = null;
-          if (error) reject(error);
-          else resolve();
-        };
-        timer = window.setTimeout(() => settle(), INTER_SENTENCE_PAUSE_MS);
-        cancelSentencePause = () => {
-          settle(new DOMException("sentence pause cancelled", "AbortError"));
-        };
-      });
-    }
-
-    async function playAudioBuffer(buffer, localGeneration) {
-      if (localGeneration !== generation) return;
-      const audioBlob = new Blob([buffer], { type: "audio/wav" });
-      activeObjectUrl = window.URL.createObjectURL(audioBlob);
-      playbackElement.src = activeObjectUrl;
-      playbackElement.load();
       applyPlaybackRate();
-      try {
-        await new Promise((resolve, reject) => {
-          let settled = false;
-          const settle = (error) => {
-            if (settled) return;
-            settled = true;
-            playbackElement.removeEventListener("ended", onEnded);
-            playbackElement.removeEventListener("error", onError);
-            cancelActivePlayback = null;
-            if (error) reject(error);
-            else resolve();
-          };
-          const onEnded = () => settle();
-          const onError = () => settle(new Error("audio playback failed"));
-          cancelActivePlayback = () => {
-            settle(new DOMException("playback stopped", "AbortError"));
-          };
-          playbackElement.addEventListener("ended", onEnded, { once: true });
-          playbackElement.addEventListener("error", onError, { once: true });
-          const playPromise = playbackElement.play();
-          if (playPromise) playPromise.catch(onError);
-        });
-      } finally {
-        playbackElement.removeAttribute("src");
-        playbackElement.load();
-        releaseActiveObjectUrl();
+      if (catchingUp && lag !== null) {
+        playbackStatus.textContent = `Catching up / ${Math.ceil(lag)}s behind live`;
+      } else {
+        playbackStatus.textContent = "Listening to live translation";
       }
     }
 
-    async function pumpQueue() {
-      if (currentJob || queue.length === 0) return;
-      const localGeneration = generation;
-      currentJob = queue.shift();
-      updateQueueStatus();
-      playbackStatus.textContent = `正在朗读 · ${currentJob.target_language || "译文"}`;
+    function createListenerId() {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return `iphone-${window.crypto.randomUUID()}`;
+      }
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      return `iphone-${Array.from(bytes, (value) =>
+        value.toString(16).padStart(2, "0")
+      ).join("")}`;
+    }
+
+    function setMediaPlaybackState(state) {
+      if ("mediaSession" in navigator) {
+        navigator.mediaSession.playbackState = state;
+      }
+    }
+
+    function markPlaying() {
+      if (!running) return;
+      resumeButton.hidden = true;
+      connectionStatus.textContent = "Connected";
+      setCard(connectionCard, "ok");
+      playbackStatus.textContent = "Listening to live translation";
       nowPlaying.dataset.playing = "true";
-      try {
-        const audioPromise = consumePreparedAudio(currentJob);
-        prefetchNextAudio();
-        const audioBytes = await audioPromise;
-        await playAudioBuffer(audioBytes, localGeneration);
-        if (localGeneration !== generation) return;
-        nowPlaying.dataset.playing = "false";
-        await waitForInterSentencePause();
-      } catch (error) {
-        if (error && error.name !== "AbortError" && localGeneration === generation) {
-          playbackStatus.textContent = "本条音频不可用，继续下一条";
-        }
-      } finally {
-        if (localGeneration !== generation) return;
-        currentJob = null;
-        nowPlaying.dataset.playing = "false";
-        playbackStatus.textContent = queue.length > 0 ? "准备下一条" : "等待新译文";
-        updateQueueStatus();
-        void pumpQueue();
-      }
+      setMediaPlaybackState("playing");
     }
 
-    function clearHeartbeat() {
-      if (heartbeat !== null) {
-        window.clearInterval(heartbeat);
-        heartbeat = null;
-      }
-    }
-
-    function resetLocalPlayback() {
-      generation += 1;
-      cancelAudioPreparations();
-      cancelInterSentencePause();
-      stopActivePlayback();
-      queue = [];
-      currentJob = null;
-      seenJobIds.clear();
+    function markPlaybackBlocked(error) {
+      if (!running) return;
+      const blocked = error && error.name === "NotAllowedError";
+      connectionStatus.textContent = blocked ? "Tap to continue" : "Audio unavailable";
+      setCard(connectionCard, blocked ? "warn" : "error");
+      playbackStatus.textContent = blocked
+        ? "Tap Resume Audio below"
+        : "The shared stream is temporarily unavailable";
       nowPlaying.dataset.playing = "false";
-      playbackStatus.textContent = "等待开始";
-      updateQueueStatus();
+      resumeButton.hidden = false;
+      setMediaPlaybackState("paused");
+    }
+
+    async function pollStatus() {
+      if (!running) return;
+      try {
+        const response = await fetch("/api/tts/live/status", {
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`status request failed: ${response.status}`);
+        const status = await response.json();
+        if (!running) return;
+        producerStatus.textContent = status.producer_active ? "Service live" : "Waiting for service";
+        setCard(producerCard, status.producer_active ? "ok" : "warn");
+        const listeners = Number(status.listener_count || 0);
+        const pendingAudioSec = Math.ceil(Number(status.pending_audio_ms || 0) / 1000);
+        queueStatus.textContent = status.encoder_active
+          ? `Live / ${listeners} listeners${pendingAudioSec > 0 ? ` / ${pendingAudioSec}s queued` : ""}`
+          : "Preparing stream";
+      } catch (error) {
+        if (!running) return;
+        producerStatus.textContent = "Status unavailable";
+        setCard(producerCard, "warn");
+      }
+    }
+
+    function beginStatusPolling() {
+      if (statusTimer !== null) window.clearInterval(statusTimer);
+      void pollStatus();
+      statusTimer = window.setInterval(() => void pollStatus(), 5000);
+    }
+
+    function stopStatusPolling() {
+      if (statusTimer === null) return;
+      window.clearInterval(statusTimer);
+      statusTimer = null;
+    }
+
+    function startListeningFromGesture() {
+      if (running) return;
+      running = true;
+      listenerId = createListenerId();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      resumeButton.hidden = true;
+      connectionStatus.textContent = "Connecting";
+      producerStatus.textContent = "Checking service";
+      queueStatus.textContent = "Joining live stream";
+      playbackStatus.textContent = "Starting audio";
+      setCard(connectionCard, "warn");
+      setCard(producerCard, "warn");
+
+      playbackElement.muted = false;
+      playbackElement.playsInline = true;
+      playbackElement.src =
+        `/api/tts/live/${encodeURIComponent(listenerId)}/index.m3u8`;
+      applyPlaybackRate();
+
+      // iOS requires the native stream to start directly inside the user's gesture.
+      const playPromise = playbackElement.play();
+      beginStatusPolling();
+      if (playPromise) {
+        playPromise.then(markPlaying).catch(markPlaybackBlocked);
+      } else {
+        markPlaying();
+      }
+    }
+
+    function resumeListeningFromGesture() {
+      if (!running || !playbackElement.src) return;
+      resumeButton.hidden = true;
+      connectionStatus.textContent = "Restoring audio";
+      setCard(connectionCard, "warn");
+      const playPromise = playbackElement.play();
+      if (playPromise) {
+        playPromise.then(markPlaying).catch(markPlaybackBlocked);
+      } else {
+        markPlaying();
+      }
+    }
+
+    function releaseListenerLease(id) {
+      if (!id) return;
+      fetch(`/api/tts/live/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+        keepalive: true,
+      }).catch(() => {});
     }
 
     function stopListening() {
-      clearHeartbeat();
-      const closingSocket = socket;
-      socket = null;
+      const closingListenerId = listenerId;
       listenerId = "";
-      if (closingSocket && closingSocket.readyState < WebSocket.CLOSING) {
-        closingSocket.close(1000, "listener stopped");
-      }
-      resetLocalPlayback();
-      connectionStatus.textContent = "已停止";
-      producerStatus.textContent = "等待状态";
+      running = false;
+      catchingUp = false;
+      stopStatusPolling();
+      playbackElement.pause();
+      playbackElement.removeAttribute("src");
+      playbackElement.load();
+      releaseListenerLease(closingListenerId);
+      resumeButton.hidden = true;
+      nowPlaying.dataset.playing = "false";
+      connectionStatus.textContent = "Stopped";
+      producerStatus.textContent = "Waiting";
+      queueStatus.textContent = "Not joined";
+      playbackStatus.textContent = "Waiting to start";
       setCard(connectionCard, "warn");
       setCard(producerCard, "warn");
       startButton.disabled = false;
       stopButton.disabled = true;
+      setMediaPlaybackState("none");
     }
 
-    async function startListening() {
-      if (socket) return;
-      resetLocalPlayback();
-      await unlockPlaybackElement();
-      startButton.disabled = true;
-      stopButton.disabled = false;
-      connectionStatus.textContent = "正在连接";
-      setCard(connectionCard, "warn");
-
-      const activeSocket = new WebSocket(wsUrl("/ws/tts"));
-      socket = activeSocket;
-      activeSocket.addEventListener("open", () => {
-        if (socket !== activeSocket) return;
-        heartbeat = window.setInterval(() => send({ type: "ping" }), 20000);
-      });
-      activeSocket.addEventListener("message", (event) => {
-        if (socket !== activeSocket) return;
-        let message;
-        try { message = JSON.parse(event.data); } catch (error) { return; }
-        if (message.type === "tts_listener_ready") {
-          listenerId = String(message.listener_id || "");
-          connectionStatus.textContent = message.tts_available ? "已连接" : "服务不可用";
-          setCard(connectionCard, message.tts_available ? "ok" : "error");
-          producerStatus.textContent = message.producer_active ? "会议进行中" : "等待会议";
-          setCard(producerCard, message.producer_active ? "ok" : "warn");
-          playbackStatus.textContent = message.tts_available ? "等待新译文" : "朗读服务不可用";
-          return;
-        }
-        if (message.type === "producer_status") {
-          producerStatus.textContent = message.active ? "会议进行中" : "会议已停止";
-          setCard(producerCard, message.active ? "ok" : "warn");
-          return;
-        }
-        if (message.type === "tts_job" && message.is_stable === true) {
-          const jobId = String(message.job_id || "");
-          if (!jobId || seenJobIds.has(jobId)) return;
-          seenJobIds.add(jobId);
-          const job = message;
-          queue.push(job);
-          updateQueueStatus();
-          prefetchNextAudio();
-          void pumpQueue();
-          return;
-        }
-        if (message.type === "error") {
-          connectionStatus.textContent = "连接错误";
-          setCard(connectionCard, "error");
-        }
-      });
-      activeSocket.addEventListener("close", () => {
-        if (socket !== activeSocket) return;
-        clearHeartbeat();
-        socket = null;
-        listenerId = "";
-        resetLocalPlayback();
-        connectionStatus.textContent = "连接已断开，请重新开始";
-        setCard(connectionCard, "error");
-        startButton.disabled = false;
-        stopButton.disabled = true;
-      });
-      activeSocket.addEventListener("error", () => {
-        if (socket !== activeSocket) return;
-        connectionStatus.textContent = "网络异常";
-        setCard(connectionCard, "error");
-      });
+    function configureMediaSession() {
+      if (!("mediaSession" in navigator)) return;
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: "PCCS Live Translation",
+          artist: "Pittsburgh Christian Church South",
+          album: "Sunday Worship",
+        });
+      } catch (error) {}
+      try {
+        navigator.mediaSession.setActionHandler("play", () => {
+          if (!running) startListeningFromGesture();
+          else resumeListeningFromGesture();
+        });
+      } catch (error) {}
+      try {
+        navigator.mediaSession.setActionHandler("pause", () => {
+          playbackElement.pause();
+          nowPlaying.dataset.playing = "false";
+          playbackStatus.textContent = "Paused / resume from the lock screen";
+          setMediaPlaybackState("paused");
+        });
+      } catch (error) {}
     }
 
-    startButton.addEventListener("click", () => {
-      startListening().catch(() => {
-        stopListening();
-        connectionStatus.textContent = "启动失败";
-        setCard(connectionCard, "error");
-      });
-    });
+    applyPlaybackRate();
+    configureMediaSession();
+
+    startButton.addEventListener("click", startListeningFromGesture);
+    resumeButton.addEventListener("click", resumeListeningFromGesture);
     stopButton.addEventListener("click", stopListening);
+    playbackElement.addEventListener("playing", markPlaying);
+    playbackElement.addEventListener("waiting", () => {
+      if (!running) return;
+      playbackStatus.textContent = "Buffering live audio";
+      nowPlaying.dataset.playing = "false";
+    });
+    playbackElement.addEventListener("stalled", () => {
+      if (!running) return;
+      playbackStatus.textContent = "Reconnecting to live audio";
+      nowPlaying.dataset.playing = "false";
+    });
+    playbackElement.addEventListener("error", () => {
+      if (!running) return;
+      markPlaybackBlocked(playbackElement.error || new Error("media error"));
+    });
     playbackRateInput.addEventListener("change", () => {
       playbackRate = normalizePlaybackRate(playbackRateInput.value);
       playbackRateInput.value = String(playbackRate);
@@ -706,11 +759,13 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       } catch (error) {}
       applyPlaybackRate();
     });
+    playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard);
+    playbackElement.addEventListener("progress", updateLiveLatencyGuard);
+    document.addEventListener("visibilitychange", updateLiveLatencyGuard);
     window.addEventListener("beforeunload", () => {
-      if (socket) socket.close(1000, "page closed");
-      cancelAudioPreparations();
-      cancelInterSentencePause();
-      stopActivePlayback();
+      stopStatusPolling();
+      releaseListenerLease(listenerId);
+      playbackElement.pause();
     });
   })();
   </script>

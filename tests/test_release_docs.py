@@ -55,7 +55,8 @@ def test_readme_declares_the_supported_runtime_contract():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "8024" in readme
     assert ".venv/bin/python" in readme
-    assert "Qwen/Qwen3-ASR-0.6B" in readme
+    assert "Qwen/Qwen3-ASR-1.7B" in readme
+    assert "Qwen/Qwen3-ASR-0.6B" not in readme
     assert "sentence_id" in readme
     assert "revision" in readme
 
@@ -89,22 +90,44 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "CPU-only" in readme
     assert "FIFO" in readme
     assert "/listen" in readme
-    assert "仅接收连接后" in readme
+    assert "bounded pre-listener backlog" in readme
     assert "多个设备" in readme
     assert "主字幕页不播放" in readme
+    assert "HLS" in readme
+    assert "锁屏" in readme
+    assert "一个 Kokoro worker" in readme
+    assert "https://ushome.amycat.com:18024/listen" in readme
+    assert "免登录" in readme
+    assert "Pittsburgh Christian Church South" in readme
     assert "0.8x" in readme
     assert "1.2x" in readme
     assert "0.75x" not in readme
     assert "2.0x" not in readme
-    assert "单条预取" in readme
     assert "300ms" in readme
+    assert "pending_audio_ms" in readme
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
 
     assert "GET /listen" in api
+    assert "GET /api/tts/live/status" in api
+    assert '"synthesis_active"' in api
+    assert '"preparation_queue_depth"' in api
+    assert '"prepared_audio_count"' in api
+    assert '"pending_audio_ms"' in api
+    assert "does not seek or discard translated speech" in api
+    assert "GET /api/tts/live/{listener_id}/index.m3u8" in api
+    assert "GET /api/tts/live/{listener_id}/segments/{segment_name}" in api
+    assert "DELETE /api/tts/live/{listener_id}" in api
+    assert "persistent native media element" in api
+    assert "public bearer capability" in api
+    assert "HTTP 429" in api
+    assert "128" in api
+    assert "GET /listen/qr.svg" in api
+    assert "Pittsburgh Christian Church South" in api
     assert "WS /ws/tts" in api
     assert "POST /api/tts/broadcast/jobs/{job_id}/audio" in api
     assert '"type": "tts_received"' in api
-    assert "future-only" in api
+    assert "bounded pre-listener backlog" in api
+    assert "exact translation revision" in api
     assert "deprecated" in api
     assert "POST /api/tts/jobs/{job_id}/audio" in api
     assert "DELETE /api/tts/jobs/{job_id}" in api
@@ -113,8 +136,6 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert '"is_stable": true' in api
     assert "per-device" in api.lower()
     assert "localStorage" in api
-    assert "single-item lookahead" in api
-    assert "300ms sentence pause" in api
 
     assert "--enable-tts" in deployment
     assert "--tts-en-model-path" in deployment
@@ -124,10 +145,20 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "listener-side" in deployment.lower()
     assert "bounded" in deployment.lower()
     assert "300ms" in deployment
+    assert "one FFmpeg" in deployment
+    assert "90-second lease" in deployment
+    assert "12-second" in deployment
+    assert "live edge" in deployment
+    assert "--tts-hls-max-listeners 128" in deployment
+    assert "bounded pre-listener backlog" in deployment
+    assert "public bearer capability" in deployment
+    assert "main subtitle page remains authenticated" in deployment
     assert "CPUExecutionProvider" in deployment
     assert "/listen" in deployment
     assert "Kokoro" in changelog
     assert "multi-listener" in changelog
+    assert "PCCS" in changelog
+    assert "static QR" in changelog
 
 
 def test_docs_publish_tts_revision_stability_contract():

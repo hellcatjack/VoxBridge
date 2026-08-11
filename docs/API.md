@@ -18,7 +18,9 @@ PY
 
 Use `--auth-password-hash <hash>` or `VOXBRIDGE_AUTH_PASSWORD_HASH=<hash>`.
 For HTTPS/WSS public deployments, add `--auth-cookie-secure`. For public
-deployments, also prefer `--disable-debug-file`.
+deployments, also prefer `--disable-debug-file`. Authentication still protects
+the main subtitle UI, ASR WebSocket, and management/compatibility routes. The
+explicit public listener routes documented below are the only exception.
 
 ### `GET /`
 
@@ -29,29 +31,106 @@ When authentication is enabled, unauthenticated requests redirect to `/login`.
 ### `GET /listen`
 
 Returns the standalone translated-speech listener. The main subtitle page does
-not synthesize or play audio. When authentication is enabled, an unauthenticated
-request redirects to `/login?next=%2Flisten`, and a successful login returns to
-the listener page. Each browser must explicitly select Start to activate audio.
+not synthesize or play audio. This route is public even when authentication is
+enabled, so a phone can enter directly from the fixed QR code. Each browser must
+explicitly select Start to activate audio.
+
+The English-only, one-screen page is branded for Pittsburgh Christian Church South
+and assigns one persistent native media element a listener-scoped HLS URL
+and calls `play()` directly from the Start gesture. It does not fetch sentence
+WAVs, create Blob URLs, or depend on foreground JavaScript to advance the queue.
+The continuous stream carries silence when no translated speech is ready, which
+allows native iOS media playback and lock-screen controls to remain active.
 
 The page provides per-device playback-rate choices from `0.8x` through `1.2x`
-in `0.1x` steps. It is stored only in browser `localStorage`, applies immediately to the
-current and queued audio, and is never sent through HTTP or WebSocket. All
-listeners therefore continue receiving the same shared synthesized WAV. A
-stored value outside the current allowlist falls back to `1.0x`.
+in `0.1x` steps. The value is stored only in browser `localStorage` and applies
+to the one native media element; it never creates another synthesis or encoder.
+A stored value outside the current allowlist falls back to `1.0x`. A listener
+that reaches 12 seconds behind the HLS live edge temporarily catches up at
+`1.2x` and restores the selected rate inside five seconds. A hidden or locked
+page uses at least `1.0x`. This guard does not seek or discard translated speech.
 
-The listener uses a bounded single-item lookahead: while one FIFO item is
-playing, only the next queued job may fetch and prepare its complete WAV. The
-prepared bytes are reused when that job becomes current, and Stop, disconnect,
-or reload aborts outstanding preparation. `tts_received` still means the full
-WAV reached that browser, so a prefetched job can be acknowledged before local
-playback. No endpoint or WebSocket message changes. If synthesis takes longer
-than the current clip, a residual transition wait remains.
+### `GET /listen/qr.svg`
 
-After each successful clip, the listener applies a fixed `300ms sentence pause`
-before promoting the next prepared FIFO item. This wall-clock gate is independent
-of playback rate and translation direction, does not inspect text or punctuation,
-and does not stop lookahead preparation. Reset, Stop, disconnect, and unload
-cancel an active pause immediately.
+Returns a cacheable, script-free static QR code for
+`https://ushome.amycat.com:18024/listen`. The SVG is generated at build time and
+does not contact an external QR service. This route is public.
+
+### `GET /api/tts/live/status`
+
+Returns public foreground diagnostics for the shared stream:
+
+```json
+{
+  "available": true,
+  "listener_count": 2,
+  "queue_depth": 0,
+  "synthesis_active": false,
+  "preparation_queue_depth": 0,
+  "preparation_active": false,
+  "prepared_audio_count": 1,
+  "pending_audio_ms": 0,
+  "encoder_active": true,
+  "producer_active": true,
+  "last_error": ""
+}
+```
+
+The status request does not create a listener lease. It is advisory only; native
+HLS playback continues if browser JavaScript is suspended while the device is
+locked. `queue_depth` counts queued stable translations plus the one item already
+removed from the queue for Kokoro inference. `synthesis_active` makes that
+in-flight state explicit. `preparation_queue_depth` counts translated revisions
+waiting for speculative Kokoro work, `preparation_active` identifies that kind
+of in-flight work, and `prepared_audio_count` counts exact revisions cached but
+not yet permitted into the live stream. `pending_audio_ms` measures synthesized PCM, including
+the inter-sentence pause, that has not yet been written into the real-time HLS
+timeline. It therefore exposes ordered playback backlog that `queue_depth`
+cannot represent.
+
+### `GET /api/tts/live/{listener_id}/index.m3u8`
+
+Creates or refreshes a listener lease and returns the shared live
+playlist as `application/vnd.apple.mpegurl`. The route waits up to five seconds
+for the initial segment and returns `503` if FFmpeg cannot establish the stream.
+The response uses `Cache-Control: no-store`. Segment entries are rewritten to
+the same listener-scoped URL namespace.
+
+Listener IDs must satisfy the same safe opaque-token format used by other TTS
+routes. Because this endpoint is public, an unguessable listener ID is a public
+bearer capability for that short-lived lease, not an authenticated user identity.
+The server accepts at most 128 concurrent leases by default; a new listener over
+that bound receives `HTTP 429`, while an existing lease may still refresh.
+
+The publisher also keeps a bounded pre-listener backlog of up to 128 stable
+translations from the current producer session. It does not synthesize them while
+there are no listeners. The first listener starts one shared Kokoro worker, which
+drains that backlog in source order and can prefill the existing bounded PCM queue.
+When idle, overflow retains the most recent entries; starting a new producer
+session clears an older idle backlog so speech cannot cross meeting boundaries.
+
+While at least one listener lease is active, translation completion may start
+Kokoro preparation before the source-revision stability gate releases the item.
+The cache key is the exact translation revision: sentence ID, revision, target
+language, and a SHA-256 text digest. A newer revision invalidates stale prepared
+audio. Preparation never writes PCM to HLS; only the existing ordered stability
+release can publish it. Stable release reuses an exact cache hit, including work
+already in flight, so it does not create a second Kokoro synthesis. The cache is
+bounded to eight entries and is cleared with the listener epoch.
+
+### `GET /api/tts/live/{listener_id}/segments/{segment_name}`
+
+Refreshes the matching lease and returns one shared MPEG-TS/AAC segment. Segment
+names are restricted to `segment_#########.ts`; traversal and unknown leases
+return `404`. Different listeners read the same file and do not cause additional
+Kokoro or FFmpeg work. Possession of the matching listener ID is required.
+
+### `DELETE /api/tts/live/{listener_id}`
+
+Removes only the matching public bearer capability's listener lease. The shared
+encoder remains active while any other lease exists. The last listener removal,
+or expiry after 90 seconds without playlist/segment traffic, closes FFmpeg and
+removes the temporary HLS epoch directory.
 
 ### `GET /login`
 
@@ -78,7 +157,7 @@ Use this endpoint only for local diagnostics. Do not expose it on an untrusted
 network. When authentication is enabled, this endpoint requires a valid session.
 When `--disable-debug-file` is set, this endpoint always returns `404`.
 
-### `POST /api/tts/broadcast/jobs/{job_id}/audio`
+### Legacy `POST /api/tts/broadcast/jobs/{job_id}/audio`
 
 Returns the shared `audio/wav` for one job assigned to the authenticated
 listener in `X-TTS-Listener-ID`. Missing, expired, unassigned, and foreign jobs
@@ -120,9 +199,10 @@ speech.
 
 ## WebSocket Endpoints
 
-### `WS /ws/tts`
+### Legacy `WS /ws/tts`
 
-Authenticated standalone translated-speech listener protocol. Listener sockets
+Compatibility translated-speech listener protocol. The current `/listen` page
+uses shared HLS instead. Listener sockets
 do not count against the ASR `--max-connections` limit. After connection the
 server returns:
 
@@ -225,6 +305,61 @@ Fields:
 `start` validates and constructs the replacement ASR state before resetting the
 active session. Invalid context therefore returns `error` without replacing the
 current state or beginning a new audio stream.
+
+### `audio_silence`
+
+Compresses confirmed client-side transport silence without sending silent PCM:
+
+```json
+{
+  "type": "audio_silence",
+  "duration_ms": 1000,
+  "capture_sample_index": 1920000
+}
+```
+
+- `duration_ms` is the confirmed quiet interval represented for endpoint policy
+  and must be an integer from `1` through `5000`. The bundled client can also
+  retain a bounded prefix of that interval as endpoint-tail PCM for ASR
+  accuracy; `capture_sample_index` keeps source time monotonic.
+- `capture_sample_index` is the client's monotonic 16 kHz source-sample cursor
+  and must be a non-negative safe JavaScript integer.
+- The event is queued in order with preceding PCM. It advances backend silence
+  state, endpoint policy, idle-tail handling, and the source timeline, but it is
+  never converted to PCM or passed to ASR inference.
+- If a streaming state receives only `audio_silence` controls and no audio was
+  decoded, Stop returns an empty stable `final` without calling
+  `finish_streaming_transcribe`. This prevents context-biased empty-audio output
+  from entering subtitles, translation, or TTS.
+- The bundled browser delays the first event until 700 ms of certain silence,
+  retains a bounded 400 ms prefix as low-energy endpoint-tail PCM, then emits a
+  heartbeat for each additional 1000 ms. Shorter pauses are held briefly and
+  replayed unchanged if speech resumes. The source cursor prevents the retained
+  tail from advancing context-schedule time twice.
+
+The backend remains authoritative for VAD cuts. This event is a transport hint,
+not permission for the frontend to finalize text or choose a sentence boundary.
+
+### `audio_speech_start`
+
+Precedes PCM when speech resumes after suppressed silence:
+
+```json
+{
+  "type": "audio_speech_start",
+  "capture_sample_index": 1939200,
+  "preroll_samples": 6400
+}
+```
+
+- `capture_sample_index` uses the same monotonic 16 kHz source cursor.
+- `preroll_samples` is the number of following PCM samples replayed from the
+  client pre-roll and must be between `0` and `32000`.
+- Replayed samples remain available to ASR for onset protection but are not
+  counted twice in the source timeline used by context schedules.
+- The event does not itself prove speech. After a long-silence transition, a
+  context-bearing state remains output-quarantined until backend Silero or the
+  backend energy fallback confirms speech.
 
 ### `set_translation_direction`
 
@@ -455,6 +590,12 @@ text, stream generation, and translation direction both before inference and
 before publication. A superseded result is discarded and is never sent as a
 `sentence_translation` event.
 
+Built-in translation backends also validate the target script. For an English
+target, a result that still contains Han characters is retried once with a
+strict target-language prompt. If the retry is still mixed-language, no
+`sentence_translation` or TTS job is published for that result; later sentence
+jobs continue normally.
+
 ### `tts_job` (deprecated on `WS /ws`)
 
 Sent only after the current stable `sentence_id` and `revision` translation has
@@ -490,7 +631,8 @@ browser playback.
 ### `sentence_reset`
 
 Tells the frontend to clear committed subtitle rows and rebuild from subsequent
-sentence events.
+sentence events. Normal Stop does not emit this event. It is reserved for the
+explicit, blocking `--final-redecode-on-stop` compatibility mode.
 
 ```json
 {
@@ -541,12 +683,12 @@ Sent once after `finish`.
 skipped by `--final-redecode-max-sec`. Use `committed_text` and sentence events
 as the canonical subtitle stream.
 
-When broadcast TTS is available, the backend waits for pending stable
-translations and publishes all pending listener jobs before `final`.
+When translated speech is available, the backend waits for pending stable
+translations and publishes all pending spoken items before `final`.
 `--tts-final-translation-drain-sec` is the threshold for a slow-drain status,
 not a hard timeout. The backend does not wait for CPU synthesis or browser
-playback. Listener FIFOs therefore continue independently after the producer
-becomes inactive.
+playback. The shared HLS timeline therefore continues independently after the
+producer becomes inactive while at least one listener lease remains.
 
 ### Spoken Translation Revision Stability
 
@@ -560,10 +702,46 @@ finishes after the source revision deadline can publish immediately.
 `--tts-latest-revision-grace-sec 4.0` adds revision protection only to the
 highest unsealed source order. It is not a global seven-second delay. Registering
 a successor removes the extra grace from its predecessor, which then follows
-the ordinary three-second rule. Successful final ASR reconciliation performs
-backend segment sealing before the streaming state and candidate cursor are
-rotated. Ready sealed sources publish immediately; translations that finish
-after sealing publish as soon as they become ready.
+the ordinary three-second rule. When `--segment-final-redecode` is enabled,
+natural VAD finalization flushes pending endpoint audio and runs one bounded
+one-shot decode over the current segment before sentence reconciliation. A
+mid-speech hard cut only flushes the streaming state and rotates immediately so
+incoming speech is not dropped while an old segment is re-decoded. An
+unchanged result validates the streaming text; a safely compatible result may
+repair its tail while retaining sentence revision semantics. Empty, failed,
+context-echo, substantially divergent, or completed-unit-regressing results
+are rejected. A `completed_unit_regression` keeps the streaming text when the
+one-shot result would reduce the number of complete units inside the current
+segment. An `effective_completed_unit_regression` applies the same protection
+after carrying the previous segment's pending boundary prefix, before any
+sentence cursor, translation, or TTS state is updated. Canonical candidate
+updates are also rejected when they replay a material suffix of the preceding
+candidate into the current sentence ID; already solidified neighboring rows
+therefore cannot become overlapping duplicates after resegmentation. A
+one-shot candidate that is only a strict normalized prefix of its already
+solidified row is rejected as a terminal contraction; segment-final validation
+may extend a tail or apply a compatible lexical repair, but cannot delete a
+stable sentence ending.
+Backend segment sealing occurs only for a validated segment, before the
+streaming state and candidate cursor rotate. Ready sealed sources publish
+immediately; an unvalidated segment remains protected by the normal revision
+timers.
+
+With segment-final re-decode enabled, the highest unsealed and unconfirmed
+source has no timer deadline. `wait_state` reports
+`waiting_for_segment_seal: true` with `required_quiet_ms: -1` and
+`remaining_ms: -1`. Registering a successor removes this hold from its
+predecessor; rollback confirmation, segment sealing, and orderly Stop continue
+to release through their existing paths.
+
+`--final-redecode-on-stop` is disabled by default. When explicitly enabled, it
+can reconcile buffered full-session text only when Stop is requested, emits a
+`sentence_reset`, and is too late to protect translations or TTS already
+published during a live session.
+Segment diagnostics emit `segment_final_redecode_done`,
+`segment_final_redecode_skipped`, `segment_final_redecode_failed`, and
+`tts_source_seal_deferred`. They include duration, latency, lengths, hashes, and
+cut reason, but not source text.
 
 A higher revision inside the quiet window invalidates the older ready
 translation and restarts the source timer. Source order remains strict, so a
@@ -601,8 +779,9 @@ Example:
 ## Backend Behavior Updates
 
 The current backend owns the streaming state and all complex segmentation logic.
-The frontend sends audio chunks and renders backend sentence events; it should
-not run its own sentence stability or slicing heuristics.
+The frontend sends audio chunks, compresses only confidently silent transport
+spans, and renders backend sentence events; it does not run sentence stability
+or slicing heuristics.
 
 Important behavior updates:
 
@@ -623,6 +802,9 @@ Important behavior updates:
   returns the effective source and target labels.
 - Translation queue cleanup: changing direction or starting a new session
   clears pending translation tasks to avoid stale-language output.
+- Target-language output guard: built-in `zh2en` translation retries an English
+  result containing untranslated Han characters once and rejects a still-mixed
+  retry before subtitle or TTS publication.
 - Final reconcile guard: `final_commit_reconcile` no longer resets subtitles
   when final text is non-canonical, such as when full final re-decode is skipped
   due to `--final-redecode-max-sec`.
@@ -836,14 +1018,30 @@ Relevant recent events:
   with the existing VAD because the shadow observer is fail-open.
 - `audio_preroll_replayed`: the number and duration of previously skipped
   samples prepended once when ASR decoding resumes.
+- `endpoint_tail_decoded`: a bounded skipped-audio tail was decoded once
+  immediately before segment or stop finalization; includes duration and RMS
+  but no recognized text.
+- `endpoint_tail_decode_failed`: endpoint-tail decoding failed and the buffered
+  samples were restored for retry.
+- `idle_preroll_discarded`: skipped low-energy PCM was discarded because a
+  client-silence event arrived without an active segment or pending text.
+- `client_silence_queued`: an authenticated client silence span entered the
+  ordered consumer queue behind all preceding PCM.
+- `client_silence_applied`: the span advanced backend silence and source clocks
+  without an ASR decode; includes duration, VAD readiness, and context-guard
+  state, but no audio or text.
+- `client_speech_start`: records the monotonic source cursor and pre-roll size;
+  it does not release the backend speech-evidence guard by itself.
 - `asr_context_resume_guard_armed`: at least three consecutive silent decode
-  skips activated the context-output guard. Arming happens before either a
-  resumed decode or segment finalization, so a VAD/Hard Cut cannot bypass it.
-- `asr_context_resume_partial_quarantined`: a partial dominated by at least
-  three session-context terms was withheld after silent decoding. When the
-  Silero observer is available, the guard remains active until 200 ms of speech
-  is confirmed. Without Silero, it uses one `chunk_size_sec` fallback window.
-  Ordinary non-context text is released immediately.
+  skips, a client long-silence event, or a new post-cut state activated the
+  context-output guard. Long-silence and post-cut states set
+  `require_speech_evidence: true`; legacy energy-only resumes retain the earlier
+  context-fragment behavior.
+- `asr_context_resume_partial_quarantined`: under strict long-silence protection,
+  every partial is withheld until 200 ms of backend Silero speech is confirmed,
+  regardless of how many context terms it contains. Without Silero, sustained
+  backend energy provides the fallback. The client `audio_speech_start` event
+  alone cannot release this guard.
 - `asr_context_resume_guard_released`: the guard was released by confirmed
   speech, ordinary non-context output, or expiry of the fallback window.
 - `asr_context_silent_segment_discarded`: segment or stop finalization produced
@@ -851,6 +1049,18 @@ Relevant recent events:
   The candidate was not committed or translated. A prior non-context subtitle
   snapshot is retained when available. These events contain hashes and lengths,
   not the context or recognized text itself.
+- `asr_context_final_tail_repair_trusted`: an active context silence guard
+  accepted a final candidate because the segment had sufficient backend speech
+  activity, the candidate was an aligned correction of the prior non-context
+  snapshot, and context-echo checks passed. Only lengths, hashes, and activity
+  duration are logged.
+- `stream_finish_skipped_no_decode`: Stop did not flush or finish a state that
+  had never performed streaming ASR decode. Any buffered low-energy pre-roll is
+  discarded and cannot create context hotword output.
+- `pending_prefix_vad_boundary_preserved`: a VAD-finalized text unit remained
+  deferred by rollback protection and was retained as an independent prefix of
+  the next candidate timeline despite having no textual overlap with the next
+  segment. It is cleared only through normal commit/alignment handling.
 
 - `final_commit_reconcile_skipped_noncanonical`: final text differs from
   committed text but is not a canonical full-session decode, so the backend kept
@@ -864,6 +1074,10 @@ Relevant recent events:
 - `translation_stale_drop`: records a superseded translation request rejected
   during `pre_inference` or `post_inference`, with queued/current revisions and
   source hashes.
+- `translation_target_language_mismatch`: the first built-in translation result
+  did not match the English target script and a strict retry was requested.
+- `translation_target_language_rejected`: the strict retry remained
+  mixed-language and was withheld from subtitles and TTS.
 - `early_translation_stability_wait`: records the first-seen timestamp, stable
   age, hit count, required thresholds, and short-English classification while a
   terminal sentence remains tentative.

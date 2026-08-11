@@ -108,11 +108,12 @@ WorkingDirectory=%h/src/VoxBridge
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-%h/.config/voxbridge/voxbridge.env
 ExecStart=%h/src/VoxBridge/.venv/bin/python -m voxbridge.cli.demo_streaming_ws \
-  --asr-model-path Qwen/Qwen3-ASR-0.6B \
+  --asr-model-path Qwen/Qwen3-ASR-1.7B \
   --backend vllm \
   --host 127.0.0.1 \
   --port 8024 \
   --mm-processor-cache-gb 0.5 \
+  --segment-final-redecode \
   --auth-enabled \
   --auth-username admin \
   --auth-cookie-secure \
@@ -141,10 +142,48 @@ The recommended quality-preserving decode gate instrumentation is:
 --silero-vad-shadow-log-sec 1.0
 ```
 
-The pre-roll contains only audio skipped by the current energy gate and is
-replayed once when decoding resumes. Silero remains observe-only: it cannot
-trigger a cut or suppress audio. Loading and inference failures disable only the
-shadow observer for the current WebSocket session.
+The pre-roll contains only audio skipped by the current energy gate. It is
+replayed once when decoding resumes, or decoded once immediately before an ASR
+segment is finalized so a weak final syllable cannot be discarded. Silero
+remains observe-only: it cannot trigger a cut or suppress audio. Loading and
+inference failures disable only the shadow observer for the current WebSocket
+session.
+
+`--segment-final-redecode` runs one bounded one-shot decode at natural VAD
+endpoints before source sentences are committed, translated, or released to
+TTS. A mid-speech hard cut uses the streaming flush result and rotates
+immediately; re-decoding a long active segment would block inference and can
+overflow the live audio queue. Empty, failed, or substantially divergent VAD
+results, including corrections that reduce complete units after the previous
+segment's pending prefix is carried forward, leave the existing revision
+stability window active instead of sealing the source immediately. While this
+option is enabled, the newest unsealed
+source has no timer-only TTS release: a validated segment seal or a
+rollback-safe successor is required. Stop flushes the current streaming state
+and force-drains the final ready revision without rebuilding visible history.
+Full-session Stop re-decode is an explicit opt-in via
+`--final-redecode-on-stop`.
+
+With streaming context enabled, long silence arms a backend output quarantine.
+The quarantine still accepts a compatible sentence-tail repair when the segment
+already contains sufficient backend speech activity and context-echo checks
+pass. A state that has decoded no audio skips streaming finish entirely, so
+context hotwords cannot be generated from a control-only silent session.
+
+Browser clients additionally hold possible silence for 700 ms. A shorter pause
+is replayed as ordinary PCM; a confirmed longer pause becomes an ordered
+`audio_silence` control event with one-second heartbeats. The first 400 ms of a
+confirmed endpoint is retained as bounded low-energy tail PCM; the remaining
+silence is suppressed. The backend advances VAD and context-schedule time from
+control events without converting those events to PCM. Speech recovery sends up
+to 400 ms pre-roll after `audio_speech_start`.
+
+On macOS, use HTTPS/WSS. Safari 14.1+ supports the AudioWorklet microphone path,
+and the page retains a ScriptProcessor fallback for older or restricted WebKit
+environments. System-audio capture is not portable across Safari/macOS versions;
+Chrome or Edge is recommended when a browser tab or another application must be
+captured. The page requires a real audio track from `getDisplayMedia` and fails
+the Start operation when the browser returns video-only sharing.
 
 Long comma-delimited speech is translated in rollback-safe clause units without
 rotating the ASR state. The defaults are:
@@ -173,40 +212,80 @@ to the same `ExecStart` command:
 --tts-speed 1.05
 --tts-cpu-threads 4
 --tts-listener-queue-size 128
+--tts-hls-max-listeners 128
 --tts-revision-stable-sec 3.0
 --tts-latest-revision-grace-sec 4.0
 ```
 
 Translation endpoints and model names are deployment-specific. Keep API keys outside the unit file.
-The subtitle page never plays TTS. Each authenticated listener opens `/listen`
-on a phone, tablet, or other browser and explicitly selects Start on that device.
-Listeners receive future stable translations only; joining does not replay old
-jobs. Device-local Stop clears only that browser's FIFO and does not affect other
-listeners. One WAV is synthesized and cached per translation under the global
-CPU lock, then shared by all listeners assigned to that job.
+The shared listener also requires `ffmpeg` on `PATH`; startup of the main service
+does not spawn FFmpeg until the first public HLS listener joins.
+
+The subtitle page never plays TTS. Each listener opens the public `/listen`
+page on a phone, tablet, or other browser and explicitly selects Start on that
+device. The production main page displays a static local QR for the fixed URL
+`https://ushome.amycat.com:18024/listen`. The PCCS listener is English-only and
+uses a fixed one-screen layout without document scrollbars.
+The backend keeps a bounded pre-listener backlog of up to 128 stable translations
+from the current producer session. The first listener drains those items in source
+order instead of waiting for the next sentence; this is a catch-up queue, not a
+persisted recording. A new producer session clears an older idle backlog. Device-
+local Stop removes only that browser's lease and does not affect other listeners.
+One worker synthesizes each translation once, and one FFmpeg
+process writes a continuous 24 kHz mono AAC/HLS timeline shared by all devices.
+When no speech is pending, the encoder receives real-time zero PCM so native iOS
+playback can continue after the browser is locked.
 
 `--tts-speed` is the backend Kokoro synthesis baseline and remains global for
 the generated shared WAV. The `/listen` selector is a listener-side playback
 multiplier (`0.8x` through `1.2x` in `0.1x` steps) stored per browser; changing it does not
 restart the service, alter another device, or create another synthesis/cache
-variant.
+variant. Because this is a live stream, `1.0x` gives the most predictable live-
+edge latency; other rates remain device-local and may change the distance from
+the live edge.
 
-Listener prefetch is bounded to a single future FIFO item. It overlaps lazy
-Kokoro synthesis and WAV transfer with current playback while retaining at most
-one complete unplayed WAV per browser. Stop and disconnect abort outstanding
-preparation. This does not increase Kokoro inference concurrency because the
-backend synthesis lock remains global, and it does not guarantee a gapless
-transition when synthesis is slower than the clip already playing.
+The publisher appends a fixed `300ms` zero-PCM sentence pause after each Kokoro
+clip. The global translated-speech queue uses `--tts-listener-queue-size` as its
+bound, and the FFmpeg PCM handoff has a separate small bound. If encoding falls
+behind, this applies backpressure rather than accumulating unbounded audio in
+memory. The default HLS playlist retains at most 1200 one-second segments, and
+the last listener's 90-second lease expiry closes FFmpeg and removes all files
+for that epoch.
 
-The listener adds a fixed `300ms` sentence pause after successful playback. It
-gates only promotion of the next prepared item; synthesis and transfer continue
-during the pause. The delay is not scaled by listener playback rate, and all
-listener reset paths cancel it immediately. It requires no service flag or
-systemd change.
+`GET /api/tts/live/status` reports `queue_depth` including the item currently in
+Kokoro, exposes `synthesis_active`, and reports synthesized FIFO backlog as
+`pending_audio_ms`. Playback rates below `1.0x` still consume encoded silence,
+so the listener applies a non-skipping live-latency guard: at a 12-second gap
+from the live edge it temporarily uses `1.2x`, restores the selected rate inside
+five seconds, and uses at least `1.0x` while the page is hidden or locked.
 
-`--tts-listener-queue-size` bounds unread metadata per device. A listener that
-cannot keep up is disconnected without delaying other listeners. The shared job
-registry is bounded by `--tts-max-client-jobs` and jobs expire after
+With an active listener, translation completion also queues bounded speculative
+Kokoro preparation for the exact sentence revision. It does not append PCM to
+HLS or bypass `--tts-revision-stable-sec`; stable ordered release consumes the
+prepared result only when sentence ID, revision, target language, and text digest
+still match. A revision change discards stale audio. The fixed eight-entry cache
+and the stable queue share one Kokoro worker, and the cache is removed when the
+listener epoch ends. Monitor `preparation_queue_depth`, `preparation_active`, and
+`prepared_audio_count` separately from `queue_depth` and `pending_audio_ms`.
+
+`--tts-hls-max-listeners 128` bounds active public leases. Each browser generates
+an opaque random listener ID; possession of that ID is a public bearer capability
+that can refresh or delete only its matching lease. A new ID above the bound gets
+`HTTP 429`, while established listeners continue to refresh. This limit bounds
+lease bookkeeping; all devices still share one Kokoro worker and one FFmpeg.
+
+The public listener intentionally does not require a login so a fixed church QR
+works on guest phones. The main subtitle page remains authenticated, as do the
+ASR WebSocket and management/compatibility APIs. Keep HTTPS enabled, do not put
+private meeting content into the QR, and treat the live translated audio as
+public to anyone who has the address.
+
+The old `/ws/tts` plus per-job WAV API remains available for one compatibility
+cycle but is not used by `/listen`. Do not run old and new listener clients at
+the same time when measuring TTS CPU, because a legacy WAV request is a separate
+compatibility delivery path.
+
+The legacy shared job registry is bounded by `--tts-max-client-jobs` and jobs expire after
 `--tts-job-ttl-sec`; unread jobs are never silently evicted to admit newer work.
 `--tts-final-translation-drain-sec` controls the slow-drain warning threshold and
 does not discard pending stable translations. When capturing system audio, use a
@@ -217,8 +296,11 @@ into ASR.
 sentence revision while leaving visible subtitles responsive. The recommended
 production value is `3.0`. `--tts-latest-revision-grace-sec 4.0` applies only
 to the newest unsealed source. A successor returns its predecessor to the
-ordinary window, and successful segment final reconciliation seals the segment
-so ready translations can publish without an arbitrary timer. Do not replace
+ordinary window. With `--segment-final-redecode`, only a successful unchanged
+or safely compatible segment result seals the segment so ready translations can
+publish without an arbitrary timer. A failed or divergent result leaves normal
+revision timing active for older sources and keeps the newest source waiting for
+a seal or rollback-safe successor. Do not replace
 this source-order policy with a global seven-second delay. Tune it only from observed
 `tts_late_revision_after_release` timing; do not add punctuation,
 language-specific word lists, or frontend timers to infer speech stability.
@@ -340,7 +422,7 @@ For rollback, select a previously verified commit or annotated tag, reinstall th
 - Prefer graceful WebSocket `finish` and systemd stop before replacement.
 - Confirm old backend and EngineCore PIDs exit before starting another model process.
 - Monitor `NRestarts`, process RSS, GPU memory, GTT, queue depth, and queue-drop trace fields during long sessions.
-- Monitor CPU load and process RSS after enabling Kokoro. TTS synthesis is globally serialized; high backlog degrades by increasing spoken delay rather than starting concurrent CPU model runs.
+- Monitor CPU load, process RSS, HLS queue depth, `/tmp/voxbridge-tts-hls-8024`, and the single FFmpeg child after enabling Kokoro. Adding listeners must not add synthesis workers or FFmpeg processes; high backlog degrades by increasing spoken delay rather than duplicating CPU model runs.
 - Compare `silero_shadow_observation` and `silero_shadow_disagreement` with `silent_decode_skipped`, `audio_preroll_replayed`, and subsequent ASR output before allowing a neural VAD to influence control decisions.
 - Treat logs, audio, translations, subtitle traces, and screenshots as sensitive meeting data.
 - Keep credentials in mode `0600` runtime files or a dedicated secret manager.

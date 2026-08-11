@@ -198,7 +198,7 @@ def test_context_resume_guard_waits_for_speech_when_silero_is_available():
         silero_available=True,
         speech_confirmed=False,
         fallback_window_active=True,
-    ) is False
+    ) is True
 
 
 def test_context_echo_filter_removes_only_glossary_like_sentences():
@@ -502,6 +502,111 @@ def test_hard_cut_fallback_does_not_merge_completed_prefix_with_unrelated_raw():
 def test_hard_cut_fallback_merges_unfinished_cjk_tail():
     assert hasattr(demo_streaming_ws, "_should_hard_cut_fallback_merge")
     assert demo_streaming_ws._should_hard_cut_fallback_merge("第一句不完整", "继续补全成句。")
+
+
+def test_resegmentation_cursor_does_not_consume_a_new_terminal_sentence():
+    assert hasattr(demo_streaming_ws, "_remap_completed_cursor_after_resegmentation")
+    previous = [
+        "The first completed unit.",
+        "The second completed unit?",
+        "The third completed unit ends here,",
+    ]
+    corrected = [
+        "The first completed unit.",
+        "The second completed unit?",
+        "The corrected third completed unit ends here,",
+        "A newly completed terminal sentence.",
+    ]
+
+    assert demo_streaming_ws._remap_completed_cursor_after_resegmentation(
+        corrected,
+        previous,
+        3,
+    ) == 3
+
+
+def test_resegmentation_cursor_remaps_a_boundary_only_split():
+    assert hasattr(demo_streaming_ws, "_remap_completed_cursor_after_resegmentation")
+    previous = [
+        "The first completed unit. The second completed unit.",
+        "The third completed unit.",
+    ]
+    resegmented = [
+        "The first completed unit.",
+        "The second completed unit.",
+        "The third completed unit.",
+    ]
+
+    assert demo_streaming_ws._remap_completed_cursor_after_resegmentation(
+        resegmented,
+        previous,
+        2,
+    ) == 3
+
+
+def test_effective_boundary_guard_detects_regression_with_pending_prefix():
+    assert hasattr(demo_streaming_ws, "_effective_completed_unit_counts")
+    pending = "A carried boundary sentence."
+    previous = (
+        "The first current sentence. The second current sentence. "
+        "The third current sentence. The fourth current sentence. "
+        "The visible terminal sentence."
+    )
+    corrected = (
+        "The first current sentence, and the second current sentence. "
+        "The third current sentence. The fourth current sentence. "
+        "The visible terminal sentence."
+    )
+
+    assert demo_streaming_ws._effective_completed_unit_counts(
+        pending,
+        previous,
+        corrected,
+    ) == (6, 5)
+
+
+def test_canonical_upgrade_detects_material_left_boundary_replay():
+    assert hasattr(demo_streaming_ws, "_has_material_left_boundary_replay")
+    previous_candidate = (
+        "给他的富人来享用，但是他摸摸他的口袋，他就觉得说，"
+        "哎呀，我发现他发现他钱袋，"
+    )
+    current_candidate = "那怎么办呢？"
+    corrected_candidate = (
+        "但是他摸摸他的口袋，他就觉得说：‘哎呀，我发现他发现他钱袋，"
+        "那怎么办呢？’"
+    )
+
+    assert demo_streaming_ws._has_material_left_boundary_replay(
+        previous_candidate,
+        current_candidate,
+        corrected_candidate,
+    )
+
+
+def test_canonical_upgrade_allows_lexical_correction_without_boundary_replay():
+    assert hasattr(demo_streaming_ws, "_has_material_left_boundary_replay")
+    assert not demo_streaming_ws._has_material_left_boundary_replay(
+        "The previous sentence remains separate.",
+        "He wrote a note with his name on it.",
+        "He wrote an IOU with his name on it.",
+    )
+
+
+def test_canonical_correction_detects_committed_terminal_contraction():
+    assert hasattr(demo_streaming_ws, "_canonical_correction_drops_committed_suffix")
+    assert demo_streaming_ws._canonical_correction_drops_committed_suffix(
+        "看到一条新鲜的鱼，他就想说：‘嗯，我希望能把它买回去，给他的富人来吃。’",
+        "看到一条新鲜的鱼，他就想说：‘嗯，我希望能把它买回去给他的富人来。’",
+    )
+
+
+def test_canonical_correction_allows_same_length_lexical_repair():
+    assert hasattr(demo_streaming_ws, "_canonical_correction_drops_committed_suffix")
+    assert not demo_streaming_ws._canonical_correction_drops_committed_suffix(
+        "他列了一张字据。",
+        "他立了一张借据。",
+    )
 
 
 @pytest.mark.parametrize(
@@ -958,6 +1063,30 @@ def test_parse_args_accepts_segment_and_backpressure_controls(monkeypatch):
     assert args.backpressure_hard_relief_sec == 7.2
 
 
+def test_parse_args_accepts_segment_final_redecode(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog", "--segment-final-redecode"])
+
+    assert parse_args().segment_final_redecode is True
+
+
+def test_parse_args_disables_segment_final_redecode_by_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    assert parse_args().segment_final_redecode is False
+
+
+def test_parse_args_disables_full_stop_redecode_by_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    assert parse_args().final_redecode_on_stop is False
+
+
+def test_parse_args_can_opt_in_to_full_stop_redecode(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog", "--final-redecode-on-stop"])
+
+    assert parse_args().final_redecode_on_stop is True
+
+
 def test_parse_args_accepts_backend_vad_thresholds(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -1115,6 +1244,7 @@ def test_parse_args_uses_safe_tts_defaults(monkeypatch):
     assert args.tts_job_ttl_sec == 1800.0
     assert args.tts_max_client_jobs == 4096
     assert args.tts_listener_queue_size == 128
+    assert args.tts_hls_max_listeners == 128
     assert args.tts_final_translation_drain_sec == 30.0
 
 
@@ -1198,6 +1328,8 @@ def test_parse_args_accepts_kokoro_tts_options(monkeypatch):
             "2048",
             "--tts-listener-queue-size",
             "64",
+            "--tts-hls-max-listeners",
+            "96",
             "--tts-final-translation-drain-sec",
             "12",
         ],
@@ -1219,6 +1351,7 @@ def test_parse_args_accepts_kokoro_tts_options(monkeypatch):
     assert args.tts_job_ttl_sec == 900.0
     assert args.tts_max_client_jobs == 2048
     assert args.tts_listener_queue_size == 64
+    assert args.tts_hls_max_listeners == 96
     assert args.tts_final_translation_drain_sec == 12.0
 
 
@@ -2020,7 +2153,7 @@ def test_index_template_supports_system_audio_capture_via_display_media():
 
 def test_index_template_links_to_standalone_tts_listener_without_local_playback():
     assert 'href="/listen"' in INDEX_HTML_TEMPLATE
-    assert "译文朗读" in INDEX_HTML_TEMPLATE
+    assert "Listen on your phone" in INDEX_HTML_TEMPLATE
     for removed in (
         'id="ttsEnabledInput"',
         'id="ttsStatus"',
@@ -2034,52 +2167,30 @@ def test_index_template_links_to_standalone_tts_listener_without_local_playback(
         assert removed not in INDEX_HTML_TEMPLATE
 
 
-def test_listener_page_requires_explicit_start_and_uses_fifo():
-    assert 'id="startListening"' in TTS_LISTENER_HTML
-    assert 'id="stopListening"' in TTS_LISTENER_HTML
-    assert 'new WebSocket(wsUrl("/ws/tts"))' in TTS_LISTENER_HTML
-    assert "queue.push(job);" in TTS_LISTENER_HTML
-    assert "currentJob = queue.shift();" in TTS_LISTENER_HTML
-    assert 'type: "tts_received"' in TTS_LISTENER_HTML
-    assert 'addEventListener("ended"' in TTS_LISTENER_HTML
+def test_public_listener_qr_is_fixed_local_and_script_free():
+    from voxbridge.tts.public_listener import (
+        PUBLIC_LISTENER_QR_SVG,
+        PUBLIC_LISTENER_URL,
+    )
+
+    assert PUBLIC_LISTENER_URL == "https://ushome.amycat.com:18024/listen"
+    assert "<svg" in PUBLIC_LISTENER_QR_SVG
+    assert PUBLIC_LISTENER_URL not in PUBLIC_LISTENER_QR_SVG
+    assert "<script" not in PUBLIC_LISTENER_QR_SVG.lower()
+    assert re.search(r'(?:href|src)=["\']https?://', PUBLIC_LISTENER_QR_SVG, re.I) is None
 
 
-def test_listener_page_fetches_fifo_audio_and_stops_locally():
-    assert "if (currentJob || queue.length === 0)" in TTS_LISTENER_HTML
-    assert "X-TTS-Listener-ID" in TTS_LISTENER_HTML
-    assert "for (let attempt = 0; attempt < 2; attempt += 1)" in TTS_LISTENER_HTML
-    assert "await response.arrayBuffer();" in TTS_LISTENER_HTML
-    assert "cancelAudioPreparations();" in TTS_LISTENER_HTML
-    assert "stopActivePlayback();" in TTS_LISTENER_HTML
-    assert "queue = [];" in TTS_LISTENER_HTML
-    assert "set_tts_enabled" not in TTS_LISTENER_HTML
-    assert "window.location.reload" not in TTS_LISTENER_HTML
-
-
-def test_listener_page_prefetches_only_one_future_fifo_item():
-    assert "const audioPreparations = new Map();" in TTS_LISTENER_HTML
-    assert "function prepareAudio(job)" in TTS_LISTENER_HTML
-    assert "function prefetchNextAudio()" in TTS_LISTENER_HTML
-    assert "const nextJob = queue[0];" in TTS_LISTENER_HTML
-    assert "prepareAudio(nextJob);" in TTS_LISTENER_HTML
-    assert "queue.slice" not in TTS_LISTENER_HTML
-
-
-def test_listener_page_reuses_prepared_audio_and_cancels_on_reset():
-    assert "async function consumePreparedAudio(job)" in TTS_LISTENER_HTML
-    assert "const preparation = prepareAudio(job);" in TTS_LISTENER_HTML
-    assert "audioPreparations.delete(jobId);" in TTS_LISTENER_HTML
-    assert "function cancelAudioPreparations()" in TTS_LISTENER_HTML
-    assert "preparation.controller.abort();" in TTS_LISTENER_HTML
-    assert TTS_LISTENER_HTML.count("cancelAudioPreparations();") >= 2
-
-
-def test_listener_page_waits_for_cancellable_sentence_pause_after_playback():
-    assert "const INTER_SENTENCE_PAUSE_MS = 300;" in TTS_LISTENER_HTML
-    assert "async function waitForInterSentencePause()" in TTS_LISTENER_HTML
-    assert "await waitForInterSentencePause();" in TTS_LISTENER_HTML
-    assert "function cancelInterSentencePause()" in TTS_LISTENER_HTML
-    assert TTS_LISTENER_HTML.count("cancelInterSentencePause();") >= 2
+def test_index_template_displays_public_listener_qr_in_control_bar():
+    assert 'class="listener-qr"' in INDEX_HTML_TEMPLATE
+    assert 'href="/listen"' in INDEX_HTML_TEMPLATE
+    assert 'src="/listen/qr.svg"' in INDEX_HTML_TEMPLATE
+    assert 'alt="Scan to open the public live translation audio page"' in INDEX_HTML_TEMPLATE
+    assert INDEX_HTML_TEMPLATE.index('class="listener-qr"') > INDEX_HTML_TEMPLATE.index(
+        'id="controlBar"'
+    )
+    assert INDEX_HTML_TEMPLATE.index('class="listener-qr"') < INDEX_HTML_TEMPLATE.index(
+        'class="subtitle-stage"'
+    )
 
 
 def test_listener_page_exposes_allowlisted_per_device_playback_rates():
@@ -2118,30 +2229,52 @@ def test_listener_page_normalizes_and_persists_playback_rate_locally():
 
 def test_listener_page_applies_rate_to_persistent_pitch_preserving_audio():
     assert 'id="ttsPlayback"' in TTS_LISTENER_HTML
-    assert "playbackElement.defaultPlaybackRate = playbackRate;" in TTS_LISTENER_HTML
-    assert "playbackElement.playbackRate = playbackRate;" in TTS_LISTENER_HTML
+    assert "const effectiveRate = effectivePlaybackRate();" in TTS_LISTENER_HTML
+    assert "playbackElement.defaultPlaybackRate = effectiveRate;" in TTS_LISTENER_HTML
+    assert "playbackElement.playbackRate = effectiveRate;" in TTS_LISTENER_HTML
+    assert "if (document.hidden) return Math.max(1, playbackRate);" in TTS_LISTENER_HTML
+    assert 'playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard)' in TTS_LISTENER_HTML
     assert '"preservesPitch" in playbackElement' in TTS_LISTENER_HTML
     assert '"mozPreservesPitch" in playbackElement' in TTS_LISTENER_HTML
     assert '"webkitPreservesPitch" in playbackElement' in TTS_LISTENER_HTML
 
 
-def test_listener_page_uses_one_media_element_and_releases_object_urls():
-    assert 'new Blob([buffer], { type: "audio/wav" })' in TTS_LISTENER_HTML
-    assert "window.URL.createObjectURL(audioBlob)" in TTS_LISTENER_HTML
-    assert "window.URL.revokeObjectURL(activeObjectUrl);" in TTS_LISTENER_HTML
-    assert 'playbackElement.addEventListener("ended"' in TTS_LISTENER_HTML
-    assert "playbackElement.pause();" in TTS_LISTENER_HTML
-    assert "sourceNode" not in TTS_LISTENER_HTML
-    assert "createBufferSource" not in TTS_LISTENER_HTML
+def test_listener_page_uses_one_native_hls_element_without_sentence_blob_queue():
+    assert 'id="ttsPlayback"' in TTS_LISTENER_HTML
+    assert "playsinline" in TTS_LISTENER_HTML
+    assert 'preload="none"' in TTS_LISTENER_HTML
+    assert "/api/tts/live/${encodeURIComponent(listenerId)}/index.m3u8" in TTS_LISTENER_HTML
+    for removed in (
+        "SILENT_WAV_DATA_URL",
+        "unlockPlaybackElement",
+        "URL.createObjectURL",
+        "/api/tts/broadcast/jobs/",
+        "audioPreparations",
+        "queue.push(job)",
+        "new WebSocket",
+    ):
+        assert removed not in TTS_LISTENER_HTML
 
 
-def test_listener_page_unlocks_media_before_opening_listener_socket():
-    assert "const SILENT_WAV_DATA_URL =" in TTS_LISTENER_HTML
-    assert "async function unlockPlaybackElement()" in TTS_LISTENER_HTML
-    assert "await unlockPlaybackElement();" in TTS_LISTENER_HTML
-    assert TTS_LISTENER_HTML.index(
-        "await unlockPlaybackElement();"
-    ) < TTS_LISTENER_HTML.index('new WebSocket(wsUrl("/ws/tts"))')
+def test_listener_page_is_english_pccs_and_suppresses_document_overflow():
+    assert '<html lang="en">' in TTS_LISTENER_HTML
+    assert "Pittsburgh Christian Church South" in TTS_LISTENER_HTML
+    assert "LIVE TRANSLATION" in TTS_LISTENER_HTML
+    assert "Start Listening" in TTS_LISTENER_HTML
+    assert "Stop Listening" in TTS_LISTENER_HTML
+    assert "Resume Audio" in TTS_LISTENER_HTML
+    assert "height: 100dvh" in TTS_LISTENER_HTML
+    assert "overflow: hidden" in TTS_LISTENER_HTML
+    assert re.search(r"[\u3400-\u9fff]", TTS_LISTENER_HTML) is None
+
+
+def test_listener_page_exposes_lock_screen_media_session_and_resume_action():
+    assert 'id="resumeListening"' in TTS_LISTENER_HTML
+    assert '"mediaSession" in navigator' in TTS_LISTENER_HTML
+    assert "new MediaMetadata" in TTS_LISTENER_HTML
+    assert 'setActionHandler("play"' in TTS_LISTENER_HTML
+    assert 'setActionHandler("pause"' in TTS_LISTENER_HTML
+    assert 'setMediaPlaybackState("playing")' in TTS_LISTENER_HTML
 
 
 def test_port_precheck_rejects_occupied_port():

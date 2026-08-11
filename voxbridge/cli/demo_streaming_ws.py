@@ -61,8 +61,23 @@ from voxbridge.tts.broadcast import (
     TTSBroadcastNotFound,
     TTSBroadcastQueueFull,
 )
-from voxbridge.tts.jobs import RevisionStableTTSBuffer, TTSJobNotFound, TTSJobRegistry, TTSQueueFull
+from voxbridge.tts.jobs import (
+    RevisionStableTTSBuffer,
+    TTSJobNotFound,
+    TTSJobRegistry,
+    TTSQueueFull,
+    TTSReadyItem,
+)
+from voxbridge.tts.hls import (
+    FFmpegHLSEncoder,
+    HLSListenerCapacityExceeded,
+    HLSListenerNotFound,
+    HLSQueueFull,
+    HLSUnavailable,
+    SharedHLSTTSPublisher,
+)
 from voxbridge.tts.listener_page import TTS_LISTENER_HTML
+from voxbridge.tts.public_listener import PUBLIC_LISTENER_QR_SVG
 from voxbridge.tts.kokoro_onnx import (
     KokoroOnnxSynthesizer,
     KokoroTTSConfig,
@@ -85,6 +100,17 @@ AUTH_HASH_SCHEME = "pbkdf2_sha256"
 AUTH_HASH_ITERATIONS = 260_000
 AUTH_SESSION_TOKEN_BYTES = 32
 TTS_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+@dataclass(frozen=True)
+class ClientSilenceSpan:
+    duration_ms: int
+    capture_sample_index: int
+
+    @property
+    def size(self) -> int:
+        # Queue accounting tracks only PCM that can create inference pressure.
+        return 0
 
 
 def _positive_int_arg(value: str) -> int:
@@ -212,6 +238,50 @@ def _normalize_asr_context_apply_mode(value: Any) -> str:
 
 def _compact_asr_compare_text(value: str) -> str:
     return re.sub(r"[\W_]+", "", str(value or ""), flags=re.UNICODE).casefold()
+
+
+def _remap_completed_cursor_after_resegmentation(
+    completed: List[str],
+    candidate_texts: List[str],
+    processed_count: int,
+) -> int:
+    """Remap boundary-only splits without consuming newly completed suffixes."""
+    count = max(0, int(processed_count))
+    previous_candidates = [str(text or "").strip() for text in list(candidate_texts or [])]
+    if count <= 0 or count > len(previous_candidates) or count >= len(completed):
+        return count
+
+    previous_compact = _compact_asr_compare_text(
+        _join_segments(previous_candidates[:count])
+    )
+    if not previous_compact:
+        return count
+
+    for end in range(count + 1, len(completed) + 1):
+        current_compact = _compact_asr_compare_text(
+            _join_segments(completed[:end])
+        )
+        if current_compact == previous_compact:
+            return int(end)
+
+        length_ratio = len(current_compact) / float(len(previous_compact))
+        if length_ratio > 1.25:
+            break
+        if not 0.8 <= length_ratio <= 1.25:
+            continue
+
+        matcher = difflib.SequenceMatcher(None, previous_compact, current_compact)
+        if matcher.ratio() < 0.9:
+            continue
+        matching_blocks = [block for block in matcher.get_matching_blocks() if block.size > 0]
+        if not matching_blocks:
+            continue
+        terminal_block = matching_blocks[-1]
+        previous_tail_gap = len(previous_compact) - (terminal_block.a + terminal_block.size)
+        current_tail_gap = len(current_compact) - (terminal_block.b + terminal_block.size)
+        if previous_tail_gap <= 2 and current_tail_gap <= 2:
+            return int(end)
+    return count
 
 
 def _consume_unmatched_compact_occurrence(
@@ -425,11 +495,14 @@ def _should_quarantine_asr_context_resume_partial(
     speech_confirmed: bool,
     fallback_window_active: bool,
 ) -> bool:
-    if not guard_active or not _looks_like_asr_context_fragment_echo(context, text):
+    if not guard_active:
         return False
     if silero_available:
         return not speech_confirmed
-    return fallback_window_active
+    return bool(
+        fallback_window_active
+        and _looks_like_asr_context_fragment_echo(context, text)
+    )
 
 
 def _filter_asr_context_echo_sentences(
@@ -676,6 +749,15 @@ def _text_matches_source_language(text: str, source_language: str) -> bool:
     return True
 
 
+def _translation_needs_target_language_retry(text: str, target_language: str) -> bool:
+    out = str(text or "").strip()
+    if not out:
+        return False
+    # English subtitle output must not contain untranslated Han characters.
+    # Do not apply the inverse rule to Chinese because Latin proper nouns are valid.
+    return _is_english_label(target_language) and _has_cjk(out)
+
+
 _ESV_ZH_TO_EN_POLICY = (
     "忠实原文是最高优先级。涉及基督教、圣经或神学内容时，仅对原文中明确出现的"
     "卷名、人名、地名、称谓、神学术语及大小写，必须采用 English Standard Version "
@@ -690,6 +772,7 @@ def _build_translation_prompt(
     source_language: str,
     target_language: str,
     translation_direction: Optional[str] = None,
+    strict_target_language: bool = False,
 ) -> str:
     source = str(source_language or "Chinese")
     target = str(target_language or "English")
@@ -706,6 +789,8 @@ def _build_translation_prompt(
         requirements.append(_ESV_ZH_TO_EN_POLICY)
     else:
         requirements.append("保留专有名词")
+    if strict_target_language:
+        requirements.append(f"译文必须全部使用{target}，不得保留未翻译的{source}字词")
     requirements.append("只输出译文本身，不要解释")
     return (
         f"请将以下{source}文本翻译为{target}。\n"
@@ -811,6 +896,102 @@ def _split_translation_units_and_tail(
         completed.extend(clauses)
 
     return completed, tail
+
+
+def _effective_completed_unit_counts(
+    pending_prefix: str,
+    previous_text: str,
+    corrected_text: str,
+    *,
+    target_cjk_chars: int = 32,
+    target_latin_words: int = 24,
+) -> Tuple[int, int]:
+    """Count completed units after carrying the same segment-boundary prefix."""
+
+    pending = str(pending_prefix or "").strip()
+
+    def _with_pending(text: str) -> str:
+        current = str(text or "").strip()
+        if not pending:
+            return current
+        if not current:
+            return pending
+        if current.startswith(pending) or pending in current:
+            return current
+        if pending.startswith(current):
+            return pending
+        trimmed, overlap = trim_prefix_overlap(
+            pending,
+            current,
+            min_overlap=2,
+            max_overlap=max(16, len(pending)),
+        )
+        suffix = str(trimmed if overlap > 0 else current or "").strip()
+        return f"{pending} {suffix}".strip()
+
+    previous_units, _ = _split_translation_units_and_tail(
+        _with_pending(previous_text),
+        target_cjk_chars=int(target_cjk_chars),
+        target_latin_words=int(target_latin_words),
+    )
+    corrected_units, _ = _split_translation_units_and_tail(
+        _with_pending(corrected_text),
+        target_cjk_chars=int(target_cjk_chars),
+        target_latin_words=int(target_latin_words),
+    )
+    return len(previous_units), len(corrected_units)
+
+
+def _has_material_left_boundary_replay(
+    previous_candidate: str,
+    current_candidate: str,
+    corrected_candidate: str,
+) -> bool:
+    """Detect a correction that replays the prior candidate into the current ID."""
+
+    previous = _compact_asr_compare_text(previous_candidate)
+    current = _compact_asr_compare_text(current_candidate)
+    corrected = _compact_asr_compare_text(corrected_candidate)
+    if not previous or not current or not corrected or current == corrected:
+        return False
+
+    min_overlap = 6 if any(
+        _has_cjk(value)
+        for value in (previous_candidate, current_candidate, corrected_candidate)
+    ) else 12
+    overlap = 0
+    for size in range(min(len(previous), len(corrected)), min_overlap - 1, -1):
+        if previous[-size:] == corrected[:size]:
+            overlap = int(size)
+            break
+    if overlap < min_overlap:
+        return False
+
+    replayed_prefix = corrected[:overlap]
+    if current.startswith(replayed_prefix):
+        return False
+    corrected_remainder = corrected[overlap:]
+    if current in corrected_remainder:
+        return True
+    if not corrected_remainder:
+        return False
+    return difflib.SequenceMatcher(None, current, corrected_remainder).ratio() >= 0.8
+
+
+def _canonical_correction_drops_committed_suffix(
+    committed_text: str,
+    corrected_text: str,
+) -> bool:
+    """Reject a one-shot correction that is only a contraction of a stable row."""
+
+    committed = _compact_asr_compare_text(committed_text)
+    corrected = _compact_asr_compare_text(corrected_text)
+    return bool(
+        committed
+        and corrected
+        and len(corrected) < len(committed)
+        and committed.startswith(corrected)
+    )
 
 
 def _translation_unit_boundary_kind(text: str) -> str:
@@ -1655,6 +1836,8 @@ class LocalTranslator:
     This uses a local causal LM translation model and generates deterministic output.
     """
 
+    enforce_target_language_output = True
+
     def __init__(
         self,
         model_path: str,
@@ -1701,10 +1884,17 @@ class LocalTranslator:
         source_language: Optional[str] = None,
         target_language: Optional[str] = None,
         translation_direction: Optional[str] = None,
+        strict_target_language: bool = False,
     ) -> str:
         source = str(source_language or self.source_language or "Chinese")
         target = str(target_language or self.target_language or "English")
-        return _build_translation_prompt(text, source, target, translation_direction)
+        return _build_translation_prompt(
+            text,
+            source,
+            target,
+            translation_direction,
+            strict_target_language,
+        )
 
     def translate(
         self,
@@ -1712,6 +1902,7 @@ class LocalTranslator:
         source_language: Optional[str] = None,
         target_language: Optional[str] = None,
         translation_direction: Optional[str] = None,
+        strict_target_language: bool = False,
     ) -> str:
         import torch
 
@@ -1731,6 +1922,7 @@ class LocalTranslator:
                     source_language=source,
                     target_language=target,
                     translation_direction=translation_direction,
+                    strict_target_language=strict_target_language,
                 ),
             }
         ]
@@ -1765,6 +1957,8 @@ class OpenAIAPITranslator:
     """
     Translation client using an OpenAI-compatible Chat Completions HTTP API.
     """
+
+    enforce_target_language_output = True
 
     def __init__(
         self,
@@ -1803,10 +1997,17 @@ class OpenAIAPITranslator:
         source_language: Optional[str] = None,
         target_language: Optional[str] = None,
         translation_direction: Optional[str] = None,
+        strict_target_language: bool = False,
     ) -> str:
         source = str(source_language or self.source_language or "Chinese")
         target = str(target_language or self.target_language or "English")
-        return _build_translation_prompt(text, source, target, translation_direction)
+        return _build_translation_prompt(
+            text,
+            source,
+            target,
+            translation_direction,
+            strict_target_language,
+        )
 
     def _extract_content(self, payload: Dict[str, Any]) -> str:
         choices = payload.get("choices")
@@ -1839,6 +2040,7 @@ class OpenAIAPITranslator:
         source_language: Optional[str] = None,
         target_language: Optional[str] = None,
         translation_direction: Optional[str] = None,
+        strict_target_language: bool = False,
     ) -> str:
         src = str(text or "").strip()
         if not src:
@@ -1856,6 +2058,7 @@ class OpenAIAPITranslator:
                     source_language=source,
                     target_language=target,
                     translation_direction=translation_direction,
+                    strict_target_language=strict_target_language,
                 ),
             }
         ]
@@ -2101,6 +2304,37 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       text-decoration:none;
     }
 
+    .listener-qr{
+      display:grid;
+      grid-template-columns:64px minmax(120px, 1fr);
+      align-items:center;
+      gap:10px;
+      min-width:236px;
+      padding:7px 11px 7px 7px;
+      border:1px solid rgba(82, 126, 114, 0.28);
+      border-radius:12px;
+      background:rgba(255, 255, 247, 0.88);
+      color:#29372e;
+      text-decoration:none;
+      box-shadow:0 4px 16px rgba(82, 126, 114, 0.1);
+    }
+
+    .listener-qr img{
+      display:block;
+      width:64px;
+      height:64px;
+      border-radius:7px;
+    }
+
+    .listener-qr span{
+      display:grid;
+      gap:3px;
+      line-height:1.2;
+    }
+
+    .listener-qr strong{ font-size:12px; }
+    .listener-qr small{ color:var(--muted); font-size:10px; }
+
     .source-toggle select{
       border:1px solid #bdcbb7;
       border-radius: 8px;
@@ -2322,6 +2556,13 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         flex: 1 1 calc(50% - 8px);
         justify-content: center;
       }
+      .listener-qr{
+        flex:1 1 100%;
+        min-width:0;
+        grid-template-columns:54px minmax(0, 1fr);
+        padding:6px;
+      }
+      .listener-qr img{ width:54px; height:54px; }
       .badge{
         flex: 1 0 100%;
       }
@@ -2395,7 +2636,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             <option value="en2zh">英文 -> 中文</option>
           </select>
         </label>
-        <a class="listener-link" href="/listen" target="_blank" rel="noopener">译文朗读</a>
+        <a class="listener-qr" href="/listen" target="_blank" rel="noopener">
+          <img src="/listen/qr.svg" alt="Scan to open the public live translation audio page" />
+          <span><strong>Listen on your phone</strong><small>Scan for live translated audio</small></span>
+        </a>
         <label class="font-size-control" for="subtitleTopFontInput">
           <span>上方字号</span>
           <input id="subtitleTopFontInput" aria-label="上方字幕字号" type="number" min="18" max="72" step="1" inputmode="numeric" placeholder="自动" />
@@ -2448,6 +2692,12 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   const ASR_CONTEXT_MAX_TERMS = __ASR_CONTEXT_MAX_TERMS__;
   const ASR_CONTEXT_MAX_CHARS = __ASR_CONTEXT_MAX_CHARS__;
   const ASR_CONTEXT_STORAGE_KEY = "voxbridge_asr_context_terms";
+  const AUDIO_GATE_FRAME_MS = 20;
+  const AUDIO_GATE_SPEECH_START_MS = 120;
+  const AUDIO_GATE_SILENCE_MS = 700;
+  const AUDIO_GATE_PRE_ROLL_MS = 400;
+  const AUDIO_GATE_END_TAIL_MS = 400;
+  const AUDIO_GATE_HEARTBEAT_MS = 1000;
   const USE_COMMITTED_SENTENCE_EVENTS = true;
   const SUBTITLE_TRACE_DEFAULT = __SUBTITLE_TRACE__;
   const SUBTITLE_TRACE_MAX_EVENTS = __SUBTITLE_TRACE_MAX_EVENTS__;
@@ -2486,6 +2736,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   let workletNode = null;
   let sinkGain = null;
   let workletModuleUrl = null;
+  let audioActivityGate = null;
   let pending = new Float32Array(0);
   let sendQueue = [];
   let queuedBytes = 0;
@@ -3442,6 +3693,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     sendQueue = [];
     queuedBytes = 0;
     pending = new Float32Array(0);
+    if (audioActivityGate) audioActivityGate.reset();
+    audioActivityGate = null;
     if (!keepSubtitles) {
       subtitleSentencePairs = [];
       clearSubtitleDom();
@@ -3523,6 +3776,223 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     }
     return out.buffer;
   }
+
+  class AudioActivityGate {
+    constructor(options = {}){
+      this.sampleRate = Math.max(100, Number(options.sampleRate || TARGET_SR));
+      this.frameMs = Math.max(5, Number(options.frameMs || AUDIO_GATE_FRAME_MS));
+      this.frameSamples = Math.max(1, Math.round(this.sampleRate * this.frameMs / 1000));
+      this.speechStartSamples = Math.max(
+        this.frameSamples,
+        Math.round(this.sampleRate * Number(options.speechStartMs || AUDIO_GATE_SPEECH_START_MS) / 1000)
+      );
+      this.silenceGateSamples = Math.max(
+        this.frameSamples,
+        Math.round(this.sampleRate * Number(options.silenceGateMs || AUDIO_GATE_SILENCE_MS) / 1000)
+      );
+      this.preRollSamples = Math.max(
+        this.frameSamples,
+        Math.round(this.sampleRate * Number(options.preRollMs || AUDIO_GATE_PRE_ROLL_MS) / 1000)
+      );
+      this.endTailSamples = Math.max(
+        this.frameSamples,
+        Math.round(this.sampleRate * Number(options.endTailMs || AUDIO_GATE_END_TAIL_MS) / 1000)
+      );
+      this.heartbeatSamples = Math.max(
+        this.silenceGateSamples,
+        Math.round(this.sampleRate * Number(options.heartbeatMs || AUDIO_GATE_HEARTBEAT_MS) / 1000)
+      );
+      this.onAudio = typeof options.onAudio === "function" ? options.onAudio : () => {};
+      this.onControl = typeof options.onControl === "function" ? options.onControl : () => {};
+      this.reset();
+    }
+
+    reset(){
+      this.active = false;
+      this.hasReportedSilence = false;
+      this.captureSampleIndex = 0;
+      this.speechRunSamples = 0;
+      this.unreportedSilenceSamples = 0;
+      this.noiseFloorDb = -55.0;
+      this.framePending = new Float32Array(0);
+      this.preRoll = new Float32Array(0);
+      this.heldQuiet = new Float32Array(0);
+    }
+
+    _appendLimited(current, addition, limit){
+      const combined = concatFloat32(current, addition);
+      if (combined.length <= limit) return combined;
+      return combined.slice(combined.length - limit);
+    }
+
+    _dbfs(frame){
+      let sumSquares = 0.0;
+      for (let i = 0; i < frame.length; i++) {
+        const value = Number(frame[i] || 0);
+        sumSquares += value * value;
+      }
+      const rms = Math.sqrt(sumSquares / Math.max(1, frame.length));
+      return 20 * Math.log10(Math.max(rms, 1e-9));
+    }
+
+    _isCertainSilence(frame){
+      const db = this._dbfs(frame);
+      const threshold = Math.min(-50.0, this.noiseFloorDb + 6.0);
+      const silent = db <= threshold;
+      if (silent) {
+        const boundedNoiseDb = Math.max(-75.0, db);
+        this.noiseFloorDb = (0.98 * this.noiseFloorDb) + (0.02 * boundedNoiseDb);
+      }
+      return silent;
+    }
+
+    _emitAudio(samples){
+      if (!samples || samples.length <= 0) return;
+      this.onAudio(samples);
+    }
+
+    _emitSilence(){
+      const samples = Math.max(0, Math.round(this.unreportedSilenceSamples));
+      if (samples <= 0) return;
+      this.onControl({
+        type: "audio_silence",
+        duration_ms: Math.max(1, Math.round(samples * 1000 / this.sampleRate)),
+        capture_sample_index: Math.round(this.captureSampleIndex),
+      });
+      this.unreportedSilenceSamples = 0;
+      this.hasReportedSilence = true;
+    }
+
+    _processFrame(frame){
+      this.captureSampleIndex += frame.length;
+      const certainSilence = this._isCertainSilence(frame);
+
+      if (this.active) {
+        if (certainSilence) {
+          this.heldQuiet = concatFloat32(this.heldQuiet, frame);
+          if (this.heldQuiet.length >= this.silenceGateSamples) {
+            const endpointTail = this.heldQuiet.slice(
+              0,
+              Math.min(this.endTailSamples, this.heldQuiet.length)
+            );
+            this.active = false;
+            this.speechRunSamples = 0;
+            this.preRoll = this._appendLimited(
+              new Float32Array(0),
+              this.heldQuiet,
+              this.preRollSamples
+            );
+            // Preserve a bounded low-energy sentence ending. The backend decodes
+            // this tail once at finalization, while the remaining silence stays suppressed.
+            this._emitAudio(endpointTail);
+            this.unreportedSilenceSamples += this.heldQuiet.length;
+            this.heldQuiet = new Float32Array(0);
+            this._emitSilence();
+          }
+          return;
+        }
+
+        if (this.heldQuiet.length > 0) {
+          const resumed = concatFloat32(this.heldQuiet, frame);
+          this.heldQuiet = new Float32Array(0);
+          this._emitAudio(resumed);
+          return;
+        }
+        this._emitAudio(frame);
+        return;
+      }
+
+      this.preRoll = this._appendLimited(this.preRoll, frame, this.preRollSamples);
+      if (certainSilence) {
+        this.speechRunSamples = 0;
+        this.unreportedSilenceSamples += frame.length;
+        const reportAt = this.hasReportedSilence
+          ? this.heartbeatSamples
+          : this.silenceGateSamples;
+        if (this.unreportedSilenceSamples >= reportAt) this._emitSilence();
+        return;
+      }
+
+      this.speechRunSamples += frame.length;
+      if (this.speechRunSamples < this.speechStartSamples) return;
+
+      this.active = true;
+      this.speechRunSamples = 0;
+      this.unreportedSilenceSamples = 0;
+      const replay = this.preRoll;
+      this.preRoll = new Float32Array(0);
+      this.onControl({
+        type: "audio_speech_start",
+        capture_sample_index: Math.round(this.captureSampleIndex),
+        preroll_samples: replay.length,
+      });
+      this._emitAudio(replay);
+    }
+
+    feed(samples){
+      if (!samples || samples.length <= 0) return;
+      const incoming = samples instanceof Float32Array
+        ? samples
+        : new Float32Array(samples);
+      this.framePending = concatFloat32(this.framePending, incoming);
+      while (this.framePending.length >= this.frameSamples) {
+        const frame = this.framePending.slice(0, this.frameSamples);
+        this.framePending = this.framePending.slice(this.frameSamples);
+        this._processFrame(frame);
+      }
+    }
+
+    finish(){
+      if (this.framePending.length > 0) {
+        const remainder = this.framePending;
+        this.framePending = new Float32Array(0);
+        this._processFrame(remainder);
+      }
+      if (!this.active && this.speechRunSamples > 0 && this.preRoll.length > 0) {
+        const replay = this.preRoll;
+        this.preRoll = new Float32Array(0);
+        this.unreportedSilenceSamples = 0;
+        this.onControl({
+          type: "audio_speech_start",
+          capture_sample_index: Math.round(this.captureSampleIndex),
+          preroll_samples: replay.length,
+        });
+        this._emitAudio(replay);
+        this.speechRunSamples = 0;
+        this.active = true;
+      }
+      if (this.active && this.heldQuiet.length > 0) {
+        this._emitAudio(this.heldQuiet);
+        this.heldQuiet = new Float32Array(0);
+      } else if (!this.active && this.unreportedSilenceSamples > 0) {
+        this._emitSilence();
+      }
+    }
+  }
+
+  const audioGateDebugInstances = new Map();
+  let nextAudioGateDebugId = 1;
+  window.__audioActivityGateDebug = {
+    create(options = {}) {
+      const events = [];
+      const gate = new AudioActivityGate({
+        ...options,
+        onAudio: (samples) => events.push({ type: "audio", samples: samples.length }),
+        onControl: (message) => events.push({ type: "control", message: { ...message } }),
+      });
+      const id = nextAudioGateDebugId++;
+      audioGateDebugInstances.set(id, {
+        feedConstant(amplitude, durationMs) {
+          const sampleCount = Math.max(0, Math.round(gate.sampleRate * Number(durationMs || 0) / 1000));
+          gate.feed(new Float32Array(sampleCount).fill(Number(amplitude || 0)));
+        },
+        finish() { gate.finish(); },
+        drainEvents() { return events.splice(0, events.length); },
+      });
+      return id;
+    },
+    get(id) { return audioGateDebugInstances.get(Number(id)); },
+  };
 
   function describeStartError(err){
     const name = (err && err.name) ? err.name : "Error";
@@ -3701,6 +4171,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       workletModuleUrl = null;
     }
     if (resetPending) {
+      if (audioActivityGate) audioActivityGate.reset();
+      audioActivityGate = null;
       pending = new Float32Array(0);
       sendQueue = [];
       queuedBytes = 0;
@@ -3710,20 +4182,65 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
   function enqueueSendBuffer(frame){
     if (!frame || !(frame instanceof ArrayBuffer)) return;
     if (frame.byteLength <= 0) return;
-    sendQueue.push(frame);
+    sendQueue.push({ payload: frame, bytes: frame.byteLength, droppable: true });
     queuedBytes += frame.byteLength;
     while (queuedBytes > MAX_SEND_QUEUE_BYTES && sendQueue.length > 1) {
-      const dropped = sendQueue.shift();
-      queuedBytes -= dropped.byteLength;
+      const dropIndex = sendQueue.findIndex((item) => item && item.droppable);
+      if (dropIndex < 0) break;
+      const dropped = sendQueue.splice(dropIndex, 1)[0];
+      queuedBytes -= Number(dropped.bytes || 0);
     }
   }
 
-  function flushPendingToQueue(){
+  function flushPendingToQueue(force = false){
     while (pending.length >= CHUNK_SAMPLES) {
       const chunk = pending.slice(0, CHUNK_SAMPLES);
       pending = pending.slice(CHUNK_SAMPLES);
       enqueueSendBuffer(float32ToPcm16(chunk));
     }
+    if (force && pending.length > 0) {
+      enqueueSendBuffer(float32ToPcm16(pending));
+      pending = new Float32Array(0);
+    }
+  }
+
+  function enqueueAudioControl(message){
+    if (!message || typeof message !== "object") return;
+    flushPendingToQueue(true);
+    const payload = JSON.stringify(message);
+    sendQueue.push({
+      payload,
+      bytes: payload.length,
+      droppable: false,
+    });
+    queuedBytes += payload.length;
+  }
+
+  function createLiveAudioActivityGate(){
+    return new AudioActivityGate({
+      sampleRate: TARGET_SR,
+      frameMs: AUDIO_GATE_FRAME_MS,
+      speechStartMs: AUDIO_GATE_SPEECH_START_MS,
+      silenceGateMs: AUDIO_GATE_SILENCE_MS,
+      preRollMs: AUDIO_GATE_PRE_ROLL_MS,
+      endTailMs: AUDIO_GATE_END_TAIL_MS,
+      heartbeatMs: AUDIO_GATE_HEARTBEAT_MS,
+      onAudio(samples) {
+        pending = concatFloat32(pending, samples);
+        flushPendingToQueue();
+        pump();
+      },
+      onControl(message) {
+        enqueueAudioControl(message);
+        traceSubtitle("audio_activity_control", {
+          type: String(message.type || ""),
+          durationMs: Number(message.duration_ms || 0),
+          prerollSamples: Number(message.preroll_samples || 0),
+          captureSampleIndex: Number(message.capture_sample_index || 0),
+        });
+        pump();
+      },
+    });
   }
 
   function onCapturedSamples(samples, srcSr){
@@ -3731,10 +4248,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     if (!samples || samples.length === 0) return;
     lastCaptureAt = Date.now();
     const rs = resampleLinear(samples, srcSr, TARGET_SR);
-    // Frontend no longer owns slice decisions; keep a single stream state per websocket.
-    pending = concatFloat32(pending, rs);
-    flushPendingToQueue();
-    pump();
+    // The client suppresses only confirmed transport silence. Sentence and
+    // segment boundaries remain exclusively controlled by the backend.
+    if (!audioActivityGate) audioActivityGate = createLiveAudioActivityGate();
+    audioActivityGate.feed(rs);
   }
 
   async function drainSendQueue(timeoutMs){
@@ -4093,10 +4610,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     while (sendQueue.length > 0) {
       if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) break;
-      const frame = sendQueue.shift();
-      queuedBytes -= frame.byteLength;
+      const item = sendQueue.shift();
+      if (!item) continue;
+      queuedBytes -= Number(item.bytes || 0);
       try {
-        ws.send(frame);
+        ws.send(item.payload);
         lastChunkSentAt = Date.now();
       } catch (err) {
         console.error(err);
@@ -4200,6 +4718,8 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
     renderTranslation();
     if (langEl) langEl.textContent = "-";
     pending = new Float32Array(0);
+    if (audioActivityGate) audioActivityGate.reset();
+    audioActivityGate = null;
     sendQueue = [];
     queuedBytes = 0;
     resetFinalWait();
@@ -4268,11 +4788,9 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
 
     try {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        flushPendingToQueue();
-        if (pending.length > 0) {
-          enqueueSendBuffer(float32ToPcm16(pending));
-          pending = new Float32Array(0);
-        }
+        if (audioActivityGate) audioActivityGate.finish();
+        audioActivityGate = null;
+        flushPendingToQueue(true);
         const drained = await drainSendQueue(WEBSOCKET_DRAIN_TIMEOUT_MS);
         if (!drained) {
           setStatus("Finishing (network backlog) / 收尾中(网络积压)", "warn");
@@ -4718,6 +5236,28 @@ def _parse_json_message(text: str) -> Dict[str, Any]:
     return payload
 
 
+def _bounded_json_int(
+    payload: Dict[str, Any],
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = payload.get(field)
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    integer = int(number)
+    if not np.isfinite(number) or float(integer) != number:
+        raise ValueError(f"{field} must be an integer")
+    if integer < int(minimum) or integer > int(maximum):
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    return integer
+
+
 async def _run_ordered_tts_transition(
     transition_lock: asyncio.Lock,
     transition: Any,
@@ -4748,14 +5288,59 @@ def _create_app(
         listener_queue_size=max(1, int(getattr(args, "tts_listener_queue_size", 128))),
     )
     app.state.tts_synthesizer = tts_synthesizer
+    tts_hls_root = Path(
+        str(
+            getattr(
+                args,
+                "tts_hls_root_dir",
+                f"/tmp/voxbridge-tts-hls-{int(getattr(args, 'port', 8024))}",
+            )
+        )
+    )
+    tts_hls_encoder_factory = getattr(args, "tts_hls_encoder_factory", None)
+    if tts_hls_encoder_factory is None:
+        def tts_hls_encoder_factory(root: Path) -> FFmpegHLSEncoder:
+            return FFmpegHLSEncoder(
+                root,
+                sample_rate=24000,
+                segment_sec=max(0.5, float(getattr(args, "tts_hls_segment_sec", 1.0))),
+                playlist_segments=max(
+                    6,
+                    int(getattr(args, "tts_hls_playlist_segments", 1200)),
+                ),
+                bitrate=str(getattr(args, "tts_hls_bitrate", "64k") or "64k"),
+                ffmpeg_path=str(getattr(args, "tts_hls_ffmpeg_path", "ffmpeg") or "ffmpeg"),
+            )
+    app.state.tts_hls = SharedHLSTTSPublisher(
+        synthesizer=tts_synthesizer,
+        encoder_factory=tts_hls_encoder_factory,
+        root_dir=tts_hls_root,
+        listener_ttl_sec=max(
+            15.0,
+            float(getattr(args, "tts_hls_listener_ttl_sec", 90.0)),
+        ),
+        max_listeners=max(1, int(getattr(args, "tts_hls_max_listeners", 128))),
+        queue_size=max(1, int(getattr(args, "tts_listener_queue_size", 128))),
+        sample_rate=24000,
+        sentence_pause_ms=max(
+            0,
+            int(getattr(args, "tts_hls_sentence_pause_ms", 300)),
+        ),
+    )
     asr_tokenizer = getattr(getattr(asr, "processor", None), "tokenizer", None)
     runtime = SimpleNamespace(active_connections=0)
     translator_accepts_direction = False
+    translator_accepts_strict_target_language = False
     if translator is not None:
         with suppress(TypeError, ValueError):
-            translate_parameters = inspect.signature(translator.translate).parameters.values()
+            translate_parameters = list(inspect.signature(translator.translate).parameters.values())
             translator_accepts_direction = any(
                 parameter.name == "translation_direction"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in translate_parameters
+            )
+            translator_accepts_strict_target_language = any(
+                parameter.name == "strict_target_language"
                 or parameter.kind == inspect.Parameter.VAR_KEYWORD
                 for parameter in translate_parameters
             )
@@ -4851,6 +5436,9 @@ def _create_app(
             raise HTTPException(status_code=400, detail="invalid TTS client ID")
         return value
 
+    def _public_hls_owner_key(listener_id: str) -> str:
+        return f"public-hls:{listener_id}"
+
     def _set_auth_cookie(response: RedirectResponse, token: str) -> None:
         response.set_cookie(
             AUTH_COOKIE_NAME,
@@ -4920,6 +5508,7 @@ def _create_app(
         )
         setattr(streaming_state, "_voxbridge_context_terms", tuple(selected_terms))
         setattr(streaming_state, "_voxbridge_context_elapsed_sec", float(elapsed_sec))
+        setattr(streaming_state, "_voxbridge_stream_decode_count", 0)
         return streaming_state
 
     def _new_transformers_state(
@@ -4998,11 +5587,107 @@ def _create_app(
         return HTMLResponse(html)
 
     @app.get("/listen")
-    async def tts_listener_page(request: Request):
-        if not _request_is_authenticated(request):
-            login_target = "/login?" + urllib.parse.urlencode({"next": "/listen"})
-            return RedirectResponse(login_target, status_code=303)
+    async def tts_listener_page():
         return HTMLResponse(TTS_LISTENER_HTML)
+
+    @app.get("/listen/qr.svg")
+    async def public_tts_listener_qr() -> Response:
+        return Response(
+            content=PUBLIC_LISTENER_QR_SVG,
+            media_type="image/svg+xml",
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def shutdown_shared_tts_hls() -> None:
+        await app.state.tts_hls.close()
+
+    app.add_event_handler("shutdown", shutdown_shared_tts_hls)
+
+    def _rewrite_hls_playlist(text: str, listener_id: str) -> str:
+        segment_prefix = f"/api/tts/live/{urllib.parse.quote(listener_id)}/segments/"
+        lines = []
+        for line in str(text or "").splitlines():
+            value = line.strip()
+            if value and not value.startswith("#") and value.endswith(".ts"):
+                lines.append(segment_prefix + urllib.parse.quote(Path(value).name))
+            else:
+                lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    @app.get("/api/tts/live/status")
+    async def shared_tts_hls_status() -> JSONResponse:
+        await app.state.tts_hls.prune_expired()
+        status = app.state.tts_hls.status
+        return JSONResponse(
+            {
+                "available": bool(status.available),
+                "listener_count": int(status.listener_count),
+                "queue_depth": int(status.queue_depth),
+                "synthesis_active": bool(status.synthesis_active),
+                "preparation_queue_depth": int(status.preparation_queue_depth),
+                "preparation_active": bool(status.preparation_active),
+                "prepared_audio_count": int(status.prepared_audio_count),
+                "pending_audio_ms": int(status.pending_audio_ms),
+                "encoder_active": bool(status.encoder_active),
+                "producer_active": bool(app.state.tts_broadcast.producer_active),
+                "last_error": str(status.last_error),
+            }
+        )
+
+    @app.get("/api/tts/live/{listener_id}/index.m3u8")
+    async def shared_tts_hls_playlist(listener_id: str) -> Response:
+        listener = _validated_tts_client_id(listener_id)
+        owner_key = _public_hls_owner_key(listener)
+        try:
+            await app.state.tts_hls.touch_listener(listener, owner_key)
+            await app.state.tts_hls.wait_ready(listener, owner_key, timeout=5.0)
+            playlist = app.state.tts_hls.playlist_text(listener, owner_key)
+        except HLSListenerCapacityExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="HLS listener capacity reached",
+            ) from exc
+        except HLSListenerNotFound as exc:
+            raise HTTPException(status_code=404, detail="HLS listener not found") from exc
+        except HLSUnavailable as exc:
+            raise HTTPException(status_code=503, detail="HLS stream unavailable") from exc
+        return Response(
+            content=_rewrite_hls_playlist(playlist, listener),
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/tts/live/{listener_id}/segments/{segment_name}")
+    async def shared_tts_hls_segment(
+        listener_id: str,
+        segment_name: str,
+    ) -> FileResponse:
+        listener = _validated_tts_client_id(listener_id)
+        owner_key = _public_hls_owner_key(listener)
+        if not re.fullmatch(r"segment_[0-9]{9}\.ts", str(segment_name or "")):
+            raise HTTPException(status_code=404, detail="HLS segment not found")
+        try:
+            await app.state.tts_hls.touch_listener(listener, owner_key)
+            segment = app.state.tts_hls.segment_path(listener, owner_key, segment_name)
+        except (HLSListenerNotFound, HLSUnavailable) as exc:
+            raise HTTPException(status_code=404, detail="HLS segment not found") from exc
+        return FileResponse(
+            str(segment),
+            media_type="video/mp2t",
+            headers={"Cache-Control": "private, max-age=300, immutable"},
+        )
+
+    @app.delete("/api/tts/live/{listener_id}")
+    async def remove_shared_tts_hls_listener(
+        listener_id: str,
+    ) -> JSONResponse:
+        listener = _validated_tts_client_id(listener_id)
+        owner_key = _public_hls_owner_key(listener)
+        removed = await app.state.tts_hls.remove_listener(listener, owner_key)
+        return JSONResponse({"ok": bool(removed)})
 
     @app.websocket("/ws/tts")
     async def ws_tts_listener(websocket: WebSocket) -> None:
@@ -5266,7 +5951,8 @@ def _create_app(
         )
         consumer_high_batch_samples = max(consumer_max_batch_samples, int(3.0 * SAMPLE_RATE))
         hard_overflow_relief_sec = max(2.0, float(getattr(args, "backpressure_hard_relief_sec", 6.0)))
-        final_redecode_on_stop = bool(getattr(args, "final_redecode_on_stop", True))
+        final_redecode_on_stop = bool(getattr(args, "final_redecode_on_stop", False))
+        segment_final_redecode = bool(getattr(args, "segment_final_redecode", False))
         final_redecode_max_samples = int(max(0.0, float(getattr(args, "final_redecode_max_sec", 180.0))) * SAMPLE_RATE)
         rollover_sec = max(0.0, float(getattr(args, "state_rollover_sec", 30.0)))
         segment_hard_cut_sec = max(1.0, float(getattr(args, "segment_hard_cut_sec", max(rollover_sec, 30.0) or 30.0)))
@@ -5295,8 +5981,11 @@ def _create_app(
         queue_target_sec = max(0.2, float(getattr(args, "backpressure_target_queue_sec", 3.0)))
         queue_max_sec = max(queue_target_sec, float(getattr(args, "backpressure_max_queue_sec", 5.0)))
         total_consumed_samples = 0
+        source_timeline_samples = 0
+        client_replay_samples_remaining = 0
         last_partial_emit_at = time.monotonic()
         queue_samples = 0
+        deferred_audio_items: List[Tuple[int, Any]] = []
         audio_spill_generation: Optional[int] = None
         audio_spill_parts: List[np.ndarray] = []
         audio_spill_samples = 0
@@ -5309,6 +5998,7 @@ def _create_app(
             until=0.0,
             skipped=0,
             speech_confirmed=False,
+            require_speech_evidence=False,
             silero_speech_samples=0,
             last_text_hash8="",
         )
@@ -5438,6 +6128,8 @@ def _create_app(
             queue_depth_peak=0,
             queue_spill_flushes=0,
             queue_spill_samples_peak=0,
+            client_silence_events=0,
+            client_silence_ms=0,
             last_error="",
             silent_decode_skipped=0,
         )
@@ -5531,39 +6223,6 @@ def _create_app(
                 backfilled += 1
             return merged, int(backfilled)
 
-        def _remap_completed_cursor_after_resegmentation(
-            completed: List[str],
-            processed_count: int,
-        ) -> int:
-            count = max(0, int(processed_count))
-            candidate_texts = list(getattr(subtitle_state, "candidate_texts", []) or [])
-            if count <= 0 or count > len(candidate_texts) or count >= len(completed):
-                return count
-            previous_compact = _compact_asr_compare_text(
-                _join_segments(candidate_texts[:count])
-            )
-            if not previous_compact:
-                return count
-            for end in range(count + 1, len(completed) + 1):
-                current_compact = _compact_asr_compare_text(
-                    _join_segments(completed[:end])
-                )
-                if current_compact == previous_compact:
-                    return int(end)
-                length_ratio = len(current_compact) / float(len(previous_compact))
-                if (
-                    0.8 <= length_ratio <= 1.25
-                    and difflib.SequenceMatcher(
-                        None,
-                        previous_compact,
-                        current_compact,
-                    ).ratio() >= 0.9
-                ):
-                    return int(end)
-                if length_ratio > 1.25:
-                    break
-            return count
-
         alignment_runtime = SimpleNamespace(
             model_seen={},
             committed_seen={},
@@ -5641,6 +6300,7 @@ def _create_app(
             ordered=RevisionStableTTSBuffer(
                 stable_sec=tts_revision_stable_sec,
                 latest_revision_grace_sec=tts_latest_revision_grace_sec,
+                hold_latest_until_sealed=segment_final_redecode,
             ),
             stability_task=None,
             stability_wake=asyncio.Event(),
@@ -5819,6 +6479,13 @@ def _create_app(
             return str(
                 getattr(local_state, "context", "")
                 or getattr(local_state, "streaming_context", "")
+                or " ".join(
+                    str(term or "").strip()
+                    for term in (
+                        getattr(local_state, "_voxbridge_context_terms", ()) or ()
+                    )
+                    if str(term or "").strip()
+                )
                 or ""
             ).strip()
 
@@ -5842,6 +6509,16 @@ def _create_app(
             context_resume_guard.active = False
             context_resume_guard.until = 0.0
             context_resume_guard.skipped = 0
+            context_resume_guard.require_speech_evidence = False
+            context_resume_guard.silero_speech_samples = 0
+            context_resume_guard.last_text_hash8 = ""
+
+        def _reset_context_resume_guard() -> None:
+            context_resume_guard.active = False
+            context_resume_guard.until = 0.0
+            context_resume_guard.skipped = 0
+            context_resume_guard.speech_confirmed = False
+            context_resume_guard.require_speech_evidence = False
             context_resume_guard.silero_speech_samples = 0
             context_resume_guard.last_text_hash8 = ""
 
@@ -5871,6 +6548,8 @@ def _create_app(
                 int(context_resume_guard.skipped),
                 skipped_count,
             )
+            if str(reason or "") in {"client_silence", "segment_open"}:
+                context_resume_guard.require_speech_evidence = True
             if not was_active:
                 context_resume_guard.speech_confirmed = False
                 context_resume_guard.silero_speech_samples = 0
@@ -5881,8 +6560,33 @@ def _create_app(
                     reason=str(reason or ""),
                     skipped=int(skipped_count),
                     silero_available=bool(silero_shadow_observer is not None),
+                    require_speech_evidence=bool(
+                        context_resume_guard.require_speech_evidence
+                    ),
                     guard_fallback_ms=int(round(guard_sec * 1000.0)),
                 )
+
+        def _should_quarantine_context_guard(
+            context: str,
+            candidate: str,
+            *,
+            fallback_window_active: bool,
+        ) -> bool:
+            if not bool(context_resume_guard.active):
+                return False
+            if (
+                not bool(context_resume_guard.require_speech_evidence)
+                and not _looks_like_asr_context_fragment_echo(context, candidate)
+            ):
+                return False
+            return _should_quarantine_asr_context_resume_partial(
+                context,
+                candidate,
+                guard_active=True,
+                silero_available=bool(silero_shadow_observer is not None),
+                speech_confirmed=bool(context_resume_guard.speech_confirmed),
+                fallback_window_active=bool(fallback_window_active),
+            )
 
         def _quarantine_resumed_context_partial(
             local_state: Any,
@@ -5896,25 +6600,23 @@ def _create_app(
             context = _streaming_context_for_state(local_state)
             candidate = str(text or "").strip()
             context_fragment = _looks_like_asr_context_fragment_echo(context, candidate)
-            if not context_fragment:
-                _release_context_resume_guard(
-                    reason="non_context_text",
-                    seq_no=int(seq_no),
-                )
-                return False
-
             silero_available = silero_shadow_observer is not None
             fallback_window_active = now_mono < float(context_resume_guard.until)
-            if not _should_quarantine_asr_context_resume_partial(
+            if not _should_quarantine_context_guard(
                 context,
                 candidate,
-                guard_active=bool(context_resume_guard.active),
-                silero_available=bool(silero_available),
-                speech_confirmed=bool(context_resume_guard.speech_confirmed),
                 fallback_window_active=bool(fallback_window_active),
             ):
                 _release_context_resume_guard(
-                    reason="fallback_window_elapsed",
+                    reason=(
+                        "speech_confirmed"
+                        if bool(context_resume_guard.speech_confirmed)
+                        else (
+                            "non_context_text"
+                            if not context_fragment
+                            else "fallback_window_elapsed"
+                        )
+                    ),
                     seq_no=int(seq_no),
                 )
                 return False
@@ -5930,6 +6632,10 @@ def _create_app(
                     context_chars=len(context),
                     context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
                     resume_skipped=int(context_resume_guard.skipped),
+                    context_fragment=bool(context_fragment),
+                    require_speech_evidence=bool(
+                        context_resume_guard.require_speech_evidence
+                    ),
                     awaiting_speech_confirmation=bool(
                         silero_available and not context_resume_guard.speech_confirmed
                     ),
@@ -5952,19 +6658,54 @@ def _create_app(
         ) -> str:
             candidate = str(candidate_text or "").strip()
             context = _streaming_context_for_state(local_state)
-            if not _should_quarantine_asr_context_resume_partial(
+            fallback_snapshot = str(snapshot_text or "").strip()
+            segment_active_ms = float(
+                getattr(backend_vad, "segment_active_ms", 0.0) or 0.0
+            )
+            trusted_active_ms = max(200.0, min(float(vad_min_active_ms), 1000.0))
+            aligned_tail_repair = bool(
+                context_resume_guard.active
+                and fallback_snapshot
+                and candidate
+                and segment_active_ms >= trusted_active_ms
+                and _should_accept_context_sentence_correction(
+                    fallback_snapshot,
+                    candidate,
+                )
+                and not _looks_like_asr_context_echo(
+                    context,
+                    candidate,
+                    previous_text=fallback_snapshot,
+                )
+                and not _contains_unsubstantiated_asr_context_fragment(
+                    context,
+                    candidate,
+                    previous_text=fallback_snapshot,
+                )
+            )
+            if aligned_tail_repair:
+                _trace_event(
+                    "asr_context_final_tail_repair_trusted",
+                    seq=int(seq_no),
+                    reason=str(reason or ""),
+                    segment_id=int(segment_id),
+                    segment_active_ms=int(segment_active_ms),
+                    required_active_ms=int(trusted_active_ms),
+                    snapshot_chars=len(fallback_snapshot),
+                    candidate_chars=len(candidate),
+                    snapshot_hash8=_hash8(fallback_snapshot),
+                    candidate_hash8=_hash8(candidate),
+                )
+                return candidate
+            if not _should_quarantine_context_guard(
                 context,
                 candidate,
-                guard_active=bool(context_resume_guard.active),
-                silero_available=bool(silero_shadow_observer is not None),
-                speech_confirmed=bool(context_resume_guard.speech_confirmed),
                 # An active guard means no trustworthy resumed output has been
                 # observed. Finalization itself must not bypass that gate.
                 fallback_window_active=True,
             ):
                 return candidate
 
-            fallback_snapshot = str(snapshot_text or "").strip()
             fallback_snapshot_used = bool(
                 fallback_snapshot
                 and not _looks_like_asr_context_fragment_echo(
@@ -5994,9 +6735,26 @@ def _create_app(
             return fallback_snapshot if fallback_snapshot_used else ""
 
         async def _apply_segment_final_context(local_state: Any, *, reason: str) -> bool:
-            context = str(getattr(local_state, "_voxbridge_final_context", "") or "")
-            if asr_context_apply_mode != "segment_final" or not context:
+            legacy_context_redecode = bool(
+                asr_context_apply_mode == "segment_final"
+                and str(getattr(local_state, "_voxbridge_final_context", "") or "")
+            )
+            if not segment_final_redecode and not legacy_context_redecode:
                 return False
+
+            local_state._voxbridge_segment_final_redecode_validated = False
+            local_state._voxbridge_segment_final_redecode_applied = False
+            context = (
+                str(getattr(local_state, "_voxbridge_final_context", "") or "")
+                if legacy_context_redecode
+                else _streaming_context_for_state(local_state)
+            )
+            event_prefix = (
+                "segment_final_redecode"
+                if segment_final_redecode
+                else "asr_context_final_redecode"
+            )
+            context_sha256 = hashlib.sha256(context.encode("utf-8")).hexdigest()
 
             segment_wav = np.asarray(
                 getattr(local_state, "audio_accum", np.zeros((0,), dtype=np.float32)),
@@ -6004,10 +6762,10 @@ def _create_app(
             ).reshape(-1)
             if int(segment_wav.size) <= 0:
                 _trace_event(
-                    "asr_context_final_redecode_skipped",
+                    f"{event_prefix}_skipped",
                     reason="empty_audio",
                     cut_reason=str(reason or ""),
-                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    context_sha256=context_sha256,
                 )
                 return False
 
@@ -6015,6 +6773,7 @@ def _create_app(
             saved_max_tokens = None
             sampling_params = getattr(asr, "sampling_params", None)
             override_max_tokens = int(max(1, int(getattr(args, "final_redecode_max_new_tokens", 512))))
+            redecode_started_at = time.monotonic()
             try:
                 if sampling_params is not None and hasattr(sampling_params, "max_tokens"):
                     try:
@@ -6034,23 +6793,49 @@ def _create_app(
                 corrected_text = str(getattr(segment_out, "text", "") or "").strip()
                 if not corrected_text:
                     _trace_event(
-                        "asr_context_final_redecode_skipped",
+                        f"{event_prefix}_skipped",
                         reason="empty_result",
                         cut_reason=str(reason or ""),
                         audio_samples=int(segment_wav.size),
-                        context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                        latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                        context_sha256=context_sha256,
+                    )
+                    return False
+                previous_units, _ = _split_subtitle_units(previous_text)
+                corrected_units, _ = _split_subtitle_units(corrected_text)
+                if len(corrected_units) < len(previous_units):
+                    _trace_event(
+                        f"{event_prefix}_skipped",
+                        reason="completed_unit_regression",
+                        cut_reason=str(reason or ""),
+                        audio_samples=int(segment_wav.size),
+                        previous_text_chars=len(previous_text),
+                        corrected_text_chars=len(corrected_text),
+                        previous_completed_count=len(previous_units),
+                        corrected_completed_count=len(corrected_units),
+                        latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                        context_sha256=context_sha256,
                     )
                     return False
                 if _compact_asr_compare_text(corrected_text) == _compact_asr_compare_text(
                     previous_text
                 ):
+                    local_state._voxbridge_segment_final_redecode_validated = True
                     _trace_event(
-                        "asr_context_final_redecode_skipped",
+                        (
+                            f"{event_prefix}_done"
+                            if segment_final_redecode
+                            else f"{event_prefix}_skipped"
+                        ),
                         reason="unchanged_result",
-                        cut_reason=str(reason or ""),
+                        cut_reason=str(reason or "") if segment_final_redecode else None,
                         audio_samples=int(segment_wav.size),
+                        audio_ms=int(round(int(segment_wav.size) * 1000.0 / SAMPLE_RATE)),
+                        previous_text_chars=len(previous_text),
                         corrected_text_chars=len(corrected_text),
-                        context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                        text_changed=False,
+                        latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                        context_sha256=context_sha256,
                     )
                     return False
                 context_echo_reason = ""
@@ -6068,12 +6853,35 @@ def _create_app(
                     context_echo_reason = "context_fragment_echo"
                 if context_echo_reason:
                     _trace_event(
-                        "asr_context_final_redecode_skipped",
+                        f"{event_prefix}_skipped",
                         reason=str(context_echo_reason),
                         cut_reason=str(reason or ""),
                         audio_samples=int(segment_wav.size),
                         corrected_text_chars=len(corrected_text),
-                        context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                        latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                        context_sha256=context_sha256,
+                    )
+                    return False
+
+                if (
+                    segment_final_redecode
+                    and previous_text
+                    and not _should_accept_context_sentence_correction(
+                        previous_text,
+                        corrected_text,
+                    )
+                ):
+                    _trace_event(
+                        f"{event_prefix}_skipped",
+                        reason="unsafe_divergence",
+                        cut_reason=str(reason or ""),
+                        audio_samples=int(segment_wav.size),
+                        previous_text_chars=len(previous_text),
+                        corrected_text_chars=len(corrected_text),
+                        previous_text_hash8=_hash8(previous_text),
+                        corrected_text_hash8=_hash8(corrected_text),
+                        latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                        context_sha256=context_sha256,
                     )
                     return False
 
@@ -6083,23 +6891,29 @@ def _create_app(
                     or ""
                 )
                 local_state.text = corrected_text
+                local_state._voxbridge_segment_final_redecode_validated = True
+                local_state._voxbridge_segment_final_redecode_applied = True
                 _trace_event(
-                    "asr_context_final_redecode_done",
+                    f"{event_prefix}_done",
                     reason=str(reason or ""),
                     audio_samples=int(segment_wav.size),
                     audio_ms=int(round(int(segment_wav.size) * 1000.0 / SAMPLE_RATE)),
                     previous_text_chars=len(previous_text),
                     corrected_text_chars=len(corrected_text),
                     text_changed=bool(corrected_text != previous_text),
-                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    previous_text_hash8=_hash8(previous_text),
+                    corrected_text_hash8=_hash8(corrected_text),
+                    latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                    context_sha256=context_sha256,
                 )
                 return True
             except Exception as exc:
                 _trace_event(
-                    "asr_context_final_redecode_failed",
+                    f"{event_prefix}_failed",
                     reason=str(reason or ""),
                     audio_samples=int(segment_wav.size),
-                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                    latency_ms=int(round((time.monotonic() - redecode_started_at) * 1000.0)),
+                    context_sha256=context_sha256,
                     **_safe_exception_trace_fields(exc),
                 )
                 return False
@@ -6517,6 +7331,29 @@ def _create_app(
                             app.state.tts_broadcast.listener_count,
                             app.state.tts_broadcast.job_count,
                         )
+                    try:
+                        hls_published = await app.state.tts_hls.publish(item)
+                    except HLSQueueFull:
+                        hls_published = False
+                        logger.warning(
+                            "shared HLS TTS queue full source_order=%d listeners=%d",
+                            int(item.source_order),
+                            app.state.tts_hls.listener_count,
+                        )
+                        _trace_event(
+                            "tts_hls_rejected",
+                            reason="queue_full",
+                            sentence_id=str(item.sentence_id),
+                            revision=int(item.revision),
+                            source_order=int(item.source_order),
+                        )
+                    if hls_published:
+                        logger.info(
+                            "shared HLS TTS queued source_order=%d listeners=%d queue_depth=%d",
+                            int(item.source_order),
+                            app.state.tts_hls.listener_count,
+                            app.state.tts_hls.status.queue_depth,
+                        )
 
                 private_job = None
                 if tts_runtime.enabled:
@@ -6611,11 +7448,13 @@ def _create_app(
             translated: str,
             target_language: str,
         ) -> None:
+            preparation_items: List[TTSReadyItem] = []
+
             def _transition() -> List[Any]:
                 registered = tts_runtime.sentence_orders.get(str(sentence_id or ""))
                 if not _tts_output_active() or registered is None:
                     return []
-                _, registered_generation = registered
+                source_order, registered_generation = registered
                 if int(registered_generation) != int(tts_runtime.generation):
                     return []
                 accepted = tts_runtime.ordered.mark_ready(
@@ -6625,16 +7464,31 @@ def _create_app(
                     _canonical_tts_language(str(target_language)),
                 )
                 if accepted:
+                    preparation_items.append(
+                        TTSReadyItem(
+                            sentence_id=str(sentence_id),
+                            revision=int(revision),
+                            source_order=int(source_order),
+                            target_language=_canonical_tts_language(
+                                str(target_language)
+                            ),
+                            text=str(translated),
+                            release_reason="preparation",
+                        )
+                    )
                     tts_runtime.stability_wake.set()
                     wait = tts_runtime.ordered.wait_state(str(sentence_id))
                     if wait is not None and (
-                        int(wait.remaining_ms) > 0 or bool(wait.blocked_by_earlier)
+                        int(wait.remaining_ms) > 0
+                        or bool(wait.blocked_by_earlier)
+                        or bool(wait.waiting_for_segment_seal)
                     ):
                         wait_key = (
                             str(sentence_id),
                             int(wait.revision),
                             bool(wait.blocked_by_earlier),
                             bool(wait.waiting_for_latest_grace),
+                            bool(wait.waiting_for_segment_seal),
                         )
                         if wait_key != tts_runtime.last_wait_key:
                             tts_runtime.last_wait_key = wait_key
@@ -6650,14 +7504,35 @@ def _create_app(
                                 waiting_for_latest_grace=bool(
                                     wait.waiting_for_latest_grace
                                 ),
+                                waiting_for_segment_seal=bool(
+                                    wait.waiting_for_segment_seal
+                                ),
                             )
                 return tts_runtime.ordered.drain()
 
-            await _run_ordered_tts_transition(
-                tts_transition_lock,
-                _transition,
-                _publish_tts_ready,
-            )
+            async with tts_transition_lock:
+                ready = _transition()
+                for preparation_item in preparation_items:
+                    queued = await app.state.tts_hls.prepare(preparation_item)
+                    _trace_event(
+                        "tts_hls_preparation_requested",
+                        sentence_id=str(preparation_item.sentence_id),
+                        revision=int(preparation_item.revision),
+                        source_order=int(preparation_item.source_order),
+                        target_language=str(preparation_item.target_language),
+                        translated_chars=len(str(preparation_item.text)),
+                        translated_hash8=_hash8(str(preparation_item.text)),
+                        queued=bool(queued),
+                        listener_count=int(app.state.tts_hls.listener_count),
+                        preparation_queue_depth=int(
+                            app.state.tts_hls.status.preparation_queue_depth
+                        ),
+                        prepared_audio_count=int(
+                            app.state.tts_hls.status.prepared_audio_count
+                        ),
+                    )
+                if ready:
+                    await _publish_tts_ready(ready)
 
         async def _mark_tts_translation_failed(sentence_id: str, revision: int) -> None:
             def _transition() -> List[Any]:
@@ -6886,20 +7761,74 @@ def _create_app(
 
             t0 = time.monotonic()
             try:
-                try:
+                async def _invoke_translator(*, strict_target_language: bool) -> str:
                     translate_kwargs = {
                         "source_language": effective_source_language,
                         "target_language": target_language,
                     }
                     if translator_accepts_direction:
                         translate_kwargs["translation_direction"] = direction
-                    out = await asyncio.to_thread(
-                        translator.translate,
-                        src,
-                        **translate_kwargs,
+                    if strict_target_language and translator_accepts_strict_target_language:
+                        translate_kwargs["strict_target_language"] = True
+                    try:
+                        result = await asyncio.to_thread(
+                            translator.translate,
+                            src,
+                            **translate_kwargs,
+                        )
+                    except TypeError:
+                        result = await asyncio.to_thread(translator.translate, src)
+                    return str(result or "").strip()
+
+                out = await _invoke_translator(strict_target_language=False)
+                quality_retry_count = 0
+                enforce_target_language = bool(
+                    getattr(translator, "enforce_target_language_output", False)
+                )
+                if enforce_target_language and _translation_needs_target_language_retry(
+                    out,
+                    target_language,
+                ):
+                    _trace_event(
+                        "translation_target_language_mismatch",
+                        seq=int(seq_hint or 0),
+                        sentence_id=str(sentence_id or ""),
+                        revision=int(revision),
+                        direction=str(direction or ""),
+                        source_language=str(effective_source_language or ""),
+                        target_language=str(target_language or ""),
+                        attempt=1,
+                        out_chars=len(out),
+                        out_hash8=_hash8(out),
+                        strict_retry_supported=bool(
+                            translator_accepts_strict_target_language
+                        ),
                     )
-                except TypeError:
-                    out = await asyncio.to_thread(translator.translate, src)
+                    if translator_accepts_strict_target_language:
+                        quality_retry_count = 1
+                        out = await _invoke_translator(strict_target_language=True)
+                    if _translation_needs_target_language_retry(out, target_language):
+                        _trace_event(
+                            "translation_target_language_rejected",
+                            seq=int(seq_hint or 0),
+                            sentence_id=str(sentence_id or ""),
+                            revision=int(revision),
+                            direction=str(direction or ""),
+                            source_language=str(effective_source_language or ""),
+                            target_language=str(target_language or ""),
+                            attempt=2 if quality_retry_count else 1,
+                            out_chars=len(out),
+                            out_hash8=_hash8(out),
+                        )
+                        logger.warning(
+                            "translation rejected target-language mismatch peer=%s seq=%d "
+                            "target=%s out_chars=%d",
+                            peer,
+                            int(seq_hint or 0),
+                            str(target_language or ""),
+                            len(out),
+                        )
+                        out = ""
             except Exception as e:
                 stats.last_error = f"translate failed: {e}"
                 logger.warning("translation failed peer=%s err=%s", peer, e)
@@ -6933,6 +7862,7 @@ def _create_app(
                 out_chars=len(out or ""),
                 out_hash8=_hash8(str(out or "")),
                 latency_ms=int(latency * 1000),
+                quality_retry_count=int(quality_retry_count),
             )
             if latency >= 1.0:
                 logger.info(
@@ -7708,6 +8638,24 @@ def _create_app(
                                     raw_chars=len(raw),
                                     pending_reason=str(pending_reason or ""),
                                 )
+                        elif pending_reason == "vad_silence":
+                            # A VAD boundary normally starts the next state at a new
+                            # sentence, so lack of text overlap is expected. Keep the
+                            # deferred previous segment in the candidate timeline.
+                            merged = _join_segments([pending_prefix, raw]).strip()
+                            pending_miss_count = 0
+                            subtitle_state.pending_prefix_is_separate = True
+                            subtitle_state.pending_prefix_retain_for_alignment = True
+                            subtitle_state.boundary_anchor_text = ""
+                            subtitle_state.boundary_anchor_segment_id = 0
+                            _trace_event(
+                                "pending_prefix_vad_boundary_preserved",
+                                seq=int(seq_no or 0),
+                                pending_reason=str(pending_reason or ""),
+                                pending_chars=len(pending_prefix),
+                                raw_chars=len(raw),
+                                merged_chars=len(merged),
+                            )
                         else:
                             merged = raw
                             completed_now, _ = _split_sentences_and_tail(raw)
@@ -7962,6 +8910,38 @@ def _create_app(
                     tentative_after_chars=len(str(tentative_after or "").strip()),
                 )
 
+        async def _flush_pending_decode_tail(local_state: Any, *, reason: str) -> int:
+            tail, tail_samples = decode_pre_roll.prepend_to(
+                np.empty((0,), dtype=np.float32)
+            )
+            if tail_samples <= 0:
+                return 0
+
+            try:
+                await asyncio.to_thread(asr.streaming_transcribe, tail, local_state)
+                local_state._voxbridge_stream_decode_count = int(
+                    getattr(local_state, "_voxbridge_stream_decode_count", 0) or 0
+                ) + 1
+            except Exception:
+                decode_pre_roll.append(tail)
+                _trace_event(
+                    "endpoint_tail_decode_failed",
+                    reason=str(reason or ""),
+                    samples=int(tail_samples),
+                )
+                raise
+
+            stats.silent_decode_skipped = 0
+            rms = float(np.sqrt(np.mean(np.square(tail, dtype=np.float64)))) if tail.size else 0.0
+            _trace_event(
+                "endpoint_tail_decoded",
+                reason=str(reason or ""),
+                samples=int(tail_samples),
+                duration_ms=int(round(float(tail_samples) * 1000.0 / SAMPLE_RATE)),
+                rms_dbfs=round(float(20.0 * np.log10(max(rms, 1e-9))), 2),
+            )
+            return int(tail_samples)
+
         async def _finalize_segment_and_rotate(
             *,
             reason: str,
@@ -7983,6 +8963,19 @@ def _create_app(
             if local_state is None:
                 return False
 
+            hard_cut_mid_speech = bool(
+                str(reason or "") == "hard_cut"
+                and bool(getattr(backend_vad, "in_speech", False))
+                and float(getattr(backend_vad, "silence_ms", 0.0) or 0.0) < 80.0
+            )
+            legacy_segment_context_redecode = bool(
+                asr_context_apply_mode == "segment_final"
+                and str(getattr(local_state, "_voxbridge_final_context", "") or "")
+            )
+            fast_live_hard_cut = bool(
+                hard_cut_mid_speech and not legacy_segment_context_redecode
+            )
+
             _trace_event(
                 "segment_finalize_start",
                 reason=str(reason or ""),
@@ -8003,12 +8996,30 @@ def _create_app(
             try:
                 context_final_applied = False
                 async with infer_lock:
+                    await _flush_pending_decode_tail(
+                        local_state,
+                        reason=str(reason or "segment_finalize"),
+                    )
                     await asyncio.to_thread(asr.finish_streaming_transcribe, local_state)
                     _guard_streaming_context_output(local_state, reason=str(reason or "segment_finalize"))
-                    context_final_applied = await _apply_segment_final_context(
-                        local_state,
-                        reason=str(reason or ""),
-                    )
+                    if fast_live_hard_cut:
+                        local_state._voxbridge_segment_final_redecode_validated = True
+                        local_state._voxbridge_segment_final_redecode_applied = False
+                        _trace_event(
+                            "segment_final_redecode_skipped",
+                            reason="live_hard_cut",
+                            cut_reason=str(reason or ""),
+                            audio_samples=int(
+                                np.asarray(
+                                    getattr(local_state, "audio_accum", np.zeros((0,), dtype=np.float32))
+                                ).size
+                            ),
+                        )
+                    else:
+                        context_final_applied = await _apply_segment_final_context(
+                            local_state,
+                            reason=str(reason or ""),
+                        )
             except Exception as e:
                 _trace_event(
                     "segment_finalize_failed",
@@ -8022,7 +9033,9 @@ def _create_app(
                 if state is not local_state:
                     return False
                 if context_final_applied:
-                    segment_final_context_applied = True
+                    segment_final_context_applied = bool(
+                        asr_context_apply_mode == "segment_final"
+                    )
 
             seq = max(int(seq), int(seq_hint or 0)) + 1
             raw_final_text = str(getattr(local_state, "text", "") or snapshot_text or "").strip()
@@ -8034,6 +9047,52 @@ def _create_app(
                 seq_no=int(seq),
                 segment_id=int(getattr(segment_runtime, "id", 0) or 0),
             )
+            if context_final_applied:
+                pending_prefix_for_guard = str(
+                    getattr(subtitle_state, "pending_prefix_text", "") or ""
+                ).strip()
+                previous_effective_count, corrected_effective_count = (
+                    _effective_completed_unit_counts(
+                        pending_prefix_for_guard,
+                        str(snapshot_text or ""),
+                        final_text,
+                        target_cjk_chars=int(stable_clause_target_cjk_chars),
+                        target_latin_words=int(stable_clause_target_latin_words),
+                    )
+                )
+                if corrected_effective_count < previous_effective_count:
+                    _trace_event(
+                        "segment_final_redecode_skipped",
+                        reason="effective_completed_unit_regression",
+                        cut_reason=str(reason or ""),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        previous_completed_count=int(previous_effective_count),
+                        corrected_completed_count=int(corrected_effective_count),
+                        pending_prefix_chars=len(pending_prefix_for_guard),
+                        previous_text_chars=len(str(snapshot_text or "").strip()),
+                        corrected_text_chars=len(final_text),
+                        previous_text_hash8=_hash8(str(snapshot_text or "")),
+                        corrected_text_hash8=_hash8(final_text),
+                    )
+                    final_text = str(snapshot_text or "").strip()
+                    raw_final_text = final_text
+                    local_state.text = final_text
+                    if hasattr(local_state, "_raw_decoded"):
+                        local_state._raw_decoded = final_text
+                    local_state._voxbridge_segment_final_redecode_validated = False
+                    local_state._voxbridge_segment_final_redecode_applied = False
+                    context_final_applied = False
+                    segment_final_context_applied = False
+                    _trace_text_pool(
+                        "segment_final_redecode_reverted",
+                        phase="generating",
+                        text=final_text,
+                        reason="effective_completed_unit_regression",
+                        seq_hint=int(seq),
+                        delta_chars=0,
+                        previous_completed_count=int(previous_effective_count),
+                        corrected_completed_count=int(corrected_effective_count),
+                    )
             punct_cut_carry_text = ""
             punct_cut_resolved_end = 0
             if str(reason or "") == "punct_timeout_cut" and int(cut_boundary_end or 0) > 0 and raw_final_text:
@@ -8061,11 +9120,6 @@ def _create_app(
                 force_finalize=bool(force_finalize),
             )
             finalize_completed_preview, finalize_tail_preview = _split_sentences_and_tail(final_text)
-            hard_cut_mid_speech = bool(
-                str(reason or "") == "hard_cut"
-                and bool(getattr(backend_vad, "in_speech", False))
-                and float(getattr(backend_vad, "silence_ms", 0.0) or 0.0) < 80.0
-            )
             defer_short_english_slice_commit = bool(
                 str(reason or "") in {"vad_silence", "hard_cut", "punct_timeout_cut"}
                 and len(finalize_completed_preview) == 1
@@ -8108,7 +9162,23 @@ def _create_app(
                 final_reconcile=True,
                 allow_early_translation_promotion=not bool(hard_cut_mid_speech),
             )
-            await _seal_tts_sources_through_current_segment(reason=str(reason or ""))
+            segment_redecode_validated = bool(
+                getattr(
+                    local_state,
+                    "_voxbridge_segment_final_redecode_validated",
+                    False,
+                )
+            )
+            if not segment_final_redecode or segment_redecode_validated:
+                await _seal_tts_sources_through_current_segment(reason=str(reason or ""))
+            else:
+                _trace_event(
+                    "tts_source_seal_deferred",
+                    reason=str(reason or ""),
+                    segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    pending_count=int(tts_runtime.ordered.pending_count),
+                    cause="segment_final_redecode_unvalidated",
+                )
             pending_prefix = ""
             if not commit_tail_on_finalize:
                 pending_prefix = str(tentative_after_finalize or "").strip()
@@ -8188,7 +9258,7 @@ def _create_app(
                 take = min(int(local_audio_accum.size), int(segment_overlap_samples))
                 overlap_audio = np.asarray(local_audio_accum[-take:], dtype=np.float32).copy()
 
-            context_elapsed_sec = float(total_consumed_samples) / float(SAMPLE_RATE)
+            context_elapsed_sec = float(source_timeline_samples) / float(SAMPLE_RATE)
             new_state = await asyncio.to_thread(
                 _new_vllm_state,
                 session_force_language,
@@ -8214,6 +9284,13 @@ def _create_app(
             backend_vad.last_cut_at = time.monotonic()
             _reset_backend_vad_segment(reset_cut_clock=True)
             _reset_punct_cut_state("segment_finalize")
+            _reset_context_resume_guard()
+            _arm_context_resume_guard(
+                new_state,
+                skipped=3,
+                reason="segment_open",
+                seq_no=int(seq),
+            )
 
             stream_text_state.last_text = ""
             stream_text_state.accepted_text = ""
@@ -8538,6 +9615,7 @@ def _create_app(
             if canonical_segment_correction:
                 remapped_processed_count = _remap_completed_cursor_after_resegmentation(
                     completed,
+                    list(getattr(subtitle_state, "candidate_texts", []) or []),
                     processed_count,
                 )
                 if remapped_processed_count != processed_count:
@@ -9006,6 +10084,7 @@ def _create_app(
                 )
 
             candidate_sentence_ids = list(getattr(subtitle_state, "candidate_sentence_ids", []) or [])
+            candidate_texts_before = list(getattr(subtitle_state, "candidate_texts", []) or [])
             update_upper = min(processed_count, len(completed), len(candidate_sentence_ids))
             committed_added = 0
             upgraded_count = 0
@@ -9018,6 +10097,76 @@ def _create_app(
                 evaluated_sentence_ids.add(sentence_id)
                 upgraded = str(completed[i] or "").strip()
                 current = str(subtitle_state.committed_sentences[global_idx] or "").strip()
+                if (
+                    canonical_segment_correction
+                    and _canonical_correction_drops_committed_suffix(current, upgraded)
+                ):
+                    _reset_deferred_sentence_upgrade(
+                        sentence_id,
+                        seq_no=seq_no,
+                        reason="canonical_committed_suffix_contraction",
+                        replacement_text=upgraded,
+                    )
+                    _trace_event(
+                        "canonical_committed_suffix_contraction_rejected",
+                        seq=seq_no,
+                        idx=int(i),
+                        sentence_id=sentence_id,
+                        current_chars=len(current),
+                        corrected_chars=len(upgraded),
+                        current_hash8=_hash8(current),
+                        corrected_hash8=_hash8(upgraded),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    _trace_event(
+                        "candidate_action",
+                        seq=seq_no,
+                        idx=int(i),
+                        action="canonical_committed_suffix_contraction_reject",
+                        sentence_id=sentence_id,
+                        text_hash8=_hash8(upgraded),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    continue
+                if (
+                    canonical_segment_correction
+                    and i > 0
+                    and i - 1 < len(candidate_texts_before)
+                    and _has_material_left_boundary_replay(
+                        str(candidate_texts_before[i - 1] or ""),
+                        current,
+                        upgraded,
+                    )
+                ):
+                    _reset_deferred_sentence_upgrade(
+                        sentence_id,
+                        seq_no=seq_no,
+                        reason="canonical_left_boundary_replay",
+                        replacement_text=upgraded,
+                    )
+                    _trace_event(
+                        "canonical_left_boundary_replay_rejected",
+                        seq=seq_no,
+                        idx=int(i),
+                        sentence_id=sentence_id,
+                        previous_candidate_chars=len(str(candidate_texts_before[i - 1] or "").strip()),
+                        current_chars=len(current),
+                        corrected_chars=len(upgraded),
+                        previous_candidate_hash8=_hash8(str(candidate_texts_before[i - 1] or "")),
+                        current_hash8=_hash8(current),
+                        corrected_hash8=_hash8(upgraded),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    _trace_event(
+                        "candidate_action",
+                        seq=seq_no,
+                        idx=int(i),
+                        action="canonical_left_boundary_replay_reject",
+                        sentence_id=sentence_id,
+                        text_hash8=_hash8(upgraded),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                    )
+                    continue
                 context_run = _streaming_context_run(upgraded)
                 if context_run is not None:
                     run_start, run_end, run_count = context_run
@@ -9600,7 +10749,10 @@ def _create_app(
         def _drop_oldest_audio() -> bool:
             nonlocal queue_samples, audio_spill_generation, audio_spill_samples
             try:
-                _, dropped_wav = audio_queue.get_nowait()
+                dropped_gen, dropped_wav = audio_queue.get_nowait()
+                if isinstance(dropped_wav, ClientSilenceSpan):
+                    deferred_audio_items.append((int(dropped_gen), dropped_wav))
+                    return False
                 queue_samples = max(0, int(queue_samples - int(getattr(dropped_wav, "size", 0))))
                 stats.queue_dropped += 1
                 return True
@@ -9667,9 +10819,34 @@ def _create_app(
                 )
 
         def _clear_audio_queue() -> int:
+            nonlocal queue_samples, audio_spill_generation, audio_spill_samples
             dropped = 0
-            while _drop_oldest_audio():
+            while deferred_audio_items:
+                _, item = deferred_audio_items.pop(0)
+                if not isinstance(item, ClientSilenceSpan):
+                    queue_samples = max(
+                        0,
+                        int(queue_samples - int(getattr(item, "size", 0))),
+                    )
                 dropped += 1
+            while True:
+                try:
+                    _, item = audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not isinstance(item, ClientSilenceSpan):
+                    queue_samples = max(
+                        0,
+                        int(queue_samples - int(getattr(item, "size", 0))),
+                    )
+                dropped += 1
+            while audio_spill_parts:
+                dropped_wav = audio_spill_parts.pop(0)
+                dropped_samples = int(getattr(dropped_wav, "size", 0))
+                audio_spill_samples = max(0, int(audio_spill_samples - dropped_samples))
+                queue_samples = max(0, int(queue_samples - dropped_samples))
+                dropped += 1
+            audio_spill_generation = None
             return dropped
 
         def _enqueue_audio(gen: int, wav: np.ndarray) -> None:
@@ -9745,6 +10922,23 @@ def _create_app(
                     frame_samples=int(wav.size),
                 )
 
+        async def _enqueue_client_silence(gen: int, span: ClientSilenceSpan) -> None:
+            # A control span is an ordering barrier. Flush older spill audio before
+            # placing it in the consumer queue and never count it as PCM pressure.
+            while audio_spill_parts:
+                _flush_audio_spill()
+                if audio_spill_parts:
+                    await asyncio.sleep(0.005)
+            await audio_queue.put((int(gen), span))
+            stats.queue_depth_peak = max(stats.queue_depth_peak, int(audio_queue.qsize()))
+            _trace_event(
+                "client_silence_queued",
+                duration_ms=int(span.duration_ms),
+                capture_sample_index=int(span.capture_sample_index),
+                queue_depth=int(audio_queue.qsize()),
+                queue_samples=int(queue_samples),
+            )
+
         def _coalesce_audio_frames(gen: int, wav: np.ndarray) -> np.ndarray:
             nonlocal queue_samples
             depth_before = int(audio_queue.qsize())
@@ -9767,6 +10961,9 @@ def _create_app(
                     next_gen, next_wav = audio_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                if isinstance(next_wav, ClientSilenceSpan):
+                    deferred_audio_items.append((int(next_gen), next_wav))
+                    break
                 queue_samples = max(0, int(queue_samples - int(next_wav.size)))
                 if int(next_gen) != int(gen):
                     continue
@@ -9785,6 +10982,107 @@ def _create_app(
                 queue_sec=round(float(pressure.queue_sec), 3),
             )
             return np.concatenate(chunks, axis=0)
+
+        async def _consume_client_silence(
+            span: ClientSilenceSpan,
+            local_state: Any,
+        ) -> None:
+            duration_ms = max(1.0, float(span.duration_ms))
+            backend_vad.segment_elapsed_ms = float(backend_vad.segment_elapsed_ms) + duration_ms
+            backend_vad.speech_confirm_ms = max(
+                0.0,
+                float(backend_vad.speech_confirm_ms) - duration_ms,
+            )
+            if bool(backend_vad.in_speech):
+                backend_vad.silence_ms = float(backend_vad.silence_ms) + duration_ms
+
+            since_last_cut_ms = (
+                time.monotonic() - float(backend_vad.last_cut_at)
+            ) * 1000.0
+            can_cut = bool(
+                backend_vad.in_speech
+                and float(backend_vad.segment_elapsed_ms) >= float(vad_min_slice_ms)
+                and float(backend_vad.segment_active_ms) >= float(vad_min_active_ms)
+                and float(backend_vad.silence_ms) >= float(vad_silence_trigger_ms)
+                and since_last_cut_ms >= min(float(vad_min_slice_ms), 1500.0)
+            )
+            force_cut = bool(
+                can_cut
+                and float(backend_vad.silence_ms) >= float(vad_force_silence_ms)
+            )
+            signal = {
+                "candidate": bool(can_cut),
+                "force": bool(force_cut),
+                "silence_ms": float(backend_vad.silence_ms),
+                "snr_db": -120.0,
+                "segment_active_ms": float(backend_vad.segment_active_ms),
+                "segment_elapsed_ms": float(backend_vad.segment_elapsed_ms),
+            }
+
+            skipped_batches = max(
+                1,
+                int(
+                    (
+                        int(span.duration_ms)
+                        + max(1, int(getattr(args, "client_chunk_ms", 200)))
+                        - 1
+                    )
+                    // max(1, int(getattr(args, "client_chunk_ms", 200)))
+                ),
+            )
+            pending_endpoint_text = str(
+                last_text_snapshot or getattr(local_state, "text", "") or ""
+            ).strip()
+            preserve_endpoint_tail = bool(
+                getattr(backend_vad, "in_speech", False) and pending_endpoint_text
+            )
+            discarded_preroll_samples = 0
+            if not preserve_endpoint_tail:
+                discarded_preroll_samples = int(decode_pre_roll.buffered_samples)
+                decode_pre_roll.clear()
+                if discarded_preroll_samples > 0:
+                    _trace_event(
+                        "idle_preroll_discarded",
+                        samples=int(discarded_preroll_samples),
+                        duration_ms=int(
+                            round(
+                                float(discarded_preroll_samples)
+                                * 1000.0
+                                / SAMPLE_RATE
+                            )
+                        ),
+                        reason="client_silence_without_active_text",
+                    )
+            stats.silent_decode_skipped += skipped_batches
+            _arm_context_resume_guard(
+                local_state,
+                skipped=max(3, int(stats.silent_decode_skipped)),
+                reason="client_silence",
+                seq_no=int(seq or 0),
+            )
+            stats.client_silence_events += 1
+            stats.client_silence_ms += int(span.duration_ms)
+            _trace_event(
+                "client_silence_applied",
+                duration_ms=int(span.duration_ms),
+                capture_sample_index=int(span.capture_sample_index),
+                silence_ms=int(float(backend_vad.silence_ms)),
+                segment_elapsed_ms=int(float(backend_vad.segment_elapsed_ms)),
+                segment_active_ms=int(float(backend_vad.segment_active_ms)),
+                vad_candidate=bool(can_cut),
+                vad_force=bool(force_cut),
+                endpoint_tail_buffered_samples=int(decode_pre_roll.buffered_samples),
+                idle_preroll_discarded_samples=int(discarded_preroll_samples),
+                context_guard_active=bool(context_resume_guard.active),
+                asr_decode=False,
+            )
+            await _maybe_vad_silence_cut(
+                signal,
+                str(last_text_snapshot or ""),
+                str(getattr(local_state, "language", "") or ""),
+                int(seq or 0),
+            )
+            await _maybe_idle_tail_commit()
 
         async def _audio_consumer() -> None:
             nonlocal seq, finished, state
@@ -9831,11 +11129,19 @@ def _create_app(
 
             while not stop_consumer.is_set():
                 _flush_audio_spill()
-                if finish_requested and audio_queue.empty() and not audio_spill_parts:
+                if (
+                    finish_requested
+                    and audio_queue.empty()
+                    and not audio_spill_parts
+                    and not deferred_audio_items
+                ):
                     break
                 _relieve_hard_overflow_if_needed()
                 try:
-                    gen, wav = await asyncio.wait_for(audio_queue.get(), timeout=0.2)
+                    if deferred_audio_items:
+                        gen, wav = deferred_audio_items.pop(0)
+                    else:
+                        gen, wav = await asyncio.wait_for(audio_queue.get(), timeout=0.2)
                 except asyncio.TimeoutError:
                     _flush_audio_spill()
                     _relieve_hard_overflow_if_needed()
@@ -9852,13 +11158,17 @@ def _create_app(
                         int(seq or 0),
                     )
                     continue
-                queue_samples = max(0, int(queue_samples - int(wav.size)))
+                if not isinstance(wav, ClientSilenceSpan):
+                    queue_samples = max(0, int(queue_samples - int(wav.size)))
                 _flush_audio_spill()
 
                 async with state_lock:
                     local_state = state
                     local_gen = state_generation
                 if local_state is None or gen != local_gen:
+                    continue
+                if isinstance(wav, ClientSilenceSpan):
+                    await _consume_client_silence(wav, local_state)
                     continue
                 wav = _coalesce_audio_frames(gen, wav)
                 total_consumed_samples += int(wav.size)
@@ -9896,7 +11206,9 @@ def _create_app(
                                 >= float(silero_shadow_threshold)
                             )
                             if shadow_confirms_speech:
-                                context_resume_guard.silero_speech_samples += int(wav.size)
+                                context_resume_guard.silero_speech_samples += int(
+                                    shadow.frames * silero_shadow_observer.frame_samples
+                                )
                             else:
                                 context_resume_guard.silero_speech_samples = 0
                             if int(context_resume_guard.silero_speech_samples) >= int(
@@ -9934,6 +11246,17 @@ def _create_app(
                         if (now_shadow - float(silero_shadow_last_log_at)) >= silero_shadow_log_sec:
                             _trace_event("silero_shadow_observation", **common_shadow_fields)
                             silero_shadow_last_log_at = now_shadow
+                elif (
+                    bool(context_resume_guard.active)
+                    and bool(getattr(backend_vad, "in_speech", False))
+                    and float(getattr(backend_vad, "segment_active_ms", 0.0) or 0.0)
+                    >= 200.0
+                ):
+                    context_resume_guard.speech_confirmed = True
+                    _release_context_resume_guard(
+                        reason="energy_speech_confirmed",
+                        seq_no=int(seq or 0),
+                    )
                 if should_skip_decode:
                     decode_pre_roll.append(wav)
                     stats.silent_decode_skipped += 1
@@ -9993,6 +11316,9 @@ def _create_app(
                 if use_vllm_streaming:
                     async with infer_lock:
                         await asyncio.to_thread(asr.streaming_transcribe, wav, local_state)
+                        local_state._voxbridge_stream_decode_count = int(
+                            getattr(local_state, "_voxbridge_stream_decode_count", 0) or 0
+                        ) + 1
                         _guard_streaming_context_output(local_state, reason="partial")
                     async with state_lock:
                         if local_state is not state or gen != state_generation:
@@ -10212,15 +11538,49 @@ def _create_app(
             canonical_redecode_applied = False
             stop_context_final_applied = False
             if use_vllm_streaming:
-                async with infer_lock:
-                    await asyncio.to_thread(asr.finish_streaming_transcribe, local_state)
-                    _guard_streaming_context_output(
-                        local_state,
+                stream_decode_count = int(
+                    getattr(local_state, "_voxbridge_stream_decode_count", 0) or 0
+                )
+                if stream_decode_count > 0:
+                    async with infer_lock:
+                        await _flush_pending_decode_tail(
+                            local_state,
+                            reason=str(finish_reason or finish_mode or "stop"),
+                        )
+                        await asyncio.to_thread(asr.finish_streaming_transcribe, local_state)
+                        _guard_streaming_context_output(
+                            local_state,
+                            reason=str(finish_reason or finish_mode or "stop"),
+                        )
+                        if finish_mode == "stop" and not final_redecode_on_stop:
+                            local_state._voxbridge_segment_final_redecode_validated = True
+                            local_state._voxbridge_segment_final_redecode_applied = False
+                            _trace_event(
+                                "segment_final_redecode_skipped",
+                                reason="user_stop",
+                                cut_reason=str(finish_reason or finish_mode or "stop"),
+                                audio_samples=int(
+                                    np.asarray(
+                                        getattr(local_state, "audio_accum", np.zeros((0,), dtype=np.float32))
+                                    ).size
+                                ),
+                            )
+                        else:
+                            stop_context_final_applied = await _apply_segment_final_context(
+                                local_state,
+                                reason=str(finish_reason or finish_mode or "stop"),
+                            )
+                else:
+                    discarded_tail_samples = int(decode_pre_roll.buffered_samples)
+                    decode_pre_roll.clear()
+                    local_state.text = ""
+                    if hasattr(local_state, "_raw_decoded"):
+                        local_state._raw_decoded = ""
+                    _trace_event(
+                        "stream_finish_skipped_no_decode",
                         reason=str(finish_reason or finish_mode or "stop"),
-                    )
-                    stop_context_final_applied = await _apply_segment_final_context(
-                        local_state,
-                        reason=str(finish_reason or finish_mode or "stop"),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        discarded_tail_samples=int(discarded_tail_samples),
                     )
                 if finish_mode == "stop" and final_redecode_on_stop:
                     if _tts_output_active():
@@ -10559,12 +11919,23 @@ def _create_app(
 
                     stats.raw_frames += 1
                     stats.raw_samples += int(wav.size)
+                    replayed_timeline_samples = min(
+                        int(client_replay_samples_remaining),
+                        int(wav.size),
+                    )
+                    client_replay_samples_remaining = max(
+                        0,
+                        int(client_replay_samples_remaining - replayed_timeline_samples),
+                    )
+                    source_timeline_samples += int(wav.size) - replayed_timeline_samples
                     if stats.raw_frames <= 3 or stats.raw_frames % 40 == 0:
                         _trace_event(
                             "audio_frame_recv",
                             raw_frames=int(stats.raw_frames),
                             raw_samples=int(stats.raw_samples),
                             frame_samples=int(wav.size),
+                            source_timeline_samples=int(source_timeline_samples),
+                            replayed_timeline_samples=int(replayed_timeline_samples),
                         )
                     if final_redecode_on_stop:
                         if final_redecode_max_samples <= 0:
@@ -10700,6 +12071,8 @@ def _create_app(
                             last_text_advance_at = time.monotonic()
                             last_idle_commit_at = 0.0
                             total_consumed_samples = 0
+                            source_timeline_samples = 0
+                            client_replay_samples_remaining = 0
                             queue_samples = 0
                             last_partial_emit_at = time.monotonic()
                             segment_runtime.id = 1
@@ -10711,12 +12084,7 @@ def _create_app(
                             full_audio_samples = 0
                             full_audio_overflow = False
                             segment_final_context_applied = False
-                            context_resume_guard.until = 0.0
-                            context_resume_guard.active = False
-                            context_resume_guard.skipped = 0
-                            context_resume_guard.speech_confirmed = False
-                            context_resume_guard.silero_speech_samples = 0
-                            context_resume_guard.last_text_hash8 = ""
+                            _reset_context_resume_guard()
                             async with state_lock:
                                 state_generation += 1
                                 state = new_state
@@ -10734,6 +12102,13 @@ def _create_app(
                                 translation_runtime.source_language,
                                 translation_runtime.target_language,
                             ) = _resolve_direction_languages(requested_translation_direction)
+                            stale_hls_backlog = await app.state.tts_hls.discard_idle_backlog()
+                            if stale_hls_backlog:
+                                _trace_event(
+                                    "tts_hls_idle_backlog_reset",
+                                    dropped=int(stale_hls_backlog),
+                                    reason="new_producer_session",
+                                )
                             tts_runtime.session_issued_job_count = 0
                             await _configure_tts(
                                 requested_tts_enabled,
@@ -10839,6 +12214,82 @@ def _create_app(
                             await _send_json(
                                 {"type": "error", "message": str(exc.detail)}
                             )
+                        continue
+
+                    if msg_type == "audio_speech_start":
+                        try:
+                            capture_sample_index = _bounded_json_int(
+                                payload,
+                                "capture_sample_index",
+                                minimum=0,
+                                maximum=(2**53) - 1,
+                            )
+                            preroll_samples = _bounded_json_int(
+                                payload,
+                                "preroll_samples",
+                                minimum=0,
+                                maximum=2 * SAMPLE_RATE,
+                            )
+                        except ValueError as exc:
+                            stats.last_error = str(exc)
+                            _trace_event(
+                                "audio_speech_start_rejected",
+                                error=str(exc),
+                            )
+                            await _send_json({"type": "error", "message": str(exc)})
+                            continue
+                        source_timeline_samples = max(
+                            int(source_timeline_samples),
+                            int(capture_sample_index),
+                        )
+                        client_replay_samples_remaining = max(
+                            int(client_replay_samples_remaining),
+                            int(preroll_samples),
+                        )
+                        _trace_event(
+                            "client_speech_start",
+                            capture_sample_index=int(capture_sample_index),
+                            preroll_samples=int(preroll_samples),
+                            source_timeline_samples=int(source_timeline_samples),
+                            context_guard_active=bool(context_resume_guard.active),
+                        )
+                        continue
+
+                    if msg_type == "audio_silence":
+                        try:
+                            duration_ms = _bounded_json_int(
+                                payload,
+                                "duration_ms",
+                                minimum=1,
+                                maximum=5000,
+                            )
+                            capture_sample_index = _bounded_json_int(
+                                payload,
+                                "capture_sample_index",
+                                minimum=0,
+                                maximum=(2**53) - 1,
+                            )
+                        except ValueError as exc:
+                            stats.last_error = str(exc)
+                            _trace_event(
+                                "audio_silence_rejected",
+                                error=str(exc),
+                            )
+                            await _send_json({"type": "error", "message": str(exc)})
+                            continue
+                        source_timeline_samples = max(
+                            int(source_timeline_samples),
+                            int(capture_sample_index),
+                        )
+                        async with state_lock:
+                            control_generation = int(state_generation)
+                        await _enqueue_client_silence(
+                            control_generation,
+                            ClientSilenceSpan(
+                                duration_ms=int(duration_ms),
+                                capture_sample_index=int(capture_sample_index),
+                            ),
+                        )
                         continue
 
                     if msg_type == "finish":
@@ -11262,6 +12713,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum unread TTS metadata events buffered per listener device",
     )
     p.add_argument(
+        "--tts-hls-max-listeners",
+        type=_positive_int_arg,
+        default=128,
+        help="Maximum concurrent public shared-HLS listener leases",
+    )
+    p.add_argument(
         "--tts-final-translation-drain-sec",
         type=float,
         default=30.0,
@@ -11458,9 +12915,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--final-redecode-on-stop",
-        default=True,
+        default=False,
         action=argparse.BooleanOptionalAction,
-        help="On stop mode, run a one-shot full-audio decode and use it as final canonical text",
+        help="On stop mode, opt in to a blocking full-audio decode and canonical subtitle rebuild",
+    )
+    p.add_argument(
+        "--segment-final-redecode",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Before committing each completed streaming segment, run a bounded one-shot decode "
+            "to validate and repair unstable sentence tails"
+        ),
     )
     p.add_argument(
         "--final-redecode-max-sec",

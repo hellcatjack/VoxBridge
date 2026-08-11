@@ -73,6 +73,7 @@ class TTSWaitState:
     remaining_ms: int
     blocked_by_earlier: bool
     waiting_for_latest_grace: bool
+    waiting_for_segment_seal: bool
 
 
 @dataclass(slots=True)
@@ -95,6 +96,7 @@ class RevisionStableTTSBuffer:
         *,
         stable_sec: float,
         latest_revision_grace_sec: float = 0.0,
+        hold_latest_until_sealed: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if stable_sec < 0:
@@ -103,6 +105,7 @@ class RevisionStableTTSBuffer:
             raise ValueError("latest_revision_grace_sec must not be negative")
         self._stable_sec = float(stable_sec)
         self._latest_revision_grace_sec = float(latest_revision_grace_sec)
+        self._hold_latest_until_sealed = bool(hold_latest_until_sealed)
         self._clock = clock
         self._entries: dict[int, _RevisionStableEntry] = {}
         self._sentence_orders: dict[str, int] = {}
@@ -297,11 +300,16 @@ class RevisionStableTTSBuffer:
     def _release_policy(
         self,
         entry: _RevisionStableEntry,
-    ) -> tuple[float, str, bool]:
+    ) -> tuple[float | None, str, bool, bool]:
         if entry.source_order <= self._sealed_through:
-            return 0.0, "source_sealed", False
+            return 0.0, "source_sealed", False, False
         if entry.source_order <= self._confirmed_through:
-            return self._stable_sec, "rollback_safe", False
+            return self._stable_sec, "rollback_safe", False, False
+        if (
+            entry.source_order == self._highest_source_order
+            and self._hold_latest_until_sealed
+        ):
+            return None, "segment_seal", False, True
         if (
             entry.source_order == self._highest_source_order
             and self._latest_revision_grace_sec > 0
@@ -310,8 +318,9 @@ class RevisionStableTTSBuffer:
                 self._stable_sec + self._latest_revision_grace_sec,
                 "latest_revision_grace",
                 True,
+                False,
             )
-        return self._stable_sec, "quiet_window", False
+        return self._stable_sec, "quiet_window", False, False
 
     def wait_state(self, sentence_id: str) -> TTSWaitState | None:
         sid = self._require_sentence_id(sentence_id)
@@ -322,17 +331,27 @@ class RevisionStableTTSBuffer:
             if entry is None or entry.status != "ready":
                 return None
             quiet_age_ms = self._elapsed_ms(entry.changed_at, now)
-            required_sec, _, waiting_for_latest_grace = self._release_policy(entry)
-            required_ms = int(round(required_sec * 1000.0))
+            (
+                required_sec,
+                _,
+                waiting_for_latest_grace,
+                waiting_for_segment_seal,
+            ) = self._release_policy(entry)
+            required_ms = (
+                -1 if required_sec is None else int(round(required_sec * 1000.0))
+            )
             return TTSWaitState(
                 sentence_id=sid,
                 revision=int(entry.revision),
                 source_order=int(entry.source_order),
                 quiet_age_ms=quiet_age_ms,
                 required_quiet_ms=required_ms,
-                remaining_ms=max(0, required_ms - quiet_age_ms),
+                remaining_ms=(
+                    -1 if required_sec is None else max(0, required_ms - quiet_age_ms)
+                ),
                 blocked_by_earlier=entry.source_order != self._next_order,
                 waiting_for_latest_grace=waiting_for_latest_grace,
+                waiting_for_segment_seal=waiting_for_segment_seal,
             )
 
     def next_deadline(self) -> float | None:
@@ -340,7 +359,9 @@ class RevisionStableTTSBuffer:
             entry = self._entries.get(self._next_order)
             if entry is None or entry.status != "ready":
                 return None
-            required_sec, _, _ = self._release_policy(entry)
+            required_sec, _, _, _ = self._release_policy(entry)
+            if required_sec is None:
+                return None
             return float(entry.changed_at + required_sec)
 
     def drain(self, *, force: bool = False) -> list[TTSReadyItem]:
@@ -355,8 +376,10 @@ class RevisionStableTTSBuffer:
                     del self._entries[self._next_order]
                     self._next_order += 1
                     continue
-                required_sec, release_reason, _ = self._release_policy(entry)
-                if not force and now < entry.changed_at + required_sec:
+                required_sec, release_reason, _, _ = self._release_policy(entry)
+                if not force and (
+                    required_sec is None or now < entry.changed_at + required_sec
+                ):
                     break
                 del self._entries[self._next_order]
                 self._next_order += 1

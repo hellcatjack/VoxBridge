@@ -168,6 +168,39 @@ def test_newest_source_uses_additional_revision_grace():
     assert ready[0].release_reason == "latest_revision_grace"
 
 
+def test_newest_source_can_require_segment_seal_before_release():
+    clock = FakeClock(100.0)
+    buffer = RevisionStableTTSBuffer(
+        stable_sec=3.0,
+        latest_revision_grace_sec=4.0,
+        hold_latest_until_sealed=True,
+        clock=clock,
+    )
+    buffer.register("s1", 1, 0)
+    buffer.mark_ready("s1", 1, "first", "English")
+
+    clock.advance(60.0)
+    assert buffer.drain() == []
+    assert buffer.next_deadline() is None
+    wait = buffer.wait_state("s1")
+    assert wait is not None
+    assert wait.required_quiet_ms == -1
+    assert wait.remaining_ms == -1
+    assert wait.waiting_for_latest_grace is False
+    assert wait.waiting_for_segment_seal is True
+
+    buffer.register("s2", 1, 1)
+    assert [item.text for item in buffer.drain()] == ["first"]
+    buffer.mark_ready("s2", 1, "second", "English")
+    clock.advance(60.0)
+    assert buffer.drain() == []
+
+    assert buffer.seal_through(1) is True
+    ready = buffer.drain()
+    assert [item.text for item in ready] == ["second"]
+    assert ready[0].release_reason == "source_sealed"
+
+
 def test_successor_removes_latest_grace_from_preceding_source():
     clock = FakeClock(100.0)
     buffer = RevisionStableTTSBuffer(

@@ -8,7 +8,8 @@ VoxBridge 是一个面向会议、新闻和演讲场景的实时语音识别与�
 - 支持 `中文 -> 英文` 和 `英文 -> 中文`；启动后锁定方向，避免 ASR 语言与翻译方向漂移。
 - 每个 WebSocket 会话维护独立的 streaming state；VAD、硬时长轮转、最终 flush 和重叠处理均由后端负责。
 - 使用有界音频队列和背压机制，避免长时间会话无限积压。
-- 静音省算力期间保留最近 400 ms 未送入 ASR 的音频，恢复时一次补送，保护轻声起音；可选 Silero VAD 只写影子日志，不参与在线切段。
+- 浏览器保留短停顿原始 PCM；确认超过 700 ms 的长静音时保留前 400 ms 低能量句尾、把其余静音压缩为有序控制事件，恢复时补送最近 400 ms pre-roll，后端仍独占 VAD、切段和固化决策。
+- 后端静音省算力期间不会把前端静音控制事件送入 ASR；全程只有静音控制事件的 state 也不会在 Stop 时调用 ASR finish。可选 Silero VAD 继续只影响 context 恢复保护，不改变全局在线切段。
 - 后端通过 `sentence_id` 和 `revision` 明确区分新句、稳定修订和对应翻译，前端不使用固定词表猜测稳定性。
 - 支持页面输入会话级专业术语 Context，也支持后端加载有界、分时段的 context schedule。
 - 最近 100 条字幕可滚动查询；默认跟随最新内容，用户手动滚动时暂停自动跟随。
@@ -19,7 +20,7 @@ VoxBridge 是一个面向会议、新闻和演讲场景的实时语音识别与�
 ## 工作流程
 
 ```text
-Browser PCM audio
+Browser PCM + audio activity events
   -> WebSocket /ws
   -> bounded audio queue
   -> backend VAD / hard segment rotation
@@ -27,13 +28,13 @@ Browser PCM audio
   -> sentence_id + revision
   -> OpenAI-compatible translation API
   -> bilingual subtitle rows
-  -> stable translation broadcast job
-  -> /ws/tts listener snapshot
-  -> shared Kokoro WAV synthesis
-  -> independent device FIFO playback
+  -> stable translation HLS queue
+  -> one shared Kokoro synthesis worker
+  -> one continuous AAC/HLS live stream
+  -> native playback on every listener device
 ```
 
-浏览器只负责持续发送 PCM 音频和渲染后端事件。生成中的 `partial` 可以变化；已固化句子或长句中的稳定子句通过 `sentence_committed` 创建，通过 `sentence_updated` 更新同一个 `sentence_id`。稳定子句只影响字幕与翻译单元，不会在逗号处切换 ASR state。翻译结果绑定具体 `revision`，过期结果不会覆盖新文本。
+浏览器只负责音频传输优化和渲染后端事件，不判断句子边界。小于 700 ms 的短停顿会连同语音原样发送；确认长静音时仅保留前 400 ms 作为低能量句尾保护，其余静音通过 `audio_silence` 推进后端静音时钟而不进入模型。后端在 final 前只补解码尚未送入 ASR 的有界尾音，不在持续静音期间反复推理。生成中的 `partial` 可以变化；已固化句子或长句中的稳定子句通过 `sentence_committed` 创建，通过 `sentence_updated` 更新同一个 `sentence_id`。稳定子句只影响字幕与翻译单元，不会在逗号处切换 ASR state。翻译结果绑定具体 `revision`，过期结果不会覆盖新文本。
 
 ## 系统要求
 
@@ -45,6 +46,13 @@ Browser PCM audio
 - VoxBridge 本地服务固定使用端口 `8024`。
 
 项目依赖固定包含 `qwen-asr[vllm]==0.0.6`。GPU 运行时兼容性应在安装 VoxBridge 前单独验证。
+
+### macOS 浏览器客户端
+
+- Safari 14.1+、macOS Chrome 和 Edge 均可使用麦克风输入。采集优先使用 AudioWorklet；不可用或初始化失败时回退到 ScriptProcessor。
+- 麦克风和屏幕采集必须通过 HTTPS/WSS，只有 `localhost` 本地开发例外。
+- “系统声音”依赖浏览器和 macOS 对 `getDisplayMedia` 音轨的实际支持。页面会检查返回的 audio track；浏览器没有提供音轨时会明确终止启动，不会建立一个伪静音会话。
+- 需要采集浏览器标签页或其它应用声音时优先使用当前版 Chrome/Edge，并在共享选择器中确认音频选项。Safari 可稳定用于麦克风输入，但不能假定所有 Safari/macOS 组合都支持系统音频共享。
 
 ## 安装
 
@@ -82,11 +90,12 @@ uv pip install --python .venv/bin/python --no-deps 'silero-vad==6.2.1'
 
 ```bash
 .venv/bin/python -m voxbridge.cli.demo_streaming_ws \
-  --asr-model-path Qwen/Qwen3-ASR-0.6B \
+  --asr-model-path Qwen/Qwen3-ASR-1.7B \
   --backend vllm \
   --host 127.0.0.1 \
   --port 8024 \
-  --mm-processor-cache-gb 0.5
+  --mm-processor-cache-gb 0.5 \
+  --segment-final-redecode
 ```
 
 确认服务：
@@ -106,7 +115,7 @@ ss -lntp | rg ':8024'
 --silero-vad-shadow-log-sec 1.0
 ```
 
-pre-roll 只缓存现有门控原本会跳过的音频，恢复推理后立即清空。Silero 加载或推理失败只会产生 `silero_shadow_unavailable`，不会阻断 ASR、翻译或 TTS。
+pre-roll 只缓存现有门控原本会跳过的音频：恢复推理时重放一次；若直接到达段落端点，则在 final 前作为有界尾音解码一次。Silero 加载或推理失败只会产生 `silero_shadow_unavailable`，不会阻断 ASR、翻译或 TTS。
 
 ## 翻译与 Context
 
@@ -135,15 +144,19 @@ pre-roll 只缓存现有门控原本会跳过的音频，恢复推理后立即�
 
 ## 译文朗读（Kokoro-82M）
 
-译文朗读必须同时启用翻译和 `--enable-tts`。主字幕页不播放音频，只提供独立 `/listen` 页面入口；手机、平板或其他电脑通过同一 HTTPS 地址登录后打开 `/listen`，点击该设备自己的 Start 即可监听。多个设备可以同时连接，彼此的 Start、Stop、下载和播放进度互不干扰。
+译文朗读必须同时启用翻译和 `--enable-tts`，并要求系统可执行文件中存在 `ffmpeg`。主字幕页不播放音频，只提供独立 `/listen` 页面入口；该入口免登录，固定公开地址为 `https://ushome.amycat.com:18024/listen`，主页面默认显示指向它的本地静态二维码。Pittsburgh Christian Church South（PCCS）专用监听页全部使用英文，并固定在一个浏览器视口内，不产生页面滚动条。手机、平板或其他电脑扫码后点击该设备自己的 Start 即可监听。
 
-监听连接是 future-only：仅接收连接后产生的稳定译文，不回放连接前的历史任务。后端只为 `is_stable: true` 的完整译文创建广播任务；多个翻译 worker 即使乱序完成，也会按源句顺序发布。每条译文只合成一次共享 WAV，每个设备都按严格 FIFO 下载完整音频、确认接收、等待播放结束，再处理下一条。慢设备只增加自己的待播延迟；队列溢出时只断开该监听者。
+监听页把一个持续的原生 HLS 音频元素直接绑定到这次用户点击，后端在没有译文时持续写入静音 AAC，因此 iPhone 锁屏后不需要 JavaScript 唤醒、切换音频文件或继续运行 WebSocket 计时器。主字幕页、ASR WebSocket、登录和管理接口仍受原有认证保护；只有监听页、二维码、共享直播状态和 listener-scoped HLS 能力端点公开。
+
+共享 HLS 使用 bounded pre-listener backlog：当前 ASR 会话中已经通过 revision 稳定门、但发布时尚无监听设备的译文，会保留在最多 128 项的有界待播池中。首台设备加入后按源句顺序交给同一个 Kokoro worker 预合成，避免字幕区已有大量稳定译文、朗读却只能等待下一句的空窗；超过上限时仅淘汰最旧的未播项。新 ASR 会话开始时，如果没有活跃监听或编码器，会清除上一会话的待播池，防止跨会议串音。
+
+多个翻译 worker 即使乱序完成，也会按源句顺序发布。无论同时连接多少台设备，每条译文只由一个 Kokoro worker 合成一次，也只进入一个 FFmpeg 编码器；设备读取同一套 HLS 分片。设备 Stop 仅删除自己的租约，最后一个租约离开或超过 90 秒未刷新后，后端关闭共享编码器并清理临时分片，但之后产生的稳定译文仍可进入有界待播池。页面 `playback speed` 只调整设备消费已编码 HLS 的速度，不能删除已经编码进时间线的静音。低速播放落后 live edge 达到 12 秒时会临时以 `1.2x` 追赶，回到 5 秒内后恢复用户选择；页面进入锁屏/后台时最低使用 `1.0x`，全程不 seek、不丢弃译文语音。
 
 每台监听设备可在 `/listen` 独立选择 `0.8x`、`0.9x`、`1.0x`、`1.1x` 或 `1.2x` 朗读速度。选择保存在该浏览器中，播放期间修改会立即生效，Stop、重连和刷新不会重置；旧版页面保存的其它倍速会安全回退到 `1.0x`。该设置不影响其他设备，也不会让后端重复合成共享 WAV。
 
-监听页采用有界单条预取：当前译文朗读期间只提前合成并下载严格 FIFO 中的下一条，不会把整个待播队列载入内存。下一条到达播放位置时会直接复用已准备的 WAV；Stop、断线或刷新会取消尚未完成的预取。若 Kokoro 在当前音频结束前仍未完成下一条合成，播放器会继续等待，因此该机制显著减少正常切换停顿，但不承诺采样级无缝衔接。
+共享 HLS 在服务器端保持严格 FIFO。Kokoro 输出的 PCM 后固定追加 `300ms` 句号停顿，再写入同一条连续音频时间线；停顿不分析中英文文本。译文队列和 FFmpeg 前的 PCM 队列都有上限，编码变慢时通过背压限制内存增长，而不是按监听设备复制音频或启动额外合成任务。`GET /api/tts/live/status` 的 `pending_audio_ms` 显示已经合成、仍在等待写入实时 HLS 时间线的音频时长。
 
-每条成功朗读结束后固定保留 `300ms` 句号停顿，再播放已预取的下一条。该停顿不分析中英文文本、不随朗读倍速变化，也不会暂停后台合成和下载；Stop、断线和刷新会立即取消尚未结束的等待。
+有活跃监听设备时，后端会在译文生成后按精确的 `sentence_id + revision + target_language + text hash` 提前执行 Kokoro，但不会提前把音频写入 HLS。只有原有 revision 稳定门按源顺序放行后，缓存命中的 PCM 才能进入直播时间线；译文修订会立即使旧缓存失效。预合成缓存最多保留 8 项，仍由同一个 Kokoro worker 串行处理，因此不会因设备数量增加 CPU 消耗，也不会降低 3 秒稳定门。
 
 模型资产不进入 Git。部署时在 `models/kokoro/` 放置：
 
@@ -152,9 +165,9 @@ pre-roll 只缓存现有门控原本会跳过的音频，恢复推理后立即�
 
 模型来源应使用 [kokoro-onnx 官方 release](https://github.com/thewh1teagle/kokoro-onnx/releases) 和 [Kokoro-82M-v1.1-zh 官方模型页](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)。完整启动参数见 [部署指南](docs/DEPLOYMENT.md)。
 
-主字幕页 Stop 会先等待尚未完成的稳定译文并发布朗读任务，但不会等待音频合成或设备播放。监听页 Stop 只停止当前设备并清空它的本地待播队列，不影响其他设备；重新 Start 后仍只接收后续译文。公开部署必须启用登录认证，避免未授权设备接入译文广播。使用系统音频输入时，建议让朗读设备与采集设备分离或使用耳机，避免回采。
+主字幕页 Stop 会先等待尚未完成的稳定译文并发布朗读任务，但不会等待音频合成或设备播放。监听页 Stop 只停止当前设备，不影响其他设备或共享时间线；重新 Start 后从当时的 live edge 继续收听。公开部署必须为主字幕和 ASR 启用登录认证并使用 HTTPS；公开监听直播本身不含访问控制，因此应将二维码和地址视作公开会议信息。随机 listener ID 只作为短期 bearer capability，默认最多保留 128 个并发租约，避免公开入口被无界占用。使用系统音频输入时，建议让朗读设备与采集设备分离或使用耳机，避免回采。
 
-可见字幕和译文继续实时更新；朗读采用更严格的后端稳定门。普通来源仍使用 `--tts-revision-stable-sec 3.0`，只有当前最新且尚未封存的来源再使用 `--tts-latest-revision-grace-sec 4.0` 防止发布后修订。这不是全局 7 秒延时：注册后继来源后，前一句立即恢复普通 3 秒规则；后端完成分段 final reconcile 后会封存本段来源并放行已就绪译文。若同一句在保护期内收到更高 revision，旧译文不会进入朗读队列。正常 Stop 仍会在最终 ASR 与翻译完成后排空最后的 ready 版本。
+可见字幕和译文继续实时更新；朗读采用更严格的后端稳定门。推荐启用 `--segment-final-redecode`：自然 VAD 端点在固化、翻译和 TTS 封存前，对当前段音频执行一次有界的一次性解码，用相容结果修复流式句尾。讲话中的 hard cut 不执行该阻塞式重解码，避免实时音频在轮转期间堆满队列后被丢弃。段尾校验同时比较上一段待拼接前缀和当前段组成的有效文本池；若完整句数量回退，就保留最后一次流式结果，避免句界重排吞掉已显示末句。启用后，最新且未封存的来源不会仅因固定计时到期而朗读；它必须等到段校验成功，或后继句提供回滚安全证据。校验为空、失败或与流式文本明显偏离时不会覆盖字幕，也不会提前封存 TTS。普通已非最新来源仍使用 `--tts-revision-stable-sec 3.0`；未启用段校验时，最新来源继续使用 `--tts-latest-revision-grace-sec 4.0`。这不是全局 7 秒延时；正常 Stop 只 flush 当前 streaming state、排空最终译文，不清空或重建已显示字幕。仅在离线校验场景显式传入 `--final-redecode-on-stop`，才恢复全会话重识别。
 
 vLLM 的多模态处理器缓存可能同时存在于 API 进程和 EngineCore。建议显式使用 `--mm-processor-cache-gb 0.5`，把单进程缓存预算从 vLLM 默认值压低到 0.5 GiB；单引擎部署的理论总预算约为该值的两倍。设为 `0` 可以继续降低主机内存，但可能增加重复音频预处理开销。
 
@@ -180,10 +193,23 @@ vLLM 的多模态处理器缓存可能同时存在于 API 进程和 EngineCore�
 使用真实 16 kHz、单声道、PCM16 WAV 进行 WebSocket 回放：
 
 ```bash
-.venv/bin/python tools/subtitle_ws_selfcheck.py \
+.venv/bin/python -m tools.subtitle_ws_selfcheck \
   --ws-url ws://127.0.0.1:8024/ws \
   --wav <path-to-16k-mono-pcm16.wav>
 ```
+
+已有 YouTube `json3` 参考字幕和 WebSocket 事件时，可检查疑似整句空洞、
+强对齐后的句尾缺失、重复固化和翻译 ID 缺口：
+
+```bash
+.venv/bin/python -m tools.subtitle_reference_coverage \
+  --reference-json3 <reference.zh-Hans.json3> \
+  --events-jsonl <websocket-events.jsonl> \
+  --duration-sec 180
+```
+
+参考字幕仅用于离线诊断，不参与后端切段、稳定性或文本固化。工具采用模糊
+覆盖而非逐字一致判定；未完整播放到结束的边界 cue 会被排除。
 
 认证启用时，后端回放工具需要相应的已认证会话；浏览器级验证建议通过正常登录页面使用 Playwright。
 
