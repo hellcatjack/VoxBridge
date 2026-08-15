@@ -40,6 +40,7 @@ from voxbridge.cli.demo_streaming_ws import (
     _split_translation_units_and_tail,
     _find_first_boundary_after,
     _hash_auth_password,
+    _join_recent_segments,
     _trim_leading_boundary_overlap,
     _verify_auth_password,
     _vllm_model_kwargs,
@@ -1010,6 +1011,26 @@ def test_parse_args_accepts_audio_queue_size(monkeypatch):
     )
     args = parse_args()
     assert args.audio_queue_size == 12
+
+
+def test_join_recent_segments_bounds_snapshot_without_mutating_history():
+    segments = [f"sentence-{index}." for index in range(105)]
+
+    snapshot = _join_recent_segments(segments, max_segments=100)
+
+    assert "sentence-4." not in snapshot
+    assert snapshot.startswith("sentence-5.")
+    assert snapshot.endswith("sentence-104.")
+    assert len(segments) == 105
+
+
+def test_parse_args_accepts_subtitle_snapshot_history_size(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--subtitle-snapshot-history-size", "80"],
+    )
+
+    assert parse_args().subtitle_snapshot_history_size == 80
 
 
 def test_parse_args_uses_balanced_early_translation_defaults(monkeypatch):

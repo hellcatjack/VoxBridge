@@ -1701,6 +1701,13 @@ def _join_segments(segments: List[str]) -> str:
     return out
 
 
+def _join_recent_segments(segments: List[str], *, max_segments: int) -> str:
+    """Join a bounded compatibility snapshot without trimming canonical state."""
+
+    limit = max(1, int(max_segments))
+    return _join_segments(list(segments)[-limit:])
+
+
 def _classify_boundary_join_mode(prev_text: str, new_text: str, merged_text: str) -> str:
     prev = str(prev_text or "").strip()
     nxt = str(new_text or "").strip()
@@ -5971,6 +5978,10 @@ def _create_app(
         finish_mode = "stop"
         finish_reason = "stop"
         audio_queue_size = max(1, int(getattr(args, "audio_queue_size", 32)))
+        subtitle_snapshot_history_size = max(
+            1,
+            int(getattr(args, "subtitle_snapshot_history_size", 100)),
+        )
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=audio_queue_size)
         consumer_max_batch_samples = max(
             1,
@@ -7746,7 +7757,14 @@ def _create_app(
             return sid
 
         def _committed_translation_text() -> str:
-            return _join_segments([str(item.get("en", "") or "") for item in subtitle_state.sentence_items])
+            recent_items = subtitle_state.sentence_items[-subtitle_snapshot_history_size:]
+            return _join_segments([str(item.get("en", "") or "") for item in recent_items])
+
+        def _committed_source_snapshot_text() -> str:
+            return _join_recent_segments(
+                subtitle_state.committed_sentences,
+                max_segments=subtitle_snapshot_history_size,
+            )
 
         async def _translate_sentence_once(
             sentence: str,
@@ -11412,7 +11430,7 @@ def _create_app(
                         slice_commit=False,
                     )
                     _apply_incremental_text_fields(payload)
-                    payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
+                    payload["committed_text"] = _committed_source_snapshot_text()
                     payload["translation"] = _committed_translation_text()
                     tentative_text = str(payload.get("tentative_text", "") or "").strip()
                     partial_is_stable = bool((not tentative_text) and not reset_guard_hold)
@@ -11528,7 +11546,7 @@ def _create_app(
                     slice_commit=False,
                 )
                 _apply_incremental_text_fields(payload)
-                payload["committed_text"] = _join_segments(subtitle_state.committed_sentences)
+                payload["committed_text"] = _committed_source_snapshot_text()
                 payload["translation"] = _committed_translation_text()
                 tentative_text = str(payload.get("tentative_text", "") or "").strip()
                 partial_is_stable = bool((not tentative_text) and not reset_guard_hold)
@@ -11869,6 +11887,7 @@ def _create_app(
                     except Exception:
                         pass
             payload["translation"] = _committed_translation_text()
+            payload["committed_text"] = _committed_source_snapshot_text()
             _attach_stability(
                 payload,
                 is_stable=True,
@@ -12973,6 +12992,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
         action=argparse.BooleanOptionalAction,
         help="Enable frontend subtitle trace collection by default",
+    )
+    p.add_argument(
+        "--subtitle-snapshot-history-size",
+        type=int,
+        default=100,
+        help=(
+            "Maximum recent solidified sentence rows included in partial/final "
+            "compatibility snapshots; canonical backend state remains complete"
+        ),
     )
     p.add_argument(
         "--subtitle-trace-max-events",

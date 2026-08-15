@@ -516,8 +516,8 @@ Streaming ASR state update. This is generating text and can still change.
   "delta_text": "new suffix",
   "text_reset": false,
   "tentative_text": "newest uncommitted tail",
-  "committed_text": "all solidified source subtitles",
-  "translation": "all committed translations",
+  "committed_text": "up to 100 recent solidified source subtitles",
+  "translation": "up to 100 recent committed translations",
   "seq": 42,
   "is_stable": false,
   "stability": {
@@ -536,6 +536,10 @@ Streaming ASR state update. This is generating text and can still change.
 
 Frontend code should use `stability` from the backend instead of guessing
 whether a sentence is stable from local word lists or punctuation heuristics.
+`committed_text` and `translation` are bounded compatibility snapshots. Their
+row limit is configured by `--subtitle-snapshot-history-size` (default `100`).
+Use sentence events keyed by `sentence_id` for the canonical incremental stream;
+the backend does not trim its internal meeting state when it trims a snapshot.
 
 ### `sentence_committed`
 
@@ -704,8 +708,8 @@ Sent once after `finish`.
   "delta_text": "",
   "text_reset": false,
   "tentative_text": "",
-  "committed_text": "all committed source subtitles",
-  "translation": "all committed translations",
+  "committed_text": "up to 100 recent committed source subtitles",
+  "translation": "up to 100 recent committed translations",
   "seq": 100,
   "is_stable": true,
   "stability": {
@@ -724,7 +728,8 @@ Sent once after `finish`.
 
 `text` can be only the final ASR state, especially when full final re-decode is
 skipped by `--final-redecode-max-sec`. Use `committed_text` and sentence events
-as the canonical subtitle stream.
+to restore recent display state; sentence events remain the canonical complete
+subtitle stream.
 
 When translated speech is available, the backend waits for pending stable
 translations and publishes all pending spoken items before `final`.

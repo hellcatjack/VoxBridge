@@ -6,6 +6,11 @@ All notable public changes to VoxBridge are documented here.
 
 ### Fixed
 
+- Bounded `partial` and `final` compatibility snapshots to the latest 100
+  solidified rows while retaining complete canonical backend state, preventing
+  long meetings from serializing the full transcript on every partial update.
+- Increased the measured single-stream hard backpressure budget to 15 seconds
+  so a one-time ROCm/GTT allocator expansion does not discard live PCM.
 - Corrected the bounded HLS caption timeline to use FFmpeg PCM sample positions,
   AAC presentation delay, synthesized-speech activity bounds, and Safari's
   device-local program date. This removes the roughly two-second early caption
