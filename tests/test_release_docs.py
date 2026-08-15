@@ -215,8 +215,8 @@ def test_docs_publish_runtime_budget_and_tts_finality_contract():
     deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert "--mm-processor-cache-gb 0.5" in readme
-    assert "--mm-processor-cache-gb 0.5" in deployment
+    assert "--mm-processor-cache-gb 0" in readme
+    assert "--mm-processor-cache-gb 0" in deployment
     assert "--tts-latest-revision-grace-sec 4.0" in readme
     assert "--tts-latest-revision-grace-sec 4.0" in api
     assert "--tts-latest-revision-grace-sec 4.0" in deployment
@@ -225,3 +225,27 @@ def test_docs_publish_runtime_budget_and_tts_finality_contract():
     assert "backend segment sealing" in api.lower()
     assert "voxbridge-logrotate.timer" in deployment
     assert "voxbridge-logrotate.timer" in changelog
+
+
+def test_user_service_memory_containment_is_tracked_and_documented():
+    dropin = (
+        ROOT / "deploy" / "systemd" / "voxbridge-8024-memory.conf"
+    ).read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    for directive in (
+        "MemoryAccounting=yes",
+        "MemoryHigh=16G",
+        "MemoryMax=20G",
+        "TasksMax=512",
+        "OOMPolicy=stop",
+    ):
+        assert directive in dropin
+        assert directive in deployment
+
+    assert "memory.current" in deployment
+    assert "memory.peak" in deployment
+    assert "memory.events" in deployment
+    assert "pids.current" in deployment
+    assert "disabled-systemd/voxbridge-8024-memory.conf" in deployment
+    assert "external OpenAI-compatible translation service" in deployment

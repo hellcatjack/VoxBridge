@@ -112,7 +112,7 @@ ExecStart=%h/src/VoxBridge/.venv/bin/python -m voxbridge.cli.demo_streaming_ws \
   --backend vllm \
   --host 127.0.0.1 \
   --port 8024 \
-  --mm-processor-cache-gb 0.5 \
+  --mm-processor-cache-gb 0 \
   --segment-final-redecode \
   --auth-enabled \
   --auth-username admin \
@@ -131,6 +131,55 @@ Add translation, VAD, context schedule, queue, or model-memory flags to `ExecSta
 
 ```bash
 .venv/bin/python -m voxbridge.cli.demo_streaming_ws --help
+```
+
+Install the tracked cgroup guard as a drop-in after measuring the normal cold
+start and active-session peak on the target host:
+
+```bash
+mkdir -p ~/.config/systemd/user/voxbridge-8024.service.d
+cp deploy/systemd/voxbridge-8024-memory.conf \
+  ~/.config/systemd/user/voxbridge-8024.service.d/memory.conf
+systemctl --user daemon-reload
+```
+
+The production single-engine profile uses these deliberately loose guards:
+
+```ini
+MemoryAccounting=yes
+MemoryHigh=16G
+MemoryMax=20G
+TasksMax=512
+OOMPolicy=stop
+```
+
+`MemoryHigh` applies reclaim pressure before the hard `MemoryMax` boundary.
+`TasksMax` leaves headroom above the measured single-engine thread count while
+preventing a second full EngineCore from silently joining the same service.
+These values cover only the `voxbridge-8024.service` cgroup; an external OpenAI-compatible translation service has its own process and memory budget.
+Do not lower either memory boundary without a full real-time soak.
+
+Inspect the effective cgroup after restart:
+
+```bash
+cg="$(systemctl --user show voxbridge-8024.service -p ControlGroup --value)"
+systemctl --user show voxbridge-8024.service \
+  -p MemoryCurrent -p MemoryPeak -p MemoryHigh -p MemoryMax -p TasksCurrent -p TasksMax
+cat "/sys/fs/cgroup${cg}/memory.current"
+cat "/sys/fs/cgroup${cg}/memory.peak"
+cat "/sys/fs/cgroup${cg}/memory.events"
+cat "/sys/fs/cgroup${cg}/pids.current"
+```
+
+To roll back only the guard without touching the primary unit, move the drop-in
+aside and reload systemd:
+
+```bash
+mkdir -p ~/.config/voxbridge/disabled-systemd
+mv ~/.config/systemd/user/voxbridge-8024.service.d/memory.conf \
+  ~/.config/voxbridge/disabled-systemd/voxbridge-8024-memory.conf
+systemctl --user daemon-reload
+systemctl --user restart voxbridge-8024.service
 ```
 
 The recommended quality-preserving decode gate instrumentation is:
@@ -319,10 +368,11 @@ this source-order policy with a global seven-second delay. Tune it only from obs
 language-specific word lists, or frontend timers to infer speech stability.
 
 vLLM may allocate the multimodal processor cache in both the API and EngineCore
-processes. `--mm-processor-cache-gb 0.5` therefore bounds a single-engine
-deployment to roughly 1 GiB of theoretical host cache instead of relying on the
-larger vLLM default. A value of `0` disables this cache but can increase repeated
-audio preprocessing; change it only after comparing RSS and decode latency.
+processes. Use `--mm-processor-cache-gb 0` for the single-microphone,
+single-connection streaming profile because changing live audio has no useful
+cross-request processor-cache reuse. A nonzero value can improve repeated
+offline or multi-client inputs, but it must be justified with RSS, GTT, and
+decode-latency measurements from that workload.
 
 Load and start the service:
 

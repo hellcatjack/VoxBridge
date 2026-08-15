@@ -94,7 +94,7 @@ uv pip install --python .venv/bin/python --no-deps 'silero-vad==6.2.1'
   --backend vllm \
   --host 127.0.0.1 \
   --port 8024 \
-  --mm-processor-cache-gb 0.5 \
+  --mm-processor-cache-gb 0 \
   --segment-final-redecode
 ```
 
@@ -171,7 +171,7 @@ pre-roll 只缓存现有门控原本会跳过的音频：恢复推理时重放�
 
 可见字幕和译文继续实时更新；朗读采用更严格的后端稳定门。推荐启用 `--segment-final-redecode`：自然 VAD 端点在固化、翻译和 TTS 封存前，对当前段音频执行一次有界的一次性解码，用相容结果修复流式句尾。讲话中的 hard cut 不执行该阻塞式重解码，避免实时音频在轮转期间堆满队列后被丢弃。段尾校验同时比较上一段待拼接前缀和当前段组成的有效文本池；若完整句数量回退，就保留最后一次流式结果，避免句界重排吞掉已显示末句。启用后，最新且未封存的来源不会仅因固定计时到期而朗读；它必须等到段校验成功，或后继句提供回滚安全证据。校验为空、失败或与流式文本明显偏离时不会覆盖字幕，也不会提前封存 TTS。普通已非最新来源仍使用 `--tts-revision-stable-sec 3.0`；未启用段校验时，最新来源继续使用 `--tts-latest-revision-grace-sec 4.0`。这不是全局 7 秒延时；正常 Stop 只 flush 当前 streaming state、排空最终译文，不清空或重建已显示字幕。仅在离线校验场景显式传入 `--final-redecode-on-stop`，才恢复全会话重识别。
 
-vLLM 的多模态处理器缓存可能同时存在于 API 进程和 EngineCore。建议显式使用 `--mm-processor-cache-gb 0.5`，把单进程缓存预算从 vLLM 默认值压低到 0.5 GiB；单引擎部署的理论总预算约为该值的两倍。设为 `0` 可以继续降低主机内存，但可能增加重复音频预处理开销。
+vLLM 的多模态处理器缓存可能同时存在于 API 进程和 EngineCore。单麦克风、`--max-connections 1` 的生产模式建议显式使用 `--mm-processor-cache-gb 0`：连续音频请求没有可复用的跨请求处理结果，禁用缓存可避免长会话逐步填充主机缓存。多连接或重复离线音频部署应先比较 RSS、GTT 和解码延迟，再决定是否启用非零缓存。
 
 ## 公网认证
 
