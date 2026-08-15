@@ -763,6 +763,82 @@ def test_ws_mid_speech_hard_cut_skips_blocking_segment_redecode(monkeypatch, tmp
     )
 
 
+def test_ws_hard_cut_with_recent_low_energy_tail_skips_blocking_redecode(
+    monkeypatch, tmp_path
+):
+    class HardCutASR(_FakeASR):
+        def streaming_transcribe(self, wav, state):
+            samples = np.asarray(wav, dtype=np.float32)
+            state.audio_accum = np.concatenate((state.audio_accum, samples))
+            state.language = "English"
+            state.text = "A live news sentence is still growing across the hard limit"
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            return state
+
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "_should_skip_stream_decode",
+        lambda **kwargs: False,
+    )
+    trace_path = tmp_path / "hard-cut-low-energy-tail.jsonl"
+    args = _args()
+    args.segment_final_redecode = True
+    args.segment_hard_cut_sec = 1.3
+    args.segment_overlap_sec = 0.0
+    args.vad_silence_sec = 30.0
+    args.vad_force_cut_sec = 30.0
+    args.final_redecode_on_stop = False
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+    fake_asr = HardCutASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        speech = np.full(6400, 20_000, dtype="<i2").tobytes()
+        low_energy_tail = np.zeros(6400, dtype="<i2").tobytes()
+        ws.send_bytes(speech)
+        _receive_until_type(ws, "partial")
+        time.sleep(1.1)
+        ws.send_bytes(low_energy_tail)
+        _receive_until_type(ws, "partial")
+        time.sleep(0.3)
+        ws.send_bytes(low_energy_tail)
+        _receive_until_type(ws, "partial")
+        deadline = time.time() + 2.0
+        while fake_asr.finish_calls < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        ws.send_json({"type": "finish", "mode": "stop"})
+        _collect_through_final(ws)
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert fake_asr.finish_calls >= 2
+    assert fake_asr.transcribe_calls == []
+    assert any(
+        row.get("event") == "segment_cut_decision"
+        and row.get("reason") == "hard_cut"
+        and int(row.get("silence_ms", 0)) >= 80
+        for row in rows
+    )
+    assert any(
+        row.get("event") == "segment_finalize_done"
+        and row.get("reason") == "hard_cut"
+        and row.get("hard_cut_mid_speech") is False
+        for row in rows
+    )
+    assert any(
+        row.get("event") == "segment_final_redecode_skipped"
+        and row.get("reason") == "live_hard_cut"
+        for row in rows
+    )
+
+
 def test_ws_default_stop_keeps_visible_history_without_full_redecode():
     fake_asr = _FakeASR()
     app = _create_app(_args(), fake_asr)

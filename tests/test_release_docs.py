@@ -249,3 +249,17 @@ def test_user_service_memory_containment_is_tracked_and_documented():
     assert "pids.current" in deployment
     assert "disabled-systemd/voxbridge-8024-memory.conf" in deployment
     assert "external OpenAI-compatible translation service" in deployment
+
+
+def test_deployment_documents_the_realtime_single_microphone_budget():
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    normalized = " ".join(deployment.split())
+
+    for flag in (
+        "--segment-hard-cut-sec 45",
+        "--backpressure-target-queue-sec 3.0",
+        "--backpressure-max-queue-sec 10.0",
+        "--backpressure-hard-relief-sec 6.0",
+    ):
+        assert flag in deployment
+    assert "never runs the blocking full-segment re-decode" in normalized

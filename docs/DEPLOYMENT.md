@@ -213,6 +213,25 @@ and force-drains the final ready revision without rebuilding visible history.
 Full-session Stop re-decode is an explicit opt-in via
 `--final-redecode-on-stop`.
 
+For one continuous microphone or system-audio stream, use the measured
+real-time rotation and backpressure budget:
+
+```text
+--segment-hard-cut-sec 45
+--backpressure-target-queue-sec 3.0
+--backpressure-max-queue-sec 10.0
+--backpressure-hard-relief-sec 6.0
+```
+
+The soft threshold increases consumer batch size without discarding PCM. The
+hard threshold remains below the capacity of a 64-entry queue fed with 320ms
+browser chunks, while leaving enough room for a slow in-flight decode to finish.
+A hard cut always flushes and rotates the streaming state and never runs the
+blocking full-segment re-decode; natural VAD endpoints retain final re-decode
+for tail accuracy. Keep the bounded queue and sustained-overload fallback: if
+average inference remains slower than real time even with 45-second rotation,
+the deployment needs more compute rather than an unbounded audio buffer.
+
 With streaming context enabled, long silence arms a backend output quarantine.
 The quarantine still accepts a compatible sentence-tail repair when the segment
 already contains sufficient backend speech activity and context-echo checks

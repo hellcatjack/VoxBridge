@@ -9000,7 +9000,8 @@ def _create_app(
                 and str(getattr(local_state, "_voxbridge_final_context", "") or "")
             )
             fast_live_hard_cut = bool(
-                hard_cut_mid_speech and not legacy_segment_context_redecode
+                str(reason or "") == "hard_cut"
+                and not legacy_segment_context_redecode
             )
 
             _trace_event(
