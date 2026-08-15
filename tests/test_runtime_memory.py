@@ -160,3 +160,21 @@ def test_runtime_memory_enumerates_only_cgroup_processes(tmp_path):
     assert [process.pid for process in snapshot.processes] == [201, 202]
     assert snapshot.enginecore_count == 1
     assert snapshot.main_pid == 201
+
+
+def test_runtime_memory_recognizes_linux_truncated_enginecore_comm(tmp_path):
+    proc_root = tmp_path / "proc"
+    cgroup = tmp_path / "cgroup"
+    _make_process(
+        proc_root,
+        202,
+        comm="VLLM::EngineCor",
+        rss_kib=200,
+        pss_kib=160,
+        threads=8,
+    )
+    _write(cgroup / "cgroup.procs", "202\n")
+
+    snapshot = read_runtime_memory(cgroup, proc_root=proc_root)
+
+    assert snapshot.enginecore_count == 1

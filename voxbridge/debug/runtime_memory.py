@@ -166,6 +166,11 @@ def _read_events(path: Path) -> dict[str, int]:
     return events
 
 
+def _is_enginecore_comm(comm: str) -> bool:
+    # Linux task names are limited to 15 visible bytes in /proc/<pid>/comm.
+    return comm in {"VLLM::EngineCore", "VLLM::EngineCor"}
+
+
 def read_runtime_memory(
     cgroup_path: Path,
     *,
@@ -194,7 +199,7 @@ def read_runtime_memory(
         cgroup_events=_read_events(cgroup / "memory.events"),
         cgroup_task_count=_read_int(cgroup / "pids.current"),
         processes=processes,
-        enginecore_count=sum("EngineCore" in process.comm for process in processes),
+        enginecore_count=sum(_is_enginecore_comm(process.comm) for process in processes),
         main_pid=min((process.pid for process in processes), default=None),
     )
 
