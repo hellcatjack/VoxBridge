@@ -299,10 +299,11 @@ device. The production main page displays a static local QR for the fixed URL
 `https://ushome.amycat.com:18024/listen`. The PCCS listener is English-only and
 uses a fixed one-screen layout without document scrollbars.
 The backend keeps a bounded pre-listener backlog of up to 128 stable translations
-from the current producer session. The first listener drains those items in source
-order instead of waiting for the next sentence; this is a catch-up queue, not a
-persisted recording. A new producer session clears an older idle backlog. Device-
-local Stop removes only that browser's lease and does not affect other listeners.
+from the current producer session. When the first listener creates a new live
+epoch, the backend discards stale entries and retains only the latest stable translation;
+this is a live-edge join buffer, not a catch-up queue or persisted recording. A new
+producer session clears an older idle backlog. Device-local Stop removes only that
+browser's lease and does not affect other listeners.
 One worker synthesizes each translation once, and one FFmpeg
 process writes a continuous 24 kHz mono AAC/HLS timeline shared by all devices.
 When no speech is pending, the encoder receives real-time zero PCM so native iOS

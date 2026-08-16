@@ -91,6 +91,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "FIFO" in readme
     assert "/listen" in readme
     assert "bounded pre-listener backlog" in readme
+    assert "只保留最新一条稳定译文" in readme
     assert "多个设备" in readme
     assert "主字幕页不播放" in readme
     assert "HLS" in readme
@@ -136,6 +137,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "POST /api/tts/broadcast/jobs/{job_id}/audio" in api
     assert '"type": "tts_received"' in api
     assert "bounded pre-listener backlog" in api
+    assert "latest stable translation" in api
     assert "exact translation revision" in api
     assert "deprecated" in api
     assert "POST /api/tts/jobs/{job_id}/audio" in api
@@ -164,6 +166,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "256" in deployment
     assert "--tts-hls-max-listeners 128" in deployment
     assert "bounded pre-listener backlog" in deployment
+    assert "latest stable translation" in deployment
     assert "public bearer capability" in deployment
     assert "main subtitle page remains authenticated" in deployment
     assert "CPUExecutionProvider" in deployment

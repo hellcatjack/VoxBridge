@@ -21,9 +21,9 @@ All notable public changes to VoxBridge are documented here.
   worker while the backend stability gate is still active, then reused only an
   exact cache hit at ordered HLS release. Revised text invalidates stale audio,
   preparation never publishes early, and the bounded cache is listener-scoped.
-- Retained a bounded current-session TTS backlog before the first HLS listener
-  joins, then drained it through the existing single Kokoro worker so visible
-  stable translations no longer turn into long encoded-silence gaps.
+- Collapsed the bounded current-session TTS backlog to its latest stable
+  translation when the first HLS listener joins, so late listeners start at the
+  live edge instead of replaying the meeting from the beginning.
 - Counted in-flight Kokoro work in HLS queue diagnostics and logged synthesis
   latency, audio duration, and real-time factor without recording translated text.
 - Exposed synthesized PCM backlog as `pending_audio_ms` and added a non-skipping

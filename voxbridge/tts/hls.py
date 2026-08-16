@@ -610,6 +610,42 @@ class SharedHLSTTSPublisher:
             if prepared_key[0] == sentence_id and prepared_key != key:
                 del self._prepared_audio[prepared_key]
 
+    def _retain_latest_idle_item_locked(self) -> int:
+        """Collapse pre-listener speech to the current live sentence."""
+
+        queued: list[TTSReadyItem] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            queued.append(item)
+        if not queued:
+            return 0
+
+        latest = queued[-1]
+        self._queue.put_nowait(latest)
+        stale = queued[:-1]
+        for item in stale:
+            key = self._item_key(item)
+            sentence_id = str(item.sentence_id)
+            if self._latest_key_by_sentence.get(sentence_id) == key:
+                self._latest_key_by_sentence.pop(sentence_id, None)
+            self._preparation_pending.pop(key, None)
+            self._prepared_audio.pop(key, None)
+
+        dropped = len(stale)
+        if dropped:
+            self._idle_backlog_dropped += dropped
+            logger.info(
+                "shared HLS live join skipped stale backlog skipped=%d retained=%d total_skipped=%d",
+                dropped,
+                self._queue.qsize(),
+                self._idle_backlog_dropped,
+            )
+        return dropped
+
     async def touch_listener(self, listener_id: str, owner_key: str) -> HLSListenerLease:
         listener = self._require_identity(listener_id, "listener_id")
         owner = self._require_identity(owner_key, "owner_key")
@@ -623,6 +659,7 @@ class SharedHLSTTSPublisher:
             if existing is None and len(self._leases) >= self._max_listeners:
                 raise HLSListenerCapacityExceeded("listener capacity reached")
             if self._encoder is None:
+                self._retain_latest_idle_item_locked()
                 root = self._root_dir / f"epoch-{uuid.uuid4().hex}"
                 encoder = self._encoder_factory(root)
                 try:

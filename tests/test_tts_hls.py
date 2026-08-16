@@ -214,7 +214,7 @@ async def test_three_listeners_share_one_encoder_and_one_synthesis_per_item(tmp_
 
 
 @pytest.mark.asyncio
-async def test_first_listener_drains_stable_translations_queued_before_join(tmp_path):
+async def test_first_listener_starts_from_latest_translation_queued_before_join(tmp_path):
     synth = FakeSynthesizer(make_wav())
     encoder = FakeEncoder(tmp_path / "stream")
     publisher = SharedHLSTTSPublisher(
@@ -233,11 +233,8 @@ async def test_first_listener_drains_stable_translations_queued_before_join(tmp_
         await publisher.touch_listener("iphone-a", "owner-a")
         await publisher.wait_idle()
 
-        assert synth.calls == [
-            ("Stable translation 0.", "English"),
-            ("Stable translation 1.", "English"),
-        ]
-        assert len(encoder.appended) == 2
+        assert synth.calls == [("Stable translation 1.", "English")]
+        assert len(encoder.appended) == 1
     finally:
         await publisher.close()
 
@@ -261,10 +258,7 @@ async def test_idle_backlog_is_bounded_to_most_recent_stable_translations(tmp_pa
         await publisher.touch_listener("iphone-a", "owner-a")
         await publisher.wait_idle()
 
-        assert synth.calls == [
-            ("Stable translation 1.", "English"),
-            ("Stable translation 2.", "English"),
-        ]
+        assert synth.calls == [("Stable translation 2.", "English")]
     finally:
         await publisher.close()
 

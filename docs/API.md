@@ -104,10 +104,13 @@ that bound receives `HTTP 429`, while an existing lease may still refresh.
 
 The publisher also keeps a bounded pre-listener backlog of up to 128 stable
 translations from the current producer session. It does not synthesize them while
-there are no listeners. The first listener starts one shared Kokoro worker, which
-drains that backlog in source order and can prefill the existing bounded PCM queue.
-When idle, overflow retains the most recent entries; starting a new producer
-session clears an older idle backlog so speech cannot cross meeting boundaries.
+there are no listeners. When the first listener creates a new live epoch, the
+publisher discards stale backlog entries and retains only the latest stable translation
+for the shared Kokoro worker. Future translations continue in source order, so a
+late join or restart begins at the live edge instead of replaying the meeting from
+the beginning. When idle, overflow retains the most recent entries; starting a
+new producer session clears an older idle backlog so speech cannot cross meeting
+boundaries.
 
 While at least one listener lease is active, translation completion may start
 Kokoro preparation before the source-revision stability gate releases the item.
