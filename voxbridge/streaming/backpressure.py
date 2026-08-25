@@ -7,7 +7,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class BackpressureDecision:
     under_pressure: bool
-    drop_oldest: bool
+    pause_ingress: bool
     suggested_batch_scale: float
     queue_sec: float
     reason: str
@@ -37,7 +37,7 @@ class QueueBackpressureController:
         if q_sec >= self.max_queue_sec:
             return BackpressureDecision(
                 under_pressure=True,
-                drop_oldest=True,
+                pause_ingress=True,
                 suggested_batch_scale=2.0,
                 queue_sec=q_sec,
                 reason="hard_overflow",
@@ -46,16 +46,15 @@ class QueueBackpressureController:
             ratio = min(2.0, max(1.0, q_sec / max(self.target_queue_sec, 1e-6)))
             return BackpressureDecision(
                 under_pressure=True,
-                drop_oldest=False,
+                pause_ingress=False,
                 suggested_batch_scale=ratio,
                 queue_sec=q_sec,
                 reason="soft_pressure",
             )
         return BackpressureDecision(
             under_pressure=False,
-            drop_oldest=False,
+            pause_ingress=False,
             suggested_batch_scale=1.0,
             queue_sec=q_sec,
             reason="normal",
         )
-

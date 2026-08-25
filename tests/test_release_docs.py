@@ -95,6 +95,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "多个设备" in readme
     assert "主字幕页不播放" in readme
     assert "HLS" in readme
+    assert "hls.js" in readme
     assert "锁屏" in readme
     assert "一个 Kokoro worker" in readme
     assert "https://ushome.amycat.com:18024/listen" in readme
@@ -109,6 +110,8 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
 
     assert "GET /listen" in api
+    assert "GET /listen/assets/hls.min.js" in api
+    assert "hls.js" in api
     assert "GET /api/tts/live/status" in api
     assert '"synthesis_active"' in api
     assert '"preparation_queue_depth"' in api
@@ -127,7 +130,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "does not gate HLS audio" in api
     assert "GET /api/tts/live/{listener_id}/segments/{segment_name}" in api
     assert "DELETE /api/tts/live/{listener_id}" in api
-    assert "persistent native media element" in api
+    assert "persistent media element" in api
     assert "public bearer capability" in api
     assert "HTTP 429" in api
     assert "128" in api
@@ -171,7 +174,9 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "main subtitle page remains authenticated" in deployment
     assert "CPUExecutionProvider" in deployment
     assert "/listen" in deployment
+    assert "hls.js" in deployment
     assert "Kokoro" in changelog
+    assert "hls.js" in changelog
     assert "multi-listener" in changelog
     assert "PCCS" in changelog
     assert "static QR" in changelog

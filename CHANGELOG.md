@@ -6,6 +6,25 @@ All notable public changes to VoxBridge are documented here.
 
 ### Fixed
 
+- Prevented high-confidence quiet speech from being discarded by the energy
+  decode gate by adding an opt-in Silero decode rescue that cannot cut segments
+  or commit text. Rescue now uses accumulated evidence across a coalesced batch,
+  so speech at the beginning is retained even when trailing silence lowers the
+  batch mean, while the existing energy-VAD endpoint remains authoritative.
+- Replaced hard-overflow PCM deletion with bounded WebSocket ingress waiting;
+  temporary inference and segment-finalization stalls now apply transport
+  backpressure instead of removing spoken audio.
+- Preserved uncommitted text across hard cuts that occur before the configured
+  VAD silence endpoint, including stable clauses emitted with a provisional
+  terminal boundary.
+- Preserved real spoken text around consecutive streaming-context echoes;
+  pure context-only hallucinations remain excluded from translation and TTS.
+- Instructed both translation directions to omit only non-semantic speech
+  disfluencies while preserving meaningful interjections and source content.
+- Added a locally hosted hls.js MSE fallback for desktop Chrome, Edge, and
+  Firefox while preserving native Safari HLS for iPhone lock-screen playback.
+- Added explicit desktop MSE AAC capability detection and a near-silent idle
+  carrier so hls.js never waits on table-only MPEG-TS segments.
 - Bounded `partial` and `final` compatibility snapshots to the latest 100
   solidified rows while retaining complete canonical backend state, preventing
   long meetings from serializing the full transcript on every partial update.

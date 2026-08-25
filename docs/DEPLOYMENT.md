@@ -187,22 +187,28 @@ The recommended quality-preserving decode gate instrumentation is:
 ```text
 --silent-decode-pre-roll-sec 0.4
 --silero-vad-shadow
+--silero-vad-rescue
 --silero-vad-shadow-threshold 0.5
 --silero-vad-shadow-log-sec 1.0
 ```
 
 The pre-roll contains only audio skipped by the current energy gate. It is
 replayed once when decoding resumes, or decoded once immediately before an ASR
-segment is finalized so a weak final syllable cannot be discarded. Silero
-remains observe-only: it cannot trigger a cut or suppress audio. Loading and
-inference failures disable only the shadow observer for the current WebSocket
+segment is finalized so a weak final syllable cannot be discarded. With
+`--silero-vad-rescue`, accumulated Silero speech evidence may prevent such a
+batch from being skipped, including a coalesced batch that starts with speech
+but ends in silence. The rescue permits decoding only: it preserves any
+energy-VAD silence endpoint and cannot itself trigger a cut or commit text. Loading and
+inference failures disable only the Silero observer for the current WebSocket
 session.
 
 `--segment-final-redecode` runs one bounded one-shot decode at natural VAD
 endpoints before source sentences are committed, translated, or released to
 TTS. A mid-speech hard cut uses the streaming flush result and rotates
 immediately; re-decoding a long active segment would block inference and can
-overflow the live audio queue. Empty, failed, or substantially divergent VAD
+overflow the live audio queue. A hard cut remains mid-speech until trailing
+silence reaches `--vad-silence-sec`; this uses the deployed VAD endpoint rather
+than an independent fixed threshold. Empty, failed, or substantially divergent VAD
 results, including corrections that reduce complete units after the previous
 segment's pending prefix is carried forward, leave the existing revision
 stability window active instead of sealing the source immediately. While this
@@ -224,10 +230,12 @@ real-time rotation and backpressure budget:
 --subtitle-snapshot-history-size 100
 ```
 
-The soft threshold increases consumer batch size without discarding PCM. The
-hard threshold remains below the capacity of a 64-entry queue fed with 320ms
-browser chunks and absorbs the measured one-time ROCm/GTT allocator expansion,
-while leaving enough room for a slow in-flight decode to finish. Compatibility
+The soft threshold increases consumer batch size without discarding PCM. At the
+hard threshold, the backend retains the current frame in bounded spill storage
+and pauses WebSocket ingress until the independent consumer recovers; TCP/WSS
+transport backpressure replaces oldest-frame deletion and requires no browser
+decision logic. `--backpressure-hard-relief-sec` is a deprecated no-op retained
+for existing service commands. Compatibility
 snapshots sent with each `partial`/`final` are bounded to the latest 100
 solidified rows; sentence events and canonical backend state remain complete.
 A hard cut always flushes and rotates the streaming state and never runs the
@@ -298,6 +306,13 @@ page on a phone, tablet, or other browser and explicitly selects Start on that
 device. The production main page displays a static local QR for the fixed URL
 `https://ushome.amycat.com:18024/listen`. The PCCS listener is English-only and
 uses a fixed one-screen layout without document scrollbars.
+Safari uses native HLS so iPhone lock-screen playback remains independent of
+foreground JavaScript. Desktop Chrome, Edge, and Firefox use the vendored hls.js
+MSE fallback from `/listen/assets/hls.min.js` when AAC MSE is available. The
+server's idle carrier remains acoustically silent but forces FFmpeg to include
+decodable AAC frames instead of producing table-only MPEG-TS segments.
+The pinned build and license live under `voxbridge/tts/vendor/`; package builds
+must include those files. Do not replace it with a runtime CDN dependency.
 The backend keeps a bounded pre-listener backlog of up to 128 stable translations
 from the current producer session. When the first listener creates a new live
 epoch, the backend discards stale entries and retains only the latest stable translation;

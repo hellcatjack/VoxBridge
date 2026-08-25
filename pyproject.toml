@@ -37,3 +37,6 @@ voxbridge-streaming-ws = "voxbridge.cli.demo_streaming_ws:main"
 [tool.setuptools]
 packages = { find = { where = ["."], include = ["voxbridge*"] } }
 include-package-data = true
+
+[tool.setuptools.package-data]
+"voxbridge.tts" = ["vendor/*.js", "vendor/*.txt"]

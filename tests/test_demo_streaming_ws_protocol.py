@@ -763,7 +763,7 @@ def test_ws_mid_speech_hard_cut_skips_blocking_segment_redecode(monkeypatch, tmp
     )
 
 
-def test_ws_hard_cut_with_recent_low_energy_tail_skips_blocking_redecode(
+def test_ws_hard_cut_before_vad_endpoint_keeps_mid_speech_tail_without_redecode(
     monkeypatch, tmp_path
 ):
     class HardCutASR(_FakeASR):
@@ -829,7 +829,7 @@ def test_ws_hard_cut_with_recent_low_energy_tail_skips_blocking_redecode(
     assert any(
         row.get("event") == "segment_finalize_done"
         and row.get("reason") == "hard_cut"
-        and row.get("hard_cut_mid_speech") is False
+        and row.get("hard_cut_mid_speech") is True
         for row in rows
     )
     assert any(
@@ -1704,6 +1704,178 @@ def test_ws_silero_shadow_writes_observations_without_controlling_asr(monkeypatc
     assert by_event["silero_shadow_observation"]["control_mode"] == "observe_only"
 
 
+def test_ws_silero_rescue_decodes_quiet_speech_rejected_by_energy_gate(
+    monkeypatch,
+    tmp_path,
+):
+    class CountingASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.streaming_calls = 0
+
+        def streaming_transcribe(self, wav, state):
+            self.streaming_calls += 1
+            return super().streaming_transcribe(wav, state)
+
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "_should_skip_stream_decode",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: 0.9,
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    trace_path = tmp_path / "silero-rescue.jsonl"
+    args = _args()
+    args.silero_vad_shadow = True
+    args.silero_vad_rescue = True
+    args.silero_vad_shadow_threshold = 0.5
+    args.silero_vad_shadow_log_sec = 1.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+    fake_asr = CountingASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_bytes(np.full(512, 320, dtype="<i2").tobytes())
+        deadline = time.time() + 1.0
+        while fake_asr.streaming_calls < 1 and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert fake_asr.streaming_calls == 1
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rescued = [row for row in rows if row.get("event") == "silero_decode_rescue"]
+    assert len(rescued) == 1
+    assert rescued[0]["mean_probability"] == 0.9
+    assert rescued[0]["control_mode"] == "decode_rescue"
+
+
+def test_ws_silero_rescue_keeps_speech_at_start_of_batch_when_batch_ends_silent(
+    monkeypatch,
+    tmp_path,
+):
+    class CountingASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.streaming_calls = 0
+
+        def streaming_transcribe(self, wav, state):
+            self.streaming_calls += 1
+            return super().streaming_transcribe(wav, state)
+
+    probabilities = iter([0.95] * 120 + [0.05] * 68)
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "_should_skip_stream_decode",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: next(probabilities),
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    trace_path = tmp_path / "silero-rescue-speech-then-silence.jsonl"
+    args = _args()
+    args.max_frame_samples = 200_000
+    args.silero_vad_shadow = True
+    args.silero_vad_rescue = True
+    args.silero_vad_shadow_threshold = 0.5
+    args.silero_vad_shadow_log_sec = 1.0
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(trace_path)
+    fake_asr = CountingASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_bytes(np.full(188 * 512, 320, dtype="<i2").tobytes())
+        deadline = time.time() + 1.0
+        while fake_asr.streaming_calls < 1 and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert fake_asr.streaming_calls == 1
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rescued = [row for row in rows if row.get("event") == "silero_decode_rescue"]
+    assert len(rescued) == 1
+    assert rescued[0]["probability"] == 0.05
+    assert 0.5 < rescued[0]["mean_probability"] < 0.8
+
+
+def test_ws_silero_decode_rescue_preserves_energy_vad_silence_endpoint(monkeypatch):
+    class CountingASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.streaming_calls = 0
+
+        def streaming_transcribe(self, wav, state):
+            self.streaming_calls += 1
+            state.audio_accum = np.concatenate(
+                (state.audio_accum, np.asarray(wav, dtype=np.float32))
+            )
+            state.language = "Chinese"
+            state.text = "这是一句已经完成的测试。"
+            return state
+
+    decisions = iter((False, True))
+    probabilities = iter([0.95] * 12 + [0.95] * 20 + [0.05] * 11)
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "_should_skip_stream_decode",
+        lambda **kwargs: next(decisions),
+    )
+    monkeypatch.setattr(
+        demo_streaming_ws,
+        "create_silero_onnx_observer",
+        lambda threshold: SileroShadowObserver(
+            runner=lambda frame: next(probabilities),
+            frame_samples=512,
+            threshold=threshold,
+        ),
+    )
+    args = _args()
+    args.final_redecode_on_stop = False
+    args.vad_silence_sec = 0.3
+    args.vad_force_cut_sec = 0.4
+    args.vad_min_slice_sec = 0.5
+    args.vad_min_active_sec = 0.2
+    args.segment_overlap_sec = 0.0
+    args.silero_vad_shadow = True
+    args.silero_vad_rescue = True
+    args.silero_vad_shadow_threshold = 0.5
+    fake_asr = CountingASR()
+
+    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_bytes(np.full(6400, 20_000, dtype="<i2").tobytes())
+        _receive_until_type(ws, "partial")
+        time.sleep(0.55)
+        quiet_tail = np.resize(np.array([120, -120], dtype="<i2"), 16_000)
+        ws.send_bytes(quiet_tail.tobytes())
+        deadline = time.time() + 2.0
+        while fake_asr.finish_calls < 1 and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert fake_asr.streaming_calls == 2
+    assert fake_asr.finish_calls == 1
+
+
 def test_ws_silero_shadow_load_failure_keeps_asr_available(monkeypatch, tmp_path):
     trace_path = tmp_path / "silero-shadow-load-failure.jsonl"
 
@@ -1816,6 +1988,12 @@ def test_listener_page_is_public_while_main_page_remains_protected():
     page = client.get("/listen", follow_redirects=False)
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
+    hls_js = client.get("/listen/assets/hls.min.js", follow_redirects=False)
+    assert hls_js.status_code == 200
+    assert hls_js.headers["content-type"].startswith("text/javascript")
+    assert hls_js.headers["cache-control"] == "public, max-age=86400"
+    assert hls_js.headers["x-content-type-options"] == "nosniff"
+    assert len(hls_js.content) > 500_000
     protected = client.get("/", follow_redirects=False)
     assert protected.status_code in {302, 303, 307}
     assert protected.headers["location"] == "/login"
@@ -3775,13 +3953,14 @@ def test_ws_keeps_spoken_context_terms_when_they_grow_incrementally(tmp_path):
     assert fake_asr.last_state._raw_decoded == spoken
 
 
-def test_ws_drops_consecutive_streaming_context_terms_before_commit_translation_and_tts(
+def test_ws_removes_consecutive_context_echo_but_preserves_real_sentence_text(
     tmp_path,
 ):
     context_terms = ["Alpha", "Beta", "Gamma", "Delta"]
     contaminated = (
         "This uncertain sentence contains enough unrelated words before Alpha Beta Gamma."
     )
+    preserved = "This uncertain sentence contains enough unrelated words before."
     natural = "This normal sentence remains available for translation and speech output."
 
     class ConsecutiveContextRunASR(_FakeASR):
@@ -3849,10 +4028,12 @@ def test_ws_drops_consecutive_streaming_context_terms_before_commit_translation_
     assert fake_asr.init_calls[-1]["context"] == " ".join(context_terms)
     assert contaminated not in committed
     assert contaminated not in translated_sources
+    assert preserved in committed
+    assert preserved in translated_sources
     assert natural in committed
     assert natural in translated_sources
-    assert len(tts_jobs) == 1
-    assert any(row.get("event") == "context_run_commit_dropped" for row in trace_rows)
+    assert len(tts_jobs) == 2
+    assert any(row.get("event") == "context_run_commit_trimmed" for row in trace_rows)
 
 
 def test_ws_segment_final_mode_applies_context_once_to_complete_segment(tmp_path):
@@ -4498,6 +4679,54 @@ def test_audio_queue_spills_small_frames_without_dropping_audio():
             ws.send_text('{"type":"finish"}')
             time.sleep(0.1)
             fake_asr.decode_release.set()
+            _receive_until_type(ws, "final", max_steps=80)
+    finally:
+        fake_asr.decode_release.set()
+
+    assert fake_asr.final_audio_samples == frame_count * frame_samples
+
+
+def test_audio_queue_hard_pressure_preserves_pcm_until_consumer_recovers():
+    class BlockingASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.decode_started = threading.Event()
+            self.decode_release = threading.Event()
+            self.final_audio_samples = 0
+
+        def streaming_transcribe(self, wav, state):
+            if not self.decode_started.is_set():
+                self.decode_started.set()
+                if not self.decode_release.wait(timeout=5.0):
+                    raise TimeoutError("streaming decode was not released")
+            return super().streaming_transcribe(wav, state)
+
+        def finish_streaming_transcribe(self, state):
+            result = super().finish_streaming_transcribe(state)
+            self.final_audio_samples = int(state.audio_accum.size)
+            return result
+
+    fake_asr = BlockingASR()
+    args = _args()
+    args.audio_queue_size = 2
+    args.backpressure_target_queue_sec = 0.1
+    args.backpressure_max_queue_sec = 0.2
+    args.final_redecode_on_stop = False
+    app = _create_app(args, fake_asr)
+    client = TestClient(app)
+    frame = np.array([0, 1200, -1200] * 320, dtype="<i2").tobytes()
+    frame_samples = len(frame) // 2
+    frame_count = 11
+
+    try:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()
+            ws.send_bytes(frame)
+            assert fake_asr.decode_started.wait(timeout=2.0)
+            for _ in range(frame_count - 1):
+                ws.send_bytes(frame)
+            fake_asr.decode_release.set()
+            ws.send_text('{"type":"finish"}')
             _receive_until_type(ws, "final", max_steps=80)
     finally:
         fake_asr.decode_release.set()
@@ -6166,6 +6395,97 @@ def test_ws_mid_speech_hard_cut_holds_terminal_hypothesis_for_continuation(tmp_p
         if line.strip()
     ]
     assert any(row.get("event") == "hard_cut_mid_speech_tail_held" for row in trace_rows)
+
+
+def test_ws_hard_cut_preserves_terminal_stable_clause_from_single_long_sentence(
+    tmp_path,
+):
+    first_full = (
+        "好，感谢神给我们机会，让我们一起分享神的话语，"
+        "今天继续看尼希米记第八章，"
+        "所以从第一章到第七章我们看见尼希米带领以色列人来建造。"
+    )
+    boundary_clause = "所以从第一章到第七章我们看见尼希米带领以色列人来建造。"
+    following = "城墙，从第八章开始我们继续看神怎样修复他的子民。"
+
+    class _SingleTerminalLongSentenceASR(_FakeASR):
+        def __init__(self):
+            super().__init__()
+            self.segment_no = 0
+
+        def init_streaming_state(self, **kwargs):
+            state = super().init_streaming_state(**kwargs)
+            self.segment_no += 1
+            state.segment_no = self.segment_no
+            state.segment_calls = 0
+            return state
+
+        def streaming_transcribe(self, wav, state):
+            state.language = "Chinese"
+            state.segment_calls += 1
+            if state.segment_no == 1:
+                state.text = first_full
+            elif state.segment_calls <= 2:
+                state.text = "啊。"
+            else:
+                state.text = following
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            self.finish_calls += 1
+            state.language = "Chinese"
+            return state
+
+    translator = _FakeTranslator()
+    args = _args()
+    args.segment_hard_cut_sec = 1.0
+    args.segment_overlap_sec = 0.0
+    args.final_redecode_on_stop = False
+    args.early_translation_stable_sec = 0.0
+    args.early_translation_stable_hits = 2
+    args.subtitle_trace_log = True
+    args.subtitle_trace_log_file = str(tmp_path / "hard-cut-long-sentence-clause.jsonl")
+    app = _create_app(args, _SingleTerminalLongSentenceASR(), translator=translator)
+
+    events = []
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        frame = np.array([0, 1200, -1200] * 2400, dtype="<i2").tobytes()
+        ws.send_bytes(frame)
+        _receive_until_type(ws, "partial")
+        time.sleep(1.1)
+        for _ in range(8):
+            ws.send_bytes(frame)
+            while True:
+                message = ws.receive_json()
+                events.append(message)
+                if message.get("type") == "partial":
+                    break
+        ws.send_json({"type": "finish", "mode": "stop"})
+        events.extend(_collect_through_final(ws))
+
+    latest_by_id = {
+        str(message.get("sentence_id", "")): str(message.get("text", "")).strip()
+        for message in events
+        if message.get("type") in {"sentence_committed", "sentence_updated"}
+    }
+    committed = list(latest_by_id.values())
+    assert boundary_clause in committed
+    assert boundary_clause in [call[0] for call in translator.calls]
+    trace_rows = [
+        json.loads(line)
+        for line in Path(args.subtitle_trace_log_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        row.get("event") == "hard_cut_mid_speech_tail_held"
+        and row.get("terminal_chars") == len(boundary_clause)
+        for row in trace_rows
+    )
+    assert not any(
+        row.get("event") == "pending_prefix_hard_cut_fallback_skip"
+        for row in trace_rows
+    )
 
 
 def test_ws_mid_speech_hard_cut_waits_for_boundary_sentence_to_finish_growing(tmp_path):

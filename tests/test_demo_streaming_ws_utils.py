@@ -172,6 +172,25 @@ def test_context_term_run_requires_three_terms_with_only_whitespace_between(
     assert (match[2] if match is not None else None) == expected_count
 
 
+def test_context_term_run_removal_preserves_real_text_around_echo():
+    terms = ("Alpha", "Beta", "Gamma")
+    source = "A real spoken clause before Alpha Beta Gamma and after."
+    match = demo_streaming_ws._find_consecutive_context_term_run(source, terms)
+
+    assert match is not None
+    assert demo_streaming_ws._remove_context_term_run(source, match) == (
+        "A real spoken clause before and after."
+    )
+
+    pure_echo = "Alpha Beta Gamma."
+    pure_match = demo_streaming_ws._find_consecutive_context_term_run(
+        pure_echo,
+        terms,
+    )
+    assert pure_match is not None
+    assert demo_streaming_ws._remove_context_term_run(pure_echo, pure_match) == ""
+
+
 def test_context_resume_guard_waits_for_speech_when_silero_is_available():
     context = "尼希米 城墙 羊门 粪门 祭司 圣经"
     fragment = "所以说，城墙、羊门、粪门。"
@@ -357,6 +376,50 @@ def test_should_not_skip_stream_decode_when_snr_is_high():
     )
 
 
+def test_silero_rescues_quiet_speech_from_energy_decode_skip():
+    assert demo_streaming_ws._should_rescue_stream_decode(
+        energy_skip=True,
+        frames=6,
+        mean_probability=0.82,
+        max_probability=0.99,
+        threshold=0.5,
+    )
+    assert not demo_streaming_ws._should_rescue_stream_decode(
+        energy_skip=True,
+        frames=6,
+        mean_probability=0.12,
+        max_probability=0.44,
+        threshold=0.5,
+    )
+    assert not demo_streaming_ws._should_rescue_stream_decode(
+        energy_skip=False,
+        frames=6,
+        mean_probability=0.82,
+        max_probability=0.99,
+        threshold=0.5,
+    )
+
+
+def test_silero_rescues_speech_evidence_diluted_by_silence_in_large_batch():
+    assert demo_streaming_ws._should_rescue_stream_decode(
+        energy_skip=True,
+        frames=188,
+        mean_probability=0.7427,
+        max_probability=1.0,
+        threshold=0.5,
+    )
+
+
+def test_silero_does_not_rescue_single_spike_in_large_silent_batch():
+    assert not demo_streaming_ws._should_rescue_stream_decode(
+        energy_skip=True,
+        frames=188,
+        mean_probability=0.0054,
+        max_probability=1.0,
+        threshold=0.5,
+    )
+
+
 def test_should_skip_stream_decode_for_in_speech_trailing_silence():
     assert _should_skip_stream_decode(
         in_speech=True,
@@ -505,6 +568,29 @@ def test_hard_cut_fallback_merges_unfinished_cjk_tail():
     assert demo_streaming_ws._should_hard_cut_fallback_merge("第一句不完整", "继续补全成句。")
 
 
+def test_hard_cut_before_vad_endpoint_is_treated_as_mid_speech():
+    classify = demo_streaming_ws._is_hard_cut_mid_speech
+
+    assert classify(
+        reason="hard_cut",
+        in_speech=True,
+        silence_ms=110.0,
+        vad_silence_ms=700.0,
+    )
+    assert not classify(
+        reason="hard_cut",
+        in_speech=True,
+        silence_ms=700.0,
+        vad_silence_ms=700.0,
+    )
+    assert not classify(
+        reason="vad_silence",
+        in_speech=True,
+        silence_ms=110.0,
+        vad_silence_ms=700.0,
+    )
+
+
 def test_resegmentation_cursor_does_not_consume_a_new_terminal_sentence():
     assert hasattr(demo_streaming_ws, "_remap_completed_cursor_after_resegmentation")
     previous = [
@@ -647,9 +733,28 @@ def test_translation_prompt_does_not_apply_esv_policy_to_en_zh():
     assert "不得补写、扩写" not in prompt
     assert prompt == (
         "请将以下English文本翻译为中文。\n"
-        "要求：忠实原文，不增删；保留专有名词；只输出译文本身，不要解释。\n\n"
+        "要求：忠实原文，不增删；保留专有名词；"
+        "省略不承载语义、只用于拖延发言的犹豫音和口头填充，"
+        "不得把这些成分翻译成目标语言中的填充词；"
+        "自我修复只保留修正后的语义；"
+        "不得因此省略有语义的感叹、否定、强调或正文内容；"
+        "只输出译文本身，不要解释。\n\n"
         "原文：\nThis is the source sentence."
     )
+
+
+def test_translation_prompt_handles_disfluency_without_a_fixed_token_list():
+    source = "这是包含自然停顿和自我修复的原文。"
+    prompt = demo_streaming_ws._build_translation_prompt(
+        source,
+        "Chinese",
+        "English",
+    )
+
+    assert "不得把这些成分翻译成目标语言中的填充词" in prompt
+    assert "自我修复只保留修正后的语义" in prompt
+    assert "不得因此省略有语义的感叹、否定、强调或正文内容" in prompt
+    assert f"原文：\n{source}" in prompt
 
 
 def test_translation_prompt_uses_session_direction_after_source_autofallback():
@@ -769,7 +874,12 @@ def test_openai_api_translator_keeps_general_prompt_for_en_zh(monkeypatch):
     assert "English Standard Version (ESV)" not in prompt
     assert prompt == (
         "请将以下English文本翻译为中文。\n"
-        "要求：忠实原文，不增删；保留专有名词；只输出译文本身，不要解释。\n\n"
+        "要求：忠实原文，不增删；保留专有名词；"
+        "省略不承载语义、只用于拖延发言的犹豫音和口头填充，"
+        "不得把这些成分翻译成目标语言中的填充词；"
+        "自我修复只保留修正后的语义；"
+        "不得因此省略有语义的感叹、否定、强调或正文内容；"
+        "只输出译文本身，不要解释。\n\n"
         "原文：\nThis is the source sentence."
     )
 
@@ -1135,6 +1245,7 @@ def test_parse_args_accepts_decode_preroll_and_silero_shadow(monkeypatch):
             "--silent-decode-pre-roll-sec",
             "0.4",
             "--silero-vad-shadow",
+            "--silero-vad-rescue",
             "--silero-vad-shadow-threshold",
             "0.55",
             "--silero-vad-shadow-log-sec",
@@ -1146,6 +1257,7 @@ def test_parse_args_accepts_decode_preroll_and_silero_shadow(monkeypatch):
 
     assert args.silent_decode_pre_roll_sec == 0.4
     assert args.silero_vad_shadow is True
+    assert args.silero_vad_rescue is True
     assert args.silero_vad_shadow_threshold == 0.55
     assert args.silero_vad_shadow_log_sec == 1.5
 
@@ -2264,6 +2376,8 @@ def test_listener_page_uses_one_native_hls_element_without_sentence_blob_queue()
     assert 'id="ttsPlayback"' in TTS_LISTENER_HTML
     assert "playsinline" in TTS_LISTENER_HTML
     assert 'preload="none"' in TTS_LISTENER_HTML
+    assert '<script src="/listen/assets/hls.min.js"></script>' in TTS_LISTENER_HTML
+    assert "Hls.isSupported()" in TTS_LISTENER_HTML
     assert "/api/tts/live/${encodeURIComponent(listenerId)}/index.m3u8" in TTS_LISTENER_HTML
     for removed in (
         "SILENT_WAV_DATA_URL",

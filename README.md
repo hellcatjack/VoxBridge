@@ -106,16 +106,17 @@ ss -lntp | rg ':8024'
 
 浏览器访问 `http://127.0.0.1:8024`。公网部署必须先阅读 [部署指南](docs/DEPLOYMENT.md)，启用认证并使用 HTTPS/WSS。
 
-生产 trace 已开启时，可以追加以下参数观测 VAD，而不改变当前 SNR 切段判断：
+生产 trace 已开启时，可以追加以下参数观测 VAD，并仅用强 Silero 语音证据救回原本会被 SNR 门丢弃的轻声音频：
 
 ```bash
 --silent-decode-pre-roll-sec 0.4 \
 --silero-vad-shadow \
+--silero-vad-rescue \
 --silero-vad-shadow-threshold 0.5 \
 --silero-vad-shadow-log-sec 1.0
 ```
 
-pre-roll 只缓存现有门控原本会跳过的音频：恢复推理时重放一次；若直接到达段落端点，则在 final 前作为有界尾音解码一次。Silero 加载或推理失败只会产生 `silero_shadow_unavailable`，不会阻断 ASR、翻译或 TTS。
+pre-roll 只缓存现有门控原本会跳过的音频：恢复推理时重放一次；若直接到达段落端点，则在 final 前作为有界尾音解码一次。`--silero-vad-rescue` 按整批累计语音证据阻止“前部语音、后部静音”的合并批次被整体跳过，但不覆盖能量 VAD 已确认的静音端点，也不直接提交文本；Silero 加载或推理失败只会产生 `silero_shadow_unavailable`，不会阻断 ASR、翻译或 TTS。
 
 ## 翻译与 Context
 
@@ -146,7 +147,7 @@ pre-roll 只缓存现有门控原本会跳过的音频：恢复推理时重放�
 
 译文朗读必须同时启用翻译和 `--enable-tts`，并要求系统可执行文件中存在 `ffmpeg`。主字幕页不播放音频，只提供独立 `/listen` 页面入口；该入口免登录，固定公开地址为 `https://ushome.amycat.com:18024/listen`，主页面默认显示指向它的本地静态二维码。Pittsburgh Christian Church South（PCCS）专用监听页全部使用英文，并固定在一个浏览器视口内，不产生页面滚动条。手机、平板或其他电脑扫码后点击该设备自己的 Start 即可监听。
 
-监听页把一个持续的原生 HLS 音频元素直接绑定到这次用户点击，后端在没有译文时持续写入静音 AAC，因此 iPhone 锁屏后不需要 JavaScript 唤醒、切换音频文件或继续运行 WebSocket 计时器。主字幕页、ASR WebSocket、登录和管理接口仍受原有认证保护；只有监听页、二维码、共享直播状态和 listener-scoped HLS 能力端点公开。
+监听页把一个持续的音频元素绑定到这次用户点击：iPhone/Safari 使用原生 HLS，以便锁屏后不依赖 JavaScript 唤醒；具备 MSE AAC 解码能力的桌面 Chrome、Edge 和 Firefox 使用项目内固定版本的 hls.js，避免依赖不可靠的桌面原生 HLS 探测。后端在没有译文时持续写入听感静音但可解码的 AAC 载波，两种客户端都不会切换逐句音频文件或创建额外的 Kokoro/FFmpeg 任务。主字幕页、ASR WebSocket、登录和管理接口仍受原有认证保护；只有监听页、二维码、本地 hls.js 资产、共享直播状态和 listener-scoped HLS 能力端点公开。
 
 共享 HLS 使用 bounded pre-listener backlog：当前 ASR 会话中已经通过 revision 稳定门、但发布时尚无监听设备的译文，会保留在最多 128 项的有界待播池中。首台设备加入新的直播时间线时，后端会丢弃过期待播项，只保留最新一条稳定译文交给同一个 Kokoro worker，随后继续按源句顺序朗读新译文；因此扫码加入或重新 Start 默认从直播最新内容开始，而不会从会议开头补播。超过上限时仍只淘汰最旧的未播项。新 ASR 会话开始时，如果没有活跃监听或编码器，会清除上一会话的待播池，防止跨会议串音。
 

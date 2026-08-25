@@ -76,7 +76,7 @@ from voxbridge.tts.hls import (
     HLSUnavailable,
     SharedHLSTTSPublisher,
 )
-from voxbridge.tts.listener_page import TTS_LISTENER_HTML
+from voxbridge.tts.listener_page import HLS_JS_PATH, TTS_LISTENER_HTML
 from voxbridge.tts.public_listener import PUBLIC_LISTENER_QR_SVG
 from voxbridge.tts.kokoro_onnx import (
     KokoroOnnxSynthesizer,
@@ -444,6 +444,32 @@ def _find_consecutive_context_term_run(
     return best
 
 
+def _remove_context_term_run(
+    text: str,
+    match: Tuple[int, int, int],
+) -> str:
+    """Remove only a detected context echo run while retaining spoken text."""
+
+    source = str(text or "")
+    start, end, _count = match
+    start = max(0, min(int(start), len(source)))
+    end = max(start, min(int(end), len(source)))
+    prefix = source[:start].strip()
+    suffix = source[end:].strip()
+    if prefix and suffix:
+        if re.match(r'^[,.;:!?，。！？；：…\)\]\}）】》]', suffix):
+            residual = f"{prefix}{suffix}"
+        else:
+            residual = f"{prefix} {suffix}"
+    else:
+        residual = prefix or suffix
+    residual = re.sub(r"\s+([,.;:!?，。！？；：…\)\]\}）】》])", r"\1", residual)
+    residual = " ".join(residual.split()).strip()
+    if not re.search(r"\w", residual, flags=re.UNICODE):
+        return ""
+    return residual
+
+
 def _contains_unsubstantiated_asr_context_fragment(
     context: str,
     text: str,
@@ -789,6 +815,12 @@ def _build_translation_prompt(
         requirements.append(_ESV_ZH_TO_EN_POLICY)
     else:
         requirements.append("保留专有名词")
+    requirements.append(
+        "省略不承载语义、只用于拖延发言的犹豫音和口头填充，"
+        "不得把这些成分翻译成目标语言中的填充词；"
+        "自我修复只保留修正后的语义；"
+        "不得因此省略有语义的感叹、否定、强调或正文内容"
+    )
     if strict_target_language:
         requirements.append(f"译文必须全部使用{target}，不得保留未翻译的{source}字词")
     requirements.append("只输出译文本身，不要解释")
@@ -1095,6 +1127,22 @@ def _should_hard_cut_fallback_merge(pending_prefix: str, raw_text: str) -> bool:
     if _text_ends_with_sentence_terminator(pending):
         return False
     return True
+
+
+def _is_hard_cut_mid_speech(
+    *,
+    reason: str,
+    in_speech: bool,
+    silence_ms: float,
+    vad_silence_ms: float,
+) -> bool:
+    """Treat every hard cut before the configured VAD endpoint as mid-speech."""
+
+    return bool(
+        str(reason or "") == "hard_cut"
+        and bool(in_speech)
+        and float(silence_ms) < max(0.0, float(vad_silence_ms))
+    )
 
 
 def _is_abbreviation_period_boundary(text: str, start: int, end: int) -> bool:
@@ -1788,6 +1836,27 @@ def _should_skip_stream_decode(
     silence_gate_ms = max(80.0, min(float(vad_silence_ms), 200.0))
     quiet_window_ms = max(float(silence_ms), float(segment_elapsed_ms))
     return quiet_window_ms >= silence_gate_ms
+
+
+def _should_rescue_stream_decode(
+    *,
+    energy_skip: bool,
+    frames: int,
+    mean_probability: float,
+    max_probability: float,
+    threshold: float,
+) -> bool:
+    """Use accumulated Silero evidence to retain speech inside a mixed batch."""
+
+    if not bool(energy_skip) or int(frames) <= 0:
+        return False
+    confidence_floor = max(0.8, min(1.0, float(threshold)))
+    evidence = max(0.0, float(mean_probability)) * int(frames)
+    required_evidence = min(6.0, float(int(frames)) * confidence_floor)
+    return bool(
+        float(max_probability) >= confidence_floor
+        and evidence >= required_evidence
+    )
 
 
 def _should_use_high_batch_merge(*, queue_depth: int, audio_queue_size: int, under_pressure: bool) -> bool:
@@ -5597,6 +5666,17 @@ def _create_app(
     async def tts_listener_page():
         return HTMLResponse(TTS_LISTENER_HTML)
 
+    @app.get("/listen/assets/hls.min.js")
+    async def public_hls_js() -> FileResponse:
+        return FileResponse(
+            str(HLS_JS_PATH),
+            media_type="text/javascript",
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @app.get("/listen/qr.svg")
     async def public_tts_listener_qr() -> Response:
         return Response(
@@ -5988,7 +6068,6 @@ def _create_app(
             int(max(0.1, float(getattr(args, "consumer_batch_sec", 1.0))) * SAMPLE_RATE),
         )
         consumer_high_batch_samples = max(consumer_max_batch_samples, int(3.0 * SAMPLE_RATE))
-        hard_overflow_relief_sec = max(2.0, float(getattr(args, "backpressure_hard_relief_sec", 6.0)))
         final_redecode_on_stop = bool(getattr(args, "final_redecode_on_stop", False))
         segment_final_redecode = bool(getattr(args, "segment_final_redecode", False))
         final_redecode_max_samples = int(max(0.0, float(getattr(args, "final_redecode_max_sec", 180.0))) * SAMPLE_RATE)
@@ -6004,7 +6083,10 @@ def _create_app(
             sample_rate=SAMPLE_RATE,
             duration_sec=silent_decode_pre_roll_sec,
         )
-        silero_shadow_enabled = bool(getattr(args, "silero_vad_shadow", False))
+        silero_rescue_enabled = bool(getattr(args, "silero_vad_rescue", False))
+        silero_shadow_enabled = bool(
+            getattr(args, "silero_vad_shadow", False) or silero_rescue_enabled
+        )
         silero_shadow_threshold = min(
             1.0,
             max(0.0, float(getattr(args, "silero_vad_shadow_threshold", 0.5))),
@@ -6422,7 +6504,7 @@ def _create_app(
                     sample_rate=SAMPLE_RATE,
                     frame_samples=int(silero_shadow_observer.frame_samples),
                     threshold=round(float(silero_shadow_threshold), 3),
-                    control_mode="observe_only",
+                    control_mode=("decode_rescue" if silero_rescue_enabled else "observe_only"),
                 )
             except Exception as exc:
                 silero_shadow_observer = None
@@ -9008,10 +9090,11 @@ def _create_app(
             if local_state is None:
                 return False
 
-            hard_cut_mid_speech = bool(
-                str(reason or "") == "hard_cut"
-                and bool(getattr(backend_vad, "in_speech", False))
-                and float(getattr(backend_vad, "silence_ms", 0.0) or 0.0) < 80.0
+            hard_cut_mid_speech = _is_hard_cut_mid_speech(
+                reason=str(reason or ""),
+                in_speech=bool(getattr(backend_vad, "in_speech", False)),
+                silence_ms=float(getattr(backend_vad, "silence_ms", 0.0) or 0.0),
+                vad_silence_ms=float(vad_silence_trigger_ms),
             )
             legacy_segment_context_redecode = bool(
                 asr_context_apply_mode == "segment_final"
@@ -9267,6 +9350,32 @@ def _create_app(
                         carry_chars=len(pending_prefix),
                         boundary_removed=bool(continuation_candidate != terminal_candidate),
                         terminal_hash8=_hash8(terminal_candidate),
+                        carry_hash8=_hash8(pending_prefix),
+                    )
+            if (
+                hard_cut_mid_speech
+                and pending_prefix
+                and not pending_prefix_terminal_text
+            ):
+                continuation_candidate = _strip_terminal_boundary_for_continuation(
+                    pending_prefix
+                )
+                if continuation_candidate != pending_prefix:
+                    pending_prefix_terminal_text = pending_prefix
+                    pending_prefix = continuation_candidate
+                    _trace_event(
+                        "hard_cut_mid_speech_tail_held",
+                        seq=int(seq),
+                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        silence_ms=round(
+                            float(getattr(backend_vad, "silence_ms", 0.0) or 0.0),
+                            1,
+                        ),
+                        terminal_chars=len(pending_prefix_terminal_text),
+                        carry_chars=len(pending_prefix),
+                        boundary_removed=True,
+                        source="stable_clause",
+                        terminal_hash8=_hash8(pending_prefix_terminal_text),
                         carry_hash8=_hash8(pending_prefix),
                     )
             overlap_cap_chars = int(getattr(subtitle_state, "boundary_overlap_cap_chars", 12) or 12)
@@ -10469,29 +10578,47 @@ def _create_app(
                 context_run = _streaming_context_run(sentence)
                 if context_run is not None:
                     run_start, run_end, run_count = context_run
-                    _record_completed_candidate(i, sentence, "")
-                    _trace_event(
-                        "context_run_commit_dropped",
-                        seq=seq_no,
-                        idx=int(i),
-                        sentence_chars=len(sentence),
-                        sentence_hash8=_hash8(sentence),
-                        context_term_count=int(run_count),
-                        run_chars=max(0, int(run_end) - int(run_start)),
-                        slice_commit=bool(slice_commit),
-                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
-                    )
-                    _trace_event(
-                        "candidate_action",
-                        seq=seq_no,
-                        idx=int(i),
-                        action="streaming_context_echo_drop",
-                        sentence_id="",
-                        text_hash8=_hash8(sentence),
-                        context_term_count=int(run_count),
-                        segment_id=int(getattr(segment_runtime, "id", 0) or 0),
-                    )
-                    continue
+                    residual = _remove_context_term_run(sentence, context_run)
+                    if residual:
+                        _trace_event(
+                            "context_run_commit_trimmed",
+                            seq=seq_no,
+                            idx=int(i),
+                            old_chars=len(sentence),
+                            new_chars=len(residual),
+                            old_hash8=_hash8(sentence),
+                            new_hash8=_hash8(residual),
+                            context_term_count=int(run_count),
+                            run_chars=max(0, int(run_end) - int(run_start)),
+                            slice_commit=bool(slice_commit),
+                            segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        )
+                        sentence = residual
+                        completed[i] = sentence
+                    else:
+                        _record_completed_candidate(i, sentence, "")
+                        _trace_event(
+                            "context_run_commit_dropped",
+                            seq=seq_no,
+                            idx=int(i),
+                            sentence_chars=len(sentence),
+                            sentence_hash8=_hash8(sentence),
+                            context_term_count=int(run_count),
+                            run_chars=max(0, int(run_end) - int(run_start)),
+                            slice_commit=bool(slice_commit),
+                            segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        )
+                        _trace_event(
+                            "candidate_action",
+                            seq=seq_no,
+                            idx=int(i),
+                            action="streaming_context_echo_drop",
+                            sentence_id="",
+                            text_hash8=_hash8(sentence),
+                            context_term_count=int(run_count),
+                            segment_id=int(getattr(segment_runtime, "id", 0) or 0),
+                        )
+                        continue
                 candidate_compact = _compact_asr_compare_text(sentence)
                 covered_min_chars = 6 if _has_cjk(sentence) else 12
                 if (
@@ -10792,28 +10919,6 @@ def _create_app(
             async with send_lock:
                 await websocket.send_json(payload)
 
-        def _drop_oldest_audio() -> bool:
-            nonlocal queue_samples, audio_spill_generation, audio_spill_samples
-            try:
-                dropped_gen, dropped_wav = audio_queue.get_nowait()
-                if isinstance(dropped_wav, ClientSilenceSpan):
-                    deferred_audio_items.append((int(dropped_gen), dropped_wav))
-                    return False
-                queue_samples = max(0, int(queue_samples - int(getattr(dropped_wav, "size", 0))))
-                stats.queue_dropped += 1
-                return True
-            except asyncio.QueueEmpty:
-                if not audio_spill_parts:
-                    return False
-                dropped_wav = audio_spill_parts.pop(0)
-                dropped_samples = int(getattr(dropped_wav, "size", 0))
-                audio_spill_samples = max(0, int(audio_spill_samples - dropped_samples))
-                queue_samples = max(0, int(queue_samples - dropped_samples))
-                stats.queue_dropped += 1
-                if not audio_spill_parts:
-                    audio_spill_generation = None
-                return True
-
         def _flush_audio_spill() -> bool:
             nonlocal audio_spill_generation, audio_spill_samples
             if not audio_spill_parts or audio_queue.full():
@@ -10895,9 +11000,8 @@ def _create_app(
             audio_spill_generation = None
             return dropped
 
-        def _enqueue_audio(gen: int, wav: np.ndarray) -> None:
+        async def _enqueue_audio(gen: int, wav: np.ndarray) -> None:
             nonlocal queue_samples
-            dropped_now = 0
             now_mono = time.monotonic()
             if audio_spill_parts:
                 _append_audio_spill(gen, wav)
@@ -10909,12 +11013,6 @@ def _create_app(
                 except asyncio.QueueFull:
                     _append_audio_spill(gen, wav)
             pressure = backpressure.evaluate(int(queue_samples))
-            if pressure.drop_oldest:
-                while backpressure.evaluate(int(queue_samples)).drop_oldest:
-                    if not _drop_oldest_audio():
-                        break
-                    dropped_now += 1
-                _flush_audio_spill()
             if pressure.reason == "hard_overflow":
                 if float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0) <= 0.0:
                     backpressure_runtime.hard_overflow_since = now_mono
@@ -10956,17 +11054,47 @@ def _create_app(
             backpressure_runtime.under_pressure = bool(pressure.under_pressure)
             backpressure_runtime.reason = str(pressure.reason)
             stats.queue_depth_peak = max(stats.queue_depth_peak, int(audio_queue.qsize()))
-            if dropped_now > 0:
+
+            if pressure.pause_ingress:
+                wait_started_at = time.monotonic()
                 _trace_event(
-                    "audio_backpressure_drop",
+                    "audio_backpressure_wait_start",
                     reason=str(pressure.reason),
-                    dropped_now=int(dropped_now),
-                    dropped_total=int(stats.queue_dropped),
                     queue_sec=round(float(pressure.queue_sec), 3),
                     queue_samples=int(queue_samples),
                     queue_depth=int(audio_queue.qsize()),
                     frame_samples=int(wav.size),
                 )
+                while backpressure.evaluate(int(queue_samples)).pause_ingress:
+                    _flush_audio_spill()
+                    if consumer_task is not None and consumer_task.done():
+                        break
+                    await asyncio.sleep(0.005)
+                _flush_audio_spill()
+                recovered = backpressure.evaluate(int(queue_samples))
+                _trace_event(
+                    "audio_backpressure_wait_end",
+                    reason=str(recovered.reason),
+                    duration_ms=int(max(0.0, (time.monotonic() - wait_started_at) * 1000.0)),
+                    queue_sec=round(float(recovered.queue_sec), 3),
+                    queue_samples=int(queue_samples),
+                    queue_depth=int(audio_queue.qsize()),
+                )
+                hard_since = float(
+                    getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0
+                )
+                if hard_since > 0.0 and recovered.reason != "hard_overflow":
+                    _trace_event(
+                        "audio_backpressure_hard_end",
+                        reason="ingress_wait",
+                        duration_ms=int(max(0.0, (time.monotonic() - hard_since) * 1000.0)),
+                        queue_sec=round(float(recovered.queue_sec), 3),
+                        queue_samples=int(queue_samples),
+                        queue_depth=int(audio_queue.qsize()),
+                    )
+                    backpressure_runtime.hard_overflow_since = 0.0
+                backpressure_runtime.under_pressure = bool(recovered.under_pressure)
+                backpressure_runtime.reason = str(recovered.reason)
 
         async def _enqueue_client_silence(gen: int, span: ClientSilenceSpan) -> None:
             # A control span is an ordering barrier. Flush older spill audio before
@@ -11138,41 +11266,6 @@ def _create_app(
             nonlocal silero_shadow_observer, silero_shadow_last_log_at
             nonlocal silero_shadow_last_disagreement
 
-            def _relieve_hard_overflow_if_needed() -> None:
-                hard_since = float(getattr(backpressure_runtime, "hard_overflow_since", 0.0) or 0.0)
-                if hard_since <= 0.0:
-                    return
-                now_mono = time.monotonic()
-                if (now_mono - hard_since) < float(hard_overflow_relief_sec):
-                    return
-                last_relief = float(getattr(backpressure_runtime, "last_relief_at", 0.0) or 0.0)
-                if last_relief > 0.0 and (now_mono - last_relief) < float(hard_overflow_relief_sec):
-                    return
-
-                target_samples = int(max(0.0, float(queue_target_sec)) * SAMPLE_RATE)
-                trimmed = 0
-                while int(queue_samples) > int(target_samples):
-                    if not _drop_oldest_audio():
-                        break
-                    trimmed += 1
-
-                backpressure_runtime.last_relief_at = now_mono
-                pressure = backpressure.evaluate(int(queue_samples))
-                if bool(pressure.drop_oldest):
-                    backpressure_runtime.hard_overflow_since = now_mono
-                else:
-                    backpressure_runtime.hard_overflow_since = 0.0
-
-                if trimmed > 0:
-                    _trace_event(
-                        "audio_backpressure_relief",
-                        reason="sustained_hard_overflow",
-                        trimmed_frames=int(trimmed),
-                        queue_sec=round(float(pressure.queue_sec), 3),
-                        queue_samples=int(queue_samples),
-                        queue_depth=int(audio_queue.qsize()),
-                    )
-
             while not stop_consumer.is_set():
                 _flush_audio_spill()
                 if (
@@ -11182,7 +11275,6 @@ def _create_app(
                     and not deferred_audio_items
                 ):
                     break
-                _relieve_hard_overflow_if_needed()
                 try:
                     if deferred_audio_items:
                         gen, wav = deferred_audio_items.pop(0)
@@ -11190,7 +11282,6 @@ def _create_app(
                         gen, wav = await asyncio.wait_for(audio_queue.get(), timeout=0.2)
                 except asyncio.TimeoutError:
                     _flush_audio_spill()
-                    _relieve_hard_overflow_if_needed()
                     await _maybe_idle_tail_commit()
                     await _maybe_vad_silence_cut(
                         {
@@ -11245,11 +11336,46 @@ def _create_app(
                         )
                         silero_shadow_observer = None
                     elif shadow.frames > 0:
+                        rescue_decode = bool(
+                            silero_rescue_enabled
+                            and _should_rescue_stream_decode(
+                                energy_skip=bool(should_skip_decode),
+                                frames=int(shadow.frames),
+                                mean_probability=float(shadow.mean_probability or 0.0),
+                                max_probability=float(shadow.max_probability or 0.0),
+                                threshold=float(silero_shadow_threshold),
+                            )
+                        )
+                        if rescue_decode:
+                            duration_ms = (
+                                float(shadow.frames * silero_shadow_observer.frame_samples)
+                                * 1000.0
+                                / float(SAMPLE_RATE)
+                            )
+                            should_skip_decode = False
+                            _trace_event(
+                                "silero_decode_rescue",
+                                probability=round(float(shadow.last_probability or 0.0), 4),
+                                mean_probability=round(float(shadow.mean_probability or 0.0), 4),
+                                max_probability=round(float(shadow.max_probability or 0.0), 4),
+                                frames=int(shadow.frames),
+                                rescued_ms=int(round(duration_ms)),
+                                snr_db=round(float(vad_signal.get("snr_db", 0.0) or 0.0), 2),
+                                control_mode="decode_rescue",
+                                vad_control_mode="preserve_energy_vad",
+                                vad_candidate=bool(vad_signal.get("candidate", False)),
+                                vad_silence_ms=int(
+                                    round(float(vad_signal.get("silence_ms", 0.0) or 0.0))
+                                ),
+                            )
                         if bool(context_resume_guard.active):
                             shadow_confirms_speech = bool(
-                                shadow.is_speech
-                                and float(shadow.mean_probability or 0.0)
-                                >= float(silero_shadow_threshold)
+                                rescue_decode
+                                or (
+                                    shadow.is_speech
+                                    and float(shadow.mean_probability or 0.0)
+                                    >= float(silero_shadow_threshold)
+                                )
                             )
                             if shadow_confirms_speech:
                                 context_resume_guard.silero_speech_samples += int(
@@ -11280,7 +11406,9 @@ def _create_app(
                             "disagreement": bool(disagreement),
                             "frames": int(shadow.frames),
                             "pending_samples": int(shadow.pending_samples),
-                            "control_mode": "observe_only",
+                            "control_mode": (
+                                "decode_rescue" if silero_rescue_enabled else "observe_only"
+                            ),
                         }
                         if shadow.state_changed:
                             _trace_event("silero_shadow_transition", **common_shadow_fields)
@@ -12009,7 +12137,7 @@ def _create_app(
                         )
                     async with state_lock:
                         gen = state_generation
-                    _enqueue_audio(gen, wav)
+                    await _enqueue_audio(gen, wav)
                     continue
 
                 if text is not None:
@@ -12869,13 +12997,13 @@ def parse_args() -> argparse.Namespace:
         "--backpressure-max-queue-sec",
         type=float,
         default=5.0,
-        help="Hard queue cap in seconds before oldest frames are dropped.",
+        help="Hard queue cap in seconds before WebSocket ingress pauses without dropping PCM.",
     )
     p.add_argument(
         "--backpressure-hard-relief-sec",
         type=float,
         default=6.0,
-        help="If hard overflow persists beyond this duration, trim queue down to target seconds.",
+        help="Deprecated no-op retained for command-line compatibility.",
     )
     p.add_argument(
         "--backend-vad-enter-snr-db",
@@ -12906,6 +13034,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         action=argparse.BooleanOptionalAction,
         help="Run Silero VAD for structured observations without affecting control decisions.",
+    )
+    p.add_argument(
+        "--silero-vad-rescue",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Decode quiet batches with accumulated Silero speech evidence without changing VAD cuts.",
     )
     p.add_argument(
         "--silero-vad-shadow-threshold",

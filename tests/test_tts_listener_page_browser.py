@@ -50,6 +50,10 @@ def _install_hls_harness(
     caption_snapshot: dict | None = None,
     defer_caption_fetch: bool = False,
     defer_first_play: bool = False,
+    native_hls: bool = True,
+    hls_js_supported: bool = False,
+    managed_media_source: bool = False,
+    mse_aac_supported: bool = True,
 ):
     snapshot = caption_snapshot or {"live_edge_at_ms": None, "cues": []}
     listener_page.add_init_script(
@@ -64,6 +68,35 @@ def _install_hls_harness(
         window.__ttsDeferFirstPlay = {json.dumps(defer_first_play)};
         window.__ttsResolveFirstPlay = null;
         window.__ttsMediaActions = {{}};
+        window.__ttsHlsInstances = [];
+        if ({json.dumps(managed_media_source)}) {{
+          window.ManagedMediaSource = class FakeManagedMediaSource {{}};
+        }}
+        if (window.MediaSource) {{
+          window.MediaSource.isTypeSupported = function(type) {{
+            return {json.dumps(mse_aac_supported)}
+              && String(type).includes("mp4a.40.2");
+          }};
+        }}
+        HTMLMediaElement.prototype.canPlayType = function(type) {{
+          return {json.dumps(native_hls)} && String(type).includes("mpegurl")
+            ? "maybe"
+            : "";
+        }};
+        window.Hls = class FakeHls {{
+          static isSupported() {{ return {json.dumps(hls_js_supported)}; }}
+          constructor() {{
+            this.loadedSources = [];
+            this.attachedMedia = [];
+            this.destroyed = false;
+            window.__ttsHlsInstances.push(this);
+          }}
+          loadSource(source) {{ this.loadedSources.push(String(source)); }}
+          attachMedia(media) {{ this.attachedMedia.push(media.id); }}
+          destroy() {{ this.destroyed = true; }}
+          on() {{}}
+        }};
+        window.Hls.Events = {{ ERROR: "hlsError" }};
         window.__ttsMediaSession = {{
           metadata: null,
           playbackState: "none",
@@ -634,7 +667,12 @@ def test_listener_waits_for_hls_playback_before_polling_captions(listener_page):
 
 
 def test_listener_starts_one_unmuted_hls_stream_inside_click(listener_page):
-    _install_hls_harness(listener_page)
+    _install_hls_harness(
+        listener_page,
+        native_hls=True,
+        hls_js_supported=True,
+        managed_media_source=True,
+    )
     _start_hls_harness(listener_page)
 
     calls = listener_page.evaluate("window.__ttsPlayCalls.slice()")
@@ -645,7 +683,71 @@ def test_listener_starts_one_unmuted_hls_stream_inside_click(listener_page):
     assert calls[0]["playsInline"] is True
     assert calls[0]["userActive"] is True
     assert listener_page.evaluate("window.__ttsEvents[0]") == "play"
+    assert listener_page.evaluate("window.__ttsHlsInstances.length") == 0
     assert listener_page.locator("#resumeListening").is_hidden()
+
+
+def test_desktop_listener_prefers_hls_js_when_native_support_is_unreliable(
+    listener_page,
+):
+    _install_hls_harness(
+        listener_page,
+        native_hls=True,
+        hls_js_supported=True,
+        managed_media_source=False,
+    )
+    _start_hls_harness(listener_page)
+
+    assert listener_page.evaluate("window.__ttsHlsInstances.length") == 1
+    assert listener_page.evaluate(
+        "window.__ttsHlsInstances[0].attachedMedia"
+    ) == ["ttsPlayback"]
+
+
+def test_desktop_listener_uses_hls_js_fallback_and_destroys_it_on_stop(listener_page):
+    _install_hls_harness(
+        listener_page,
+        native_hls=False,
+        hls_js_supported=True,
+    )
+    _start_hls_harness(listener_page)
+
+    hls_state = listener_page.evaluate(
+        """() => {
+          const instance = window.__ttsHlsInstances[0];
+          return {
+            count: window.__ttsHlsInstances.length,
+            loadedSources: instance.loadedSources,
+            attachedMedia: instance.attachedMedia,
+            destroyed: instance.destroyed,
+          };
+        }"""
+    )
+    assert hls_state["count"] == 1
+    assert len(hls_state["loadedSources"]) == 1
+    assert "/api/tts/live/iphone-" in hls_state["loadedSources"][0]
+    assert hls_state["loadedSources"][0].endswith("/index.m3u8")
+    assert hls_state["attachedMedia"] == ["ttsPlayback"]
+    assert hls_state["destroyed"] is False
+
+    listener_page.locator("#stopListening").click()
+    assert listener_page.evaluate("window.__ttsHlsInstances[0].destroyed") is True
+
+
+def test_listener_rejects_hls_js_when_browser_lacks_mse_aac_codec(listener_page):
+    _install_hls_harness(
+        listener_page,
+        native_hls=False,
+        hls_js_supported=True,
+        mse_aac_supported=False,
+    )
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.locator("#startListening").click()
+
+    assert listener_page.evaluate("window.__ttsHlsInstances.length") == 0
+    assert listener_page.locator("#connectionStatus").text_content() == (
+        "Audio unavailable"
+    )
 
 
 def test_listener_keeps_hls_source_and_retries_after_ios_play_rejection(listener_page):

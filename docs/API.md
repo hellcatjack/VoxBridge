@@ -36,11 +36,14 @@ enabled, so a phone can enter directly from the fixed QR code. Each browser must
 explicitly select Start to activate audio.
 
 The English-only, one-screen page is branded for Pittsburgh Christian Church South
-and assigns one persistent native media element a listener-scoped HLS URL
-and calls `play()` directly from the Start gesture. It does not fetch sentence
-WAVs, create Blob URLs, or depend on foreground JavaScript to advance the queue.
-The continuous stream carries silence when no translated speech is ready, which
-allows native iOS media playback and lock-screen controls to remain active.
+and assigns one persistent media element a listener-scoped HLS URL. Safari uses
+native HLS, preserving iPhone lock-screen playback without a foreground JavaScript
+queue. Desktop Chrome, Edge, and Firefox use the locally served hls.js MSE fallback
+when MSE AAC is available, even if desktop Chrome reports unreliable native HLS
+support. Both paths consume the same shared stream and call
+`play()` from the Start gesture; neither fetches sentence WAVs nor creates another
+synthesis or encoder. The continuous stream carries silence when no translated
+speech is ready.
 
 The page provides per-device playback-rate choices from `0.8x` through `1.2x`
 in `0.1x` steps. The value is stored only in browser `localStorage` and applies
@@ -49,6 +52,17 @@ A stored value outside the current allowlist falls back to `1.0x`. A listener
 that reaches 12 seconds behind the HLS live edge temporarily catches up at
 `1.2x` and restores the selected rate inside five seconds. A hidden or locked
 page uses at least `1.0x`. This guard does not seek or discard translated speech.
+
+### `GET /listen/assets/hls.min.js`
+
+Returns the pinned hls.js browser build used only when native HLS is unavailable.
+The asset is public, locally hosted, served as JavaScript with `nosniff`, and
+cacheable for one day. Its pinned version, upstream release, SHA-256 digest, and
+Apache-2.0 license are stored with the vendored asset.
+
+The listener verifies both hls.js MSE support and the `mp4a.40.2` AAC codec before
+selecting this path. The shared encoder emits a near-silent decodable carrier while
+idle because exact zero PCM can produce MPEG-TS segments with no AAC frames.
 
 ### `GET /listen/qr.svg`
 
@@ -757,8 +771,11 @@ the ordinary three-second rule. When `--segment-final-redecode` is enabled,
 natural VAD finalization flushes pending endpoint audio and runs one bounded
 one-shot decode over the current segment before sentence reconciliation. A
 mid-speech hard cut only flushes the streaming state and rotates immediately so
-incoming speech is not dropped while an old segment is re-decoded. An
-unchanged result validates the streaming text; a safely compatible result may
+incoming speech is not dropped while an old segment is re-decoded. A hard cut
+is classified as mid-speech whenever its trailing silence has not reached the
+configured `--vad-silence-sec` endpoint; there is no separate fixed silence
+constant for this decision. An unchanged result validates the streaming text;
+a safely compatible result may
 repair its tail while retaining sentence revision semantics. Empty, failed,
 context-echo, substantially divergent, or completed-unit-regressing results
 are rejected. A `completed_unit_regression` keeps the streaming text when the
@@ -917,9 +934,10 @@ Streaming context can occasionally make uncertain audio copy several glossary
 terms. Before a completed sentence receives a `sentence_id`, the backend scans
 it using longest-term-first matching. If one run contains at least three context
 terms and every separator in that run is either whitespace or zero length, the
+backend removes only the matched run. Any real text before or after the run is
+preserved for solidification, translation, and TTS. A pure context-only
 candidate is discarded. Punctuation or any non-context text between terms
-breaks the run. The discarded candidate is absent from solidified source text,
-translation requests, and TTS jobs. It may appear temporarily in the generating
+breaks the run. The model output may appear temporarily in the generating
 partial subtitle because partial output intentionally reflects the live model
 state. The same gate rejects a context-shaped revision of an already solidified
 sentence.
@@ -948,10 +966,12 @@ Safety and tuning options:
 
 Invalid schedules fail startup before model loading. The `asr_context_selected`
 trace event contains elapsed audio time, language, apply mode, term/character
-counts, and a SHA-256 fingerprint. `context_run_commit_dropped` records a new
-candidate rejected by the streaming commit gate; `context_run_upgrade_rejected`
-records a rejected revision. Both events contain only candidate hashes, lengths,
-matched-term counts, and segment metadata, never the context terms themselves.
+counts, and a SHA-256 fingerprint. `context_run_commit_trimmed` records a
+matched run removed while retaining the candidate's real text;
+`context_run_commit_dropped` records a pure context-only candidate rejected by
+the streaming commit gate; `context_run_upgrade_rejected` records a rejected
+revision. These events contain only candidate hashes, lengths, matched-term
+counts, and segment metadata, never the context terms themselves.
 Segment-final compatibility correction emits
 `asr_context_final_redecode_done`, `asr_context_final_redecode_skipped`, or
 `asr_context_final_redecode_failed`; these events also omit context text and
@@ -1057,9 +1077,22 @@ When `--subtitle-trace-log` is enabled, logs contain two structured topics:
 
 Relevant recent events:
 
-- `silero_shadow_ready`: the per-WebSocket ONNX observer loaded successfully;
-  `control_mode` remains `observe_only` for VAD cuts and ASR decode scheduling.
-  Its speech evidence can release the context-only output guard described below.
+- `silero_shadow_ready`: the per-WebSocket ONNX observer loaded successfully.
+  `control_mode` is `observe_only` unless `--silero-vad-rescue` is enabled; the
+  rescue mode may prevent strongly speech-positive audio from being skipped,
+  but cannot cut a segment or commit text. Silero speech evidence can also
+  release the context-only output guard described below.
+- `silero_decode_rescue`: a low-energy batch was retained for ASR because its
+  Silero peak and accumulated speech evidence passed the conservative rescue
+  threshold. This is intentionally based on the complete batch rather than its
+  mean or final Silero frame, because inference backpressure may coalesce speech
+  followed by silence into one batch. A single isolated probability spike does
+  not satisfy the accumulated-evidence floor. The event records probabilities,
+  duration, SNR, and the preserved energy-VAD endpoint state but no text.
+- `audio_backpressure_wait_start` / `audio_backpressure_wait_end`: queued PCM
+  reached the hard duration cap, so the backend paused WebSocket ingress until
+  the independent consumer recovered. The current frame remains in bounded
+  spill storage; this path does not delete oldest audio.
 - `silero_shadow_observation`: sampled speech probability, SNR state, current
   decode-skip decision, and whether the two detectors disagree.
 - `silero_shadow_transition`: immediate Silero speech/non-speech state change.

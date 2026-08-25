@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import io
 import logging
+import math
 import shutil
 import sys
 import time
@@ -262,6 +263,19 @@ class FFmpegHLSEncoder:
             1,
             round(self.sample_rate * self.frame_ms / 1000),
         ) * 2
+        frame_samples = self._frame_bytes // 2
+        idle_carrier = array(
+            "h",
+            (
+                round(2 * math.sin(2 * math.pi * 1000 * index / self.sample_rate))
+                for index in range(frame_samples)
+            ),
+        )
+        if sys.byteorder != "little":
+            idle_carrier.byteswap()
+        # Exact digital silence is optimized into table-only MPEG-TS segments by
+        # FFmpeg's AAC encoder. This -84 dBFS carrier keeps idle HLS decodable.
+        self._idle_carrier_pcm = idle_carrier.tobytes()
         self._pcm_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=max(1, int(pcm_queue_size))
         )
@@ -367,7 +381,7 @@ class FFmpegHLSEncoder:
         frame_bytes = self._frame_bytes
         frame_samples = frame_bytes // 2
         frame_sec = frame_samples / self.sample_rate
-        silence = bytes(frame_bytes)
+        silence = self._idle_carrier_pcm
         active = b""
         try:
             while True:

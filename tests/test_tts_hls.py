@@ -966,6 +966,55 @@ async def test_ffmpeg_encoder_produces_shared_aac_hls_segment(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ffmpeg_encoder_idle_carrier_produces_decodable_aac_hls_segment(
+    tmp_path,
+):
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg tools are unavailable")
+    root = tmp_path / "idle-live"
+    encoder = FFmpegHLSEncoder(
+        root,
+        sample_rate=24000,
+        segment_sec=0.5,
+        playlist_segments=6,
+        frame_ms=50,
+    )
+    await encoder.start()
+    try:
+        await encoder.wait_ready(timeout=5)
+        await asyncio.sleep(0.7)
+        playlist = encoder.playlist_text()
+        complete_segments = [
+            line.strip()
+            for line in playlist.splitlines()
+            if line.strip().endswith(".ts")
+        ][:-1]
+        assert complete_segments
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name,sample_rate",
+                "-of",
+                "default=nw=1",
+                str(encoder.segment_path(complete_segments[0])),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert "codec_name=aac" in probe.stdout
+        assert "sample_rate=24000" in probe.stdout
+    finally:
+        await encoder.close()
+
+
+@pytest.mark.asyncio
 async def test_ffmpeg_append_receipt_matches_decoded_hls_audio_timeline(tmp_path):
     if shutil.which("ffmpeg") is None:
         pytest.skip("FFmpeg is unavailable")

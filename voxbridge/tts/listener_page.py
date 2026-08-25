@@ -1,5 +1,11 @@
 """Standalone browser UI for live translated-speech listeners."""
 
+from pathlib import Path
+
+
+HLS_JS_PATH = Path(__file__).with_name("vendor") / "hls.min.js"
+
+
 TTS_LISTENER_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -519,6 +525,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     </section>
   </main>
 
+  <script src="/listen/assets/hls.min.js"></script>
   <script>
   (() => {
     const startButton = document.getElementById("startListening");
@@ -552,6 +559,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let captionSnapshot = null;
     let captionCueId = "";
     let captionResizeFrame = null;
+    let hlsController = null;
     playbackRateInput.value = String(playbackRate);
 
     function normalizePlaybackRate(value) {
@@ -769,6 +777,45 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       ).join("")}`;
     }
 
+    function destroyHlsController() {
+      if (hlsController === null) return;
+      hlsController.destroy();
+      hlsController = null;
+    }
+
+    function configurePlaybackSource(streamUrl) {
+      destroyHlsController();
+      const nativeHlsSupported = Boolean(
+        playbackElement.canPlayType("application/vnd.apple.mpegurl")
+      );
+      const mseAacSupported = Boolean(
+        window.MediaSource
+        && typeof window.MediaSource.isTypeSupported === "function"
+        && window.MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"')
+      );
+      const hlsJsSupported = Boolean(
+        window.Hls
+        && typeof window.Hls.isSupported === "function"
+        && Hls.isSupported()
+        && mseAacSupported
+      );
+      if (nativeHlsSupported && ("ManagedMediaSource" in window || !hlsJsSupported)) {
+        playbackElement.src = streamUrl;
+        return true;
+      }
+      if (hlsJsSupported) {
+        hlsController = new Hls();
+        hlsController.loadSource(streamUrl);
+        hlsController.attachMedia(playbackElement);
+        return true;
+      }
+      if (nativeHlsSupported) {
+        playbackElement.src = streamUrl;
+        return true;
+      }
+      return false;
+    }
+
     function setMediaPlaybackState(state) {
       if ("mediaSession" in navigator) {
         navigator.mediaSession.playbackState = state;
@@ -875,9 +922,16 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
       playbackElement.muted = false;
       playbackElement.playsInline = true;
-      playbackElement.src =
+      const streamUrl =
         `/api/tts/live/${encodeURIComponent(listenerId)}/index.m3u8`;
+      const sourceConfigured = configurePlaybackSource(streamUrl);
       applyPlaybackRate();
+
+      if (!sourceConfigured) {
+        beginStatusPolling();
+        markPlaybackBlocked(new Error("HLS playback is unsupported"));
+        return;
+      }
 
       // iOS requires the native stream to start directly inside the user's gesture.
       const playPromise = playbackElement.play();
@@ -921,6 +975,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       captionSnapshot = null;
       captionCueId = "";
       playbackElement.pause();
+      destroyHlsController();
       playbackElement.removeAttribute("src");
       playbackElement.load();
       releaseListenerLease(closingListenerId);
@@ -1014,6 +1069,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       stopCaptionPolling();
       releaseListenerLease(listenerId);
       playbackElement.pause();
+      destroyHlsController();
     });
   })();
   </script>
@@ -1022,4 +1078,4 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 """
 
 
-__all__ = ["TTS_LISTENER_HTML"]
+__all__ = ["HLS_JS_PATH", "TTS_LISTENER_HTML"]
