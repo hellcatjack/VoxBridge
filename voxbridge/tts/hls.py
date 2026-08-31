@@ -22,7 +22,7 @@ from .jobs import TTSReadyItem
 
 logger = logging.getLogger(__name__)
 
-BACKLOG_PUBLISH_RATE = 1.4
+BACKLOG_PUBLISH_RATE = 1.6
 DEFAULT_ENGLISH_AUDIO_MS_PER_CHAR = 65.0
 DEFAULT_CHINESE_AUDIO_MS_PER_CHAR = 180.0
 MIN_ESTIMATED_SENTENCE_AUDIO_MS = 500
@@ -297,6 +297,7 @@ class FFmpegHLSEncoder:
         self._scheduled_end_pcm_bytes = 0
         self._bootstrap_pcm_bytes_total = 0
         self._bootstrap_pcm_bytes_remaining = 0
+        self._tail_flush_target_at_ms: int | None = None
         self._timeline_origin_at_ms: int | None = None
         self._closed = False
 
@@ -405,7 +406,57 @@ class FFmpegHLSEncoder:
         end_at_ms = round(
             start_at_ms + len(data) * 1000.0 / bytes_per_second
         )
+        if (
+            self._tail_flush_target_at_ms is None
+            or end_at_ms > self._tail_flush_target_at_ms
+        ):
+            self._tail_flush_target_at_ms = end_at_ms
         return HLSAppendReceipt(start_at_ms=start_at_ms, end_at_ms=end_at_ms)
+
+    async def _flush_tail_until_visible(self, *, frame_sec: float) -> None:
+        target_at_ms = self._tail_flush_target_at_ms
+        if target_at_ms is None:
+            return
+        flush_pcm_bytes_remaining = self._required_bootstrap_pcm_bytes()
+        bytes_per_second = self.sample_rate * 2
+        flush_media_sec = flush_pcm_bytes_remaining / bytes_per_second
+        deadline = asyncio.get_running_loop().time() + max(
+            1.0,
+            flush_media_sec / BACKLOG_PUBLISH_RATE + 0.75,
+        )
+        while self._pcm_queue.empty():
+            live_edge_at_ms = self.live_edge_at_ms()
+            if live_edge_at_ms is not None and live_edge_at_ms >= target_at_ms:
+                if self._tail_flush_target_at_ms == target_at_ms:
+                    self._tail_flush_target_at_ms = None
+                return
+            if flush_pcm_bytes_remaining <= 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    logger.warning(
+                        "shared HLS tail did not become visible target_at_ms=%d live_edge_at_ms=%s",
+                        target_at_ms,
+                        live_edge_at_ms,
+                    )
+                    if self._tail_flush_target_at_ms == target_at_ms:
+                        self._tail_flush_target_at_ms = None
+                    return
+                await asyncio.sleep(0.02)
+                continue
+            process = self._process
+            if (
+                process is None
+                or process.returncode is not None
+                or process.stdin is None
+            ):
+                raise HLSUnavailable("FFmpeg exited while flushing HLS tail")
+            process.stdin.write(self._idle_carrier_pcm)
+            self._submitted_pcm_bytes += len(self._idle_carrier_pcm)
+            flush_pcm_bytes_remaining = max(
+                0,
+                flush_pcm_bytes_remaining - len(self._idle_carrier_pcm),
+            )
+            await process.stdin.drain()
+            await asyncio.sleep(frame_sec / BACKLOG_PUBLISH_RATE)
 
     async def _writer_loop(self) -> None:
         frame_bytes = self._frame_bytes
@@ -425,7 +476,11 @@ class FFmpegHLSEncoder:
                     consumed_bytes = 0
                 else:
                     if not active:
-                        active = await self._pcm_queue.get()
+                        try:
+                            active = self._pcm_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            await self._flush_tail_until_visible(frame_sec=frame_sec)
+                            active = await self._pcm_queue.get()
                     writing_audio = True
                     chunk = active[:frame_bytes]
                     consumed_bytes = len(chunk)
@@ -514,6 +569,7 @@ class FFmpegHLSEncoder:
         self._scheduled_end_pcm_bytes = 0
         self._bootstrap_pcm_bytes_total = 0
         self._bootstrap_pcm_bytes_remaining = 0
+        self._tail_flush_target_at_ms = None
         self._timeline_origin_at_ms = None
         writer = self._writer_task
         self._writer_task = None
