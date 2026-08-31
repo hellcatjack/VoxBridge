@@ -54,12 +54,15 @@ def _install_hls_harness(
     hls_js_supported: bool = False,
     managed_media_source: bool = False,
     mse_aac_supported: bool = True,
+    translated_audio_backlog_ms: int = 0,
+    translated_audio_backlog_estimated: bool = False,
 ):
     snapshot = caption_snapshot or {"live_edge_at_ms": None, "cues": []}
     listener_page.add_init_script(
         f"""
         window.__ttsEvents = [];
         window.__ttsPlayCalls = [];
+        window.__ttsSourceAssignments = [];
         window.__ttsPauseCalls = 0;
         window.__ttsFetchCalls = [];
         window.__ttsCaptionSnapshot = {json.dumps(snapshot)};
@@ -69,6 +72,24 @@ def _install_hls_harness(
         window.__ttsResolveFirstPlay = null;
         window.__ttsMediaActions = {{}};
         window.__ttsHlsInstances = [];
+        const mediaSrcDescriptor = Object.getOwnPropertyDescriptor(
+          HTMLMediaElement.prototype,
+          "src"
+        );
+        Object.defineProperty(HTMLMediaElement.prototype, "src", {{
+          configurable: true,
+          enumerable: mediaSrcDescriptor.enumerable,
+          get() {{ return mediaSrcDescriptor.get.call(this); }},
+          set(value) {{
+            if (this.id === "ttsPlayback") {{
+              window.__ttsSourceAssignments.push({{
+                playbackRate: this.playbackRate,
+                defaultPlaybackRate: this.defaultPlaybackRate,
+              }});
+            }}
+            mediaSrcDescriptor.set.call(this, value);
+          }},
+        }});
         if ({json.dumps(managed_media_source)}) {{
           window.ManagedMediaSource = class FakeManagedMediaSource {{}};
         }}
@@ -89,6 +110,7 @@ def _install_hls_harness(
             this.loadedSources = [];
             this.attachedMedia = [];
             this.destroyed = false;
+            this.playingDate = null;
             window.__ttsHlsInstances.push(this);
           }}
           loadSource(source) {{ this.loadedSources.push(String(source)); }}
@@ -116,6 +138,8 @@ def _install_hls_harness(
             src: String(this.src),
             muted: this.muted,
             playsInline: this.playsInline,
+            playbackRate: this.playbackRate,
+            defaultPlaybackRate: this.defaultPlaybackRate,
             userActive: navigator.userActivation
               ? navigator.userActivation.isActive
               : true,
@@ -159,6 +183,9 @@ def _install_hls_harness(
                 listener_count: 2,
                 queue_depth: 0,
                 pending_audio_ms: 6500,
+                translated_audio_backlog_ms: {int(translated_audio_backlog_ms)},
+                translated_audio_backlog_count: 0,
+                translated_audio_backlog_estimated: {json.dumps(translated_audio_backlog_estimated)},
                 encoder_active: true,
                 producer_active: true,
                 last_error: "",
@@ -206,11 +233,217 @@ def _set_live_lag(listener_page, *, current_time: float, live_edge: float):
     )
 
 
+def _clear_live_lag(listener_page):
+    listener_page.evaluate(
+        """() => {
+          const playback = document.querySelector("#ttsPlayback");
+          Object.defineProperty(playback, "seekable", {
+            configurable: true,
+            get: () => ({
+              length: 0,
+              start: () => { throw new DOMException("no seekable range"); },
+              end: () => { throw new DOMException("no seekable range"); },
+            }),
+          });
+          playback.dispatchEvent(new Event("progress"));
+        }"""
+    )
+
+
+def _set_buffered_range(listener_page, *, start: float, end: float):
+    listener_page.evaluate(
+        """({ start, end }) => {
+          const playback = document.querySelector("#ttsPlayback");
+          Object.defineProperty(playback, "buffered", {
+            configurable: true,
+            get: () => ({
+              length: 1,
+              start: () => start,
+              end: () => end,
+            }),
+          });
+          playback.dispatchEvent(new Event("timeupdate"));
+        }""",
+        {"start": start, "end": end},
+    )
+
+
 def test_listener_rate_selection_persists_after_reload(listener_page):
     listener_page.goto("https://voxbridge.test/listen")
-    listener_page.select_option("#playbackRate", "1.2")
+    listener_page.select_option("#playbackRate", "1.4")
     listener_page.reload()
-    assert listener_page.input_value("#playbackRate") == "1.2"
+    assert listener_page.input_value("#playbackRate") == "1.4"
+
+
+def test_listener_defaults_to_auto_without_saved_preference(listener_page):
+    listener_page.goto("https://voxbridge.test/listen")
+
+    assert listener_page.input_value("#playbackRate") == "auto"
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_listener_persists_explicit_auto_selection(listener_page):
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+    listener_page.select_option("#playbackRate", "auto")
+    listener_page.reload()
+
+    assert listener_page.input_value("#playbackRate") == "auto"
+
+
+def test_auto_rate_uses_ten_thirty_and_forty_second_boundaries(
+    listener_page,
+):
+    _install_hls_harness(listener_page)
+    _start_hls_harness(listener_page)
+    _set_buffered_range(listener_page, start=0, end=105)
+
+    assert listener_page.input_value("#playbackRate") == "auto"
+    for lag, expected_rate, expected_status in (
+        (0, 1, "Live translation · Auto 1.0×"),
+        (9.99, 1, "Live translation · Auto 1.0×"),
+        (
+            10,
+            1.2,
+            "About 10s of translated audio waiting · "
+            "about 9s estimated catch-up · Auto 1.2×",
+        ),
+        (
+            29.99,
+            1.2,
+            "About 30s of translated audio waiting · "
+            "about 25s estimated catch-up · Auto 1.2×",
+        ),
+        (
+            30,
+            1.4,
+            "About 30s of translated audio waiting · "
+            "about 22s estimated catch-up · Auto 1.4×",
+        ),
+        (
+            39.99,
+            1.4,
+            "About 40s of translated audio waiting · "
+            "about 29s estimated catch-up · Auto 1.4×",
+        ),
+        (
+            40,
+            1.5,
+            "About 40s of translated audio waiting · "
+            "about 27s estimated catch-up · Auto 1.5×",
+        ),
+        (
+            60,
+            1.5,
+            "About 1m of translated audio waiting · "
+            "about 40s estimated catch-up · Auto 1.5×",
+        ),
+        (
+            60.01,
+            1.5,
+            "About 1m 1s of translated audio waiting · "
+            "about 41s estimated catch-up · Auto 1.5×",
+        ),
+    ):
+        _set_live_lag(listener_page, current_time=100 - lag, live_edge=100)
+        assert listener_page.eval_on_selector(
+            "#ttsPlayback", "node => node.playbackRate"
+        ) == expected_rate
+        assert listener_page.text_content("#playbackStatus") == expected_status
+
+
+def test_live_audio_adds_server_backlog_without_changing_auto_rate(listener_page):
+    _install_hls_harness(
+        listener_page,
+        translated_audio_backlog_ms=61_000,
+        translated_audio_backlog_estimated=True,
+    )
+    _start_hls_harness(listener_page)
+    _set_buffered_range(listener_page, start=0, end=105)
+
+    _set_live_lag(listener_page, current_time=79, live_edge=100)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+    assert listener_page.text_content("#playbackStatus") == (
+        "About 1m 22s of translated audio waiting · "
+        "about 55s estimated catch-up · Auto 1.5×"
+    )
+
+
+def test_auto_rate_uses_total_translated_audio_backlog(listener_page):
+    _install_hls_harness(
+        listener_page,
+        translated_audio_backlog_ms=61_000,
+        translated_audio_backlog_estimated=True,
+    )
+    _start_hls_harness(listener_page)
+    _set_buffered_range(listener_page, start=0, end=102)
+
+    _set_live_lag(listener_page, current_time=98, live_edge=100)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+    assert listener_page.text_content("#playbackStatus") == (
+        "About 1m 3s of translated audio waiting · "
+        "about 42s estimated catch-up · Auto 1.5×"
+    )
+
+
+def test_auto_rate_waits_for_known_forward_buffer(listener_page):
+    _install_hls_harness(
+        listener_page,
+        translated_audio_backlog_ms=61_000,
+        translated_audio_backlog_estimated=True,
+    )
+    _start_hls_harness(listener_page)
+
+    _set_live_lag(listener_page, current_time=98, live_edge=104)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_auto_fast_rate_uses_forward_buffer_hysteresis(listener_page):
+    _install_hls_harness(
+        listener_page,
+        translated_audio_backlog_ms=61_000,
+        translated_audio_backlog_estimated=True,
+    )
+    _start_hls_harness(listener_page)
+
+    _set_live_lag(listener_page, current_time=98, live_edge=104)
+    _set_buffered_range(listener_page, start=0, end=101.99)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+    _set_buffered_range(listener_page, start=0, end=102)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+
+    _set_buffered_range(listener_page, start=0, end=100.01)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+
+    _set_buffered_range(listener_page, start=0, end=100)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_auto_rate_describes_unknown_position_as_preparing(listener_page):
+    _install_hls_harness(listener_page)
+    _start_hls_harness(listener_page)
+
+    assert listener_page.text_content("#playbackStatus") == "Preparing live translation"
 
 
 def test_unsupported_legacy_rate_falls_back_to_default(listener_page):
@@ -218,10 +451,49 @@ def test_unsupported_legacy_rate_falls_back_to_default(listener_page):
         "window.localStorage.setItem('voxbridge.ttsPlaybackRate', '1.5');"
     )
     listener_page.goto("https://voxbridge.test/listen")
-    assert listener_page.input_value("#playbackRate") == "1"
+    assert listener_page.input_value("#playbackRate") == "auto"
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
     ) == 1
+
+
+def _start_historical_silence_harness(
+    listener_page,
+    *,
+    gap_ms=3000,
+    playing_at_ms=104_100,
+    playback_rate="auto",
+):
+    _install_hls_harness(
+        listener_page,
+        native_hls=False,
+        hls_js_supported=True,
+        caption_snapshot={
+            "live_edge_at_ms": 120_000,
+            "cues": [
+                {
+                    "cue_id": "spoken-before-gap",
+                    "start_at_ms": 100_000,
+                    "end_at_ms": 104_000,
+                    "text": "The sentence before the historical silence.",
+                },
+                {
+                    "cue_id": "spoken-after-gap",
+                    "start_at_ms": 104_000 + gap_ms,
+                    "end_at_ms": 110_000 + gap_ms,
+                    "text": "The next translated sentence is already buffered.",
+                },
+            ],
+        },
+    )
+    if playback_rate != "auto":
+        listener_page.goto("https://voxbridge.test/listen")
+        listener_page.select_option("#playbackRate", playback_rate)
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=50.0, live_edge=80.0)
+    listener_page.evaluate(
+        f"window.__ttsHlsInstances[0].playingDate = new Date({playing_at_ms})"
+    )
 
 
 @pytest.mark.parametrize(
@@ -278,6 +550,84 @@ def test_listener_fits_viewport_without_document_scrollbars(
         "bodyX": False,
         "bodyY": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [
+        (1440, 900),
+        (844, 390),
+        (390, 844),
+        (320, 568),
+    ],
+)
+def test_status_cards_share_available_width_evenly(
+    listener_page,
+    width,
+    height,
+):
+    listener_page.set_viewport_size({"width": width, "height": height})
+    listener_page.goto("https://voxbridge.test/listen")
+
+    widths = listener_page.evaluate(
+        """() => ({
+          connection: document.querySelector("#connectionCard").getBoundingClientRect().width,
+          service: document.querySelector("#producerCard").getBoundingClientRect().width,
+          listeners: document.querySelector("#queueCard").getBoundingClientRect().width,
+        })"""
+    )
+
+    assert max(widths.values()) - min(widths.values()) <= 1
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(1440, 900), (390, 844)],
+)
+def test_live_audio_status_stays_anchored_to_card_bottom_when_text_changes(
+    listener_page,
+    width,
+    height,
+):
+    listener_page.set_viewport_size({"width": width, "height": height})
+    listener_page.goto("https://voxbridge.test/listen")
+
+    positions = listener_page.evaluate(
+        """() => {
+          const card = document.querySelector('#nowPlaying');
+          const caption = document.querySelector('#liveCaption');
+          const status = document.querySelector('#playbackStatus');
+          caption.textContent = 'A stable translated sentence is being read aloud.';
+
+          const measure = (text) => {
+            status.textContent = text;
+            const cardRect = card.getBoundingClientRect();
+            const statusRect = status.getBoundingClientRect();
+            const paddingBottom = Number.parseFloat(
+              window.getComputedStyle(card).paddingBottom
+            );
+            return {
+              bottom: statusRect.bottom,
+              height: statusRect.height,
+              insetFromContentBottom:
+                cardRect.bottom - paddingBottom - statusRect.bottom,
+            };
+          };
+
+          return {
+            short: measure('Live translation'),
+            long: measure(
+              'Translated audio backlog 39.9s · Auto 1.4× · Catch-up about 28.5s'
+            ),
+          };
+        }"""
+    )
+
+    if width < 600:
+        assert positions["long"]["height"] > positions["short"]["height"] + 1
+    assert abs(positions["short"]["bottom"] - positions["long"]["bottom"]) <= 1
+    assert abs(positions["short"]["insetFromContentBottom"]) <= 1
+    assert abs(positions["long"]["insetFromContentBottom"]) <= 1
 
 
 @pytest.mark.parametrize(
@@ -394,6 +744,154 @@ def test_rate_change_updates_persistent_media_element(listener_page):
     ) is True
 
 
+def test_listener_starts_fast_selection_at_normal_rate(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+
+    _start_hls_harness(listener_page)
+
+    first_play = listener_page.evaluate("window.__ttsPlayCalls[0]")
+    source_assignment = listener_page.evaluate("window.__ttsSourceAssignments[0]")
+    assert listener_page.input_value("#playbackRate") == "1.2"
+    assert source_assignment["playbackRate"] == 1
+    assert source_assignment["defaultPlaybackRate"] == 1
+    assert first_play["playbackRate"] == 1
+    assert first_play["defaultPlaybackRate"] == 1
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_fast_selection_only_runs_with_safe_live_lag(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+    _start_hls_harness(listener_page)
+
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.2
+
+    _set_live_lag(listener_page, current_time=99, live_edge=100)
+    assert listener_page.input_value("#playbackRate") == "1.2"
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_1_4_selection_starts_with_two_seconds_of_safe_buffer(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.4")
+    _start_hls_harness(listener_page)
+
+    _set_live_lag(listener_page, current_time=98, live_edge=100)
+
+    assert listener_page.input_value("#playbackRate") == "1.4"
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.4
+
+
+def test_1_4_selection_is_not_capped_by_automatic_catch_up(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.4")
+    _start_hls_harness(listener_page)
+
+    _set_live_lag(listener_page, current_time=80, live_edge=100)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.4
+    assert "translated audio waiting" in listener_page.text_content("#playbackStatus")
+
+
+def test_fast_selection_falls_back_when_live_lag_is_unknown(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.2
+
+    _clear_live_lag(listener_page)
+
+    assert listener_page.input_value("#playbackRate") == "1.2"
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_waiting_resets_fast_selection_to_normal_rate(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    _set_buffered_range(listener_page, start=0, end=94.4)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.2
+
+    listener_page.locator("#ttsPlayback").dispatch_event("waiting")
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+    assert listener_page.text_content("#playbackStatus") == (
+        "Buffering live audio · 0.4s buffered ahead"
+    )
+
+
+def test_waiting_status_remains_visible_after_playback_resumes(listener_page):
+    _install_hls_harness(listener_page)
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    _set_buffered_range(listener_page, start=0, end=94.4)
+
+    playback = listener_page.locator("#ttsPlayback")
+    playback.dispatch_event("waiting")
+    playback.dispatch_event("playing")
+    _set_live_lag(listener_page, current_time=94.1, live_edge=100)
+
+    assert listener_page.text_content("#playbackStatus") == (
+        "Buffering live audio · 0.4s buffered ahead"
+    )
+
+    listener_page.wait_for_timeout(1600)
+    _set_live_lag(listener_page, current_time=94.2, live_edge=100)
+
+    assert listener_page.text_content("#playbackStatus") != (
+        "Buffering live audio · 0.4s buffered ahead"
+    )
+
+
+def test_stalled_resets_fast_selection_to_normal_rate(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    _set_buffered_range(listener_page, start=0, end=94.4)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.2
+
+    listener_page.locator("#ttsPlayback").dispatch_event("stalled")
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+    assert listener_page.text_content("#playbackStatus") == (
+        "Reconnecting to live audio · 0.4s buffered ahead"
+    )
+
+
 def test_listener_start_stop_preserves_rate_selection(listener_page):
     _install_hls_harness(listener_page)
     listener_page.goto("https://voxbridge.test/listen")
@@ -403,12 +901,34 @@ def test_listener_start_stop_preserves_rate_selection(listener_page):
         "document.querySelector('#connectionStatus').textContent === 'Connected'"
     )
     listener_page.select_option("#playbackRate", "1.1")
+    assert listener_page.input_value("#playbackRate") == "1.1"
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
-    ) == 1.1
+    ) == 1
     listener_page.locator("#stopListening").click()
     assert listener_page.input_value("#playbackRate") == "1.1"
     assert listener_page.text_content("#connectionStatus") == "Stopped"
+
+
+def test_listener_stop_normalizes_active_fast_media_rate(listener_page):
+    _install_hls_harness(listener_page)
+    listener_page.goto("https://voxbridge.test/listen")
+    listener_page.select_option("#playbackRate", "1.2")
+    _start_hls_harness(listener_page)
+    _set_live_lag(listener_page, current_time=94, live_edge=100)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.2
+
+    listener_page.locator("#stopListening").click()
+
+    assert listener_page.input_value("#playbackRate") == "1.2"
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.defaultPlaybackRate"
+    ) == 1
 
 
 def test_listener_temporarily_catches_up_without_skipping_audio(listener_page):
@@ -424,7 +944,10 @@ def test_listener_temporarily_catches_up_without_skipping_audio(listener_page):
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
     ) == 1.2
-    assert "Catching up" in listener_page.text_content("#playbackStatus")
+    assert listener_page.text_content("#playbackStatus") == (
+        "About 20s of translated audio waiting · "
+        "about 17s estimated catch-up · 1.2×"
+    )
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.currentTime"
     ) == 80
@@ -462,13 +985,14 @@ def test_listener_uses_at_least_normal_speed_while_page_is_hidden(listener_page)
     ) == 1
 
 
-def test_listener_status_shows_real_pending_audio_seconds(listener_page):
+def test_listener_status_keeps_server_backlog_out_of_listener_count(listener_page):
     _install_hls_harness(listener_page)
     _start_hls_harness(listener_page)
 
     listener_page.wait_for_function(
-        "document.querySelector('#queueStatus').textContent.includes('7s queued')"
+        "document.querySelector('#queueStatus').textContent === 'Live · 2 listening'"
     )
+    assert "queued" not in listener_page.text_content("#queueStatus")
 
 
 def test_listener_caption_follows_device_playhead_instead_of_newest_cue(listener_page):
@@ -546,6 +1070,180 @@ def test_listener_uses_hls_start_date_when_server_playlist_is_ahead(listener_pag
     assert listener_page.text_content("#liveCaption") == (
         "The sentence this device is actually playing."
     )
+
+
+def test_desktop_caption_uses_hls_playing_date_when_playlist_edges_desynchronize(
+    listener_page,
+):
+    _install_hls_harness(
+        listener_page,
+        native_hls=False,
+        hls_js_supported=True,
+        caption_snapshot={
+            "live_edge_at_ms": 110_000,
+            "cues": [
+                {
+                    "cue_id": "older-cue",
+                    "start_at_ms": 103_000,
+                    "end_at_ms": 106_000,
+                    "text": "The older sentence.",
+                },
+                {
+                    "cue_id": "newer-cue",
+                    "start_at_ms": 107_000,
+                    "end_at_ms": 110_000,
+                    "text": "The sentence Chrome is actually playing.",
+                },
+            ],
+        },
+    )
+    _start_hls_harness(listener_page)
+    listener_page.locator("#ttsPlayback").evaluate(
+        "node => { node.getStartDate = undefined; }"
+    )
+    listener_page.evaluate(
+        "window.__ttsHlsInstances[0].playingDate = new Date(108500)"
+    )
+    _set_live_lag(listener_page, current_time=98, live_edge=100)
+    listener_page.wait_for_function(
+        "document.querySelector('#liveCaption').textContent.includes('actually playing')"
+    )
+
+    listener_page.evaluate(
+        "window.__ttsCaptionSnapshot.live_edge_at_ms = 111000"
+    )
+    _set_live_lag(listener_page, current_time=99, live_edge=104)
+    listener_page.wait_for_timeout(650)
+
+    assert listener_page.text_content("#liveCaption") == (
+        "The sentence Chrome is actually playing."
+    )
+
+
+@pytest.mark.parametrize(
+    ("gap_ms", "playing_at_ms", "buffered_end", "expected_current_time"),
+    [
+        (3000, 104_100, 80.0, 52.5),
+        (3000, 104_700, 80.0, 52.3),
+        (800, 104_100, 80.0, 50.0),
+        (3000, 104_100, 52.0, 50.0),
+    ],
+    ids=[
+        "long-buffered-gap",
+        "natural-pause-already-heard",
+        "natural-gap",
+        "next-speech-not-buffered",
+    ],
+)
+def test_listener_only_compacts_long_buffered_silence(
+    listener_page,
+    gap_ms,
+    playing_at_ms,
+    buffered_end,
+    expected_current_time,
+):
+    _start_historical_silence_harness(
+        listener_page,
+        gap_ms=gap_ms,
+        playing_at_ms=playing_at_ms,
+    )
+
+    _set_buffered_range(listener_page, start=0.0, end=buffered_end)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.currentTime"
+    ) == pytest.approx(expected_current_time)
+
+
+def test_auto_compaction_requires_two_seconds_of_next_speech_buffer(listener_page):
+    _start_historical_silence_harness(listener_page)
+
+    _set_buffered_range(listener_page, start=0.0, end=54.89)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.currentTime"
+    ) == pytest.approx(50.0)
+
+    _set_buffered_range(listener_page, start=0.0, end=54.9)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.currentTime"
+    ) == pytest.approx(52.5)
+
+
+def test_auto_compaction_returns_to_normal_rate(listener_page):
+    _start_historical_silence_harness(listener_page)
+
+    _set_buffered_range(listener_page, start=0.0, end=80.0)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.currentTime"
+    ) == pytest.approx(52.5)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1
+
+
+def test_auto_compaction_retries_playback_when_seek_stays_waiting(listener_page):
+    _start_historical_silence_harness(listener_page)
+    listener_page.evaluate(
+        """() => {
+          const playback = document.querySelector("#ttsPlayback");
+          const originalPlay = HTMLMediaElement.prototype.play;
+          window.__ttsCompactionRecoveryCalls = 0;
+          HTMLMediaElement.prototype.play = function() {
+            if (this !== playback) return originalPlay.call(this);
+            window.__ttsCompactionRecoveryCalls += 1;
+            if (window.__ttsCompactionRecoveryCalls === 1) {
+              return new Promise(() => {});
+            }
+            return originalPlay.call(this);
+          };
+          Object.defineProperty(playback, "currentTime", {
+            configurable: true,
+            get: () => window.__ttsCurrentTime,
+            set: value => {
+              window.__ttsCurrentTime = Number(value);
+              playback.dispatchEvent(new Event("seeking"));
+              playback.dispatchEvent(new Event("waiting"));
+              playback.dispatchEvent(new Event("seeked"));
+            },
+          });
+        }"""
+    )
+
+    _set_buffered_range(listener_page, start=0.0, end=80.0)
+
+    listener_page.wait_for_function(
+        """() => (
+          window.__ttsCompactionRecoveryCalls >= 2
+          && document.querySelector("#nowPlaying").dataset.playing === "true"
+        )""",
+        timeout=2500,
+    )
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.currentTime"
+    ) == pytest.approx(52.5)
+    assert not listener_page.text_content("#playbackStatus").startswith(
+        "Buffering live audio"
+    )
+
+
+@pytest.mark.parametrize(
+    ("buffered_end", "expected_current_time"),
+    [(56.89, 50.0), (56.9, 52.5)],
+    ids=["less-than-four-seconds", "four-seconds"],
+)
+def test_manual_fast_compaction_retains_four_second_guard(
+    listener_page,
+    buffered_end,
+    expected_current_time,
+):
+    _start_historical_silence_harness(listener_page, playback_rate="1.4")
+
+    _set_buffered_range(listener_page, start=0.0, end=buffered_end)
+
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.currentTime"
+    ) == pytest.approx(expected_current_time)
 
 
 def test_listener_retains_caption_between_cues_without_empty_transition(listener_page):

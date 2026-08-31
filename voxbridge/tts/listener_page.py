@@ -226,8 +226,9 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       min-width: 0;
       min-height: 0;
       flex: 1 1 auto;
+      align-self: stretch;
       display: grid;
-      align-content: center;
+      grid-template-rows: auto minmax(0, 1fr) auto;
       gap: 4px;
     }
 
@@ -243,6 +244,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     .now-playing strong {
       display: block;
       min-width: 0;
+      align-self: center;
       color: var(--forest);
       font-family: Georgia, "Times New Roman", serif;
       font-size: clamp(17px, 3.4vw, 28px);
@@ -270,13 +272,13 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     .playback-state {
       min-width: 0;
+      align-self: end;
       color: var(--muted);
       font-size: clamp(9px, 1.6vw, 12px);
       font-weight: 800;
       line-height: 1.25;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
+      text-wrap: pretty;
     }
 
     .caption-reveal {
@@ -510,11 +512,14 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       <div class="playback-settings">
         <label for="playbackRate">Playback speed</label>
         <select id="playbackRate" aria-label="Playback speed">
+          <option value="auto" selected>Auto</option>
           <option value="0.8">0.8x</option>
           <option value="0.9">0.9x</option>
-          <option value="1" selected>1.0x</option>
+          <option value="1">1.0x</option>
           <option value="1.1">1.1x</option>
           <option value="1.2">1.2x</option>
+          <option value="1.3">1.3x</option>
+          <option value="1.4">1.4x</option>
         </select>
       </div>
       <div class="actions">
@@ -542,11 +547,24 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const playbackRateInput = document.getElementById("playbackRate");
     const playbackElement = document.getElementById("ttsPlayback");
     const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
-    const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2]);
+    const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4]);
     const CATCH_UP_START_LAG_SEC = 12;
     const CATCH_UP_STOP_LAG_SEC = 5;
     const CATCH_UP_RATE = 1.2;
+    const FAST_RATE_START_LAG_SEC = 2;
+    const FAST_RATE_STOP_LAG_SEC = 1;
+    const AUTO_FAST_RATE_START_BUFFER_SEC = 4;
+    const AUTO_FAST_RATE_STOP_BUFFER_SEC = 2;
+    const AUTO_MEDIUM_LAG_SEC = 10;
+    const AUTO_FAST_LAG_SEC = 30;
+    const AUTO_HIGH_LAG_SEC = 40;
     const CAPTION_POLL_INTERVAL_MS = 500;
+    const HISTORICAL_SILENCE_MIN_GAP_MS = 900;
+    const HISTORICAL_SILENCE_KEEP_MS = 500;
+    const AUTO_NEXT_SPEECH_BUFFER_GUARD_SEC = 2;
+    const NEXT_SPEECH_BUFFER_GUARD_SEC = 4;
+    const SILENCE_COMPACTION_RECOVERY_MS = 800;
+    const PLAYBACK_INTERRUPTION_STATUS_HOLD_MS = 1500;
     const MIN_CAPTION_FONT_PX = 8;
 
     let playbackRate = readPlaybackRate();
@@ -556,15 +574,23 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let captionTimer = null;
     let captionAbortController = null;
     let catchingUp = false;
+    let playbackStarted = false;
+    let fastRateActive = false;
+    let playbackStatusHoldUntilMs = 0;
     let captionSnapshot = null;
     let captionCueId = "";
+    let compactedNextCueKey = "";
+    let pendingSilenceCompaction = null;
+    let silenceCompactionRecoveryTimer = null;
     let captionResizeFrame = null;
     let hlsController = null;
+    let serverTranslatedAudioBacklogSec = 0;
     playbackRateInput.value = String(playbackRate);
 
     function normalizePlaybackRate(value) {
+      if (String(value ?? "").trim().toLowerCase() === "auto") return "auto";
       const parsed = Number(value);
-      return SUPPORTED_PLAYBACK_RATES.has(parsed) ? parsed : 1;
+      return SUPPORTED_PLAYBACK_RATES.has(parsed) ? parsed : "auto";
     }
 
     function readPlaybackRate() {
@@ -573,7 +599,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
           window.localStorage.getItem(PLAYBACK_RATE_STORAGE_KEY)
         );
       } catch (error) {
-        return 1;
+        return "auto";
       }
     }
 
@@ -591,7 +617,71 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       return Math.max(0, liveEdge - playbackElement.currentTime);
     }
 
+    function forwardBufferedSec() {
+      const currentTime = Number(playbackElement.currentTime);
+      const ranges = playbackElement.buffered;
+      if (!ranges || !Number.isFinite(currentTime)) return null;
+      try {
+        for (let index = 0; index < ranges.length; index += 1) {
+          const start = Number(ranges.start(index));
+          const end = Number(ranges.end(index));
+          if (
+            Number.isFinite(start)
+            && Number.isFinite(end)
+            && currentTime >= start
+            && currentTime <= end
+          ) {
+            return Math.max(0, end - currentTime);
+          }
+        }
+      } catch (error) {}
+      return null;
+    }
+
+    function showPlaybackInterruptionStatus(label) {
+      const bufferedAhead = forwardBufferedSec();
+      playbackStatusHoldUntilMs = (
+        performance.now() + PLAYBACK_INTERRUPTION_STATUS_HOLD_MS
+      );
+      playbackStatus.textContent = bufferedAhead === null
+        ? `${label} · buffer unknown`
+        : `${label} · ${bufferedAhead.toFixed(1)}s buffered ahead`;
+    }
+
+    function translatedAudioBacklogSec(lag = liveLagSec()) {
+      if (lag === null) return null;
+      return Math.max(0, lag) + Math.max(0, serverTranslatedAudioBacklogSec);
+    }
+
+    function formatDurationSec(value) {
+      const totalSec = Math.max(0, Math.ceil(Number(value) || 0));
+      if (totalSec < 60) return `${totalSec}s`;
+      const minutes = Math.floor(totalSec / 60);
+      const seconds = totalSec % 60;
+      return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+    }
+
+    function describeTranslatedAudioBacklog(totalSec, effectiveRate) {
+      const mediaDuration = formatDurationSec(totalSec);
+      const catchUpDuration = formatDurationSec(totalSec / effectiveRate);
+      const rate = playbackRate === "auto"
+        ? `Auto ${effectiveRate.toFixed(1)}×`
+        : `${effectiveRate.toFixed(1)}×`;
+      return `About ${mediaDuration} of translated audio waiting`
+        + ` · about ${catchUpDuration} estimated catch-up · ${rate}`;
+    }
+
     function estimatedPlaybackAtMs(snapshot) {
+      if (hlsController !== null) {
+        try {
+          const playingDate = hlsController.playingDate;
+          const playingAtMs = playingDate instanceof Date ? playingDate.getTime() : NaN;
+          if (Number.isFinite(playingAtMs)) return playingAtMs;
+        } catch (error) {}
+        // HLS.js and the server refresh their playlist edges independently.
+        // Keep the current caption until HLS.js exposes the exact playing date.
+        return null;
+      }
       const currentTime = Number(playbackElement.currentTime);
       if (
         Number.isFinite(currentTime)
@@ -649,7 +739,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         if (captionFitsCard()) smallestFitPx = candidatePx;
         else largestOverflowPx = candidatePx;
       }
-      liveCaption.style.fontSize = `${smallestFitPx.toFixed(2)}px`;
+      const verifiedFitPx = Math.floor(smallestFitPx * 100) / 100;
+      liveCaption.style.fontSize = `${verifiedFitPx.toFixed(2)}px`;
     }
 
     function scheduleCaptionFit() {
@@ -673,16 +764,148 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       revealCaption();
     }
 
+    function mediaTimeIsBuffered(mediaTime) {
+      const ranges = playbackElement.buffered;
+      if (!ranges || !Number.isFinite(mediaTime)) return false;
+      try {
+        for (let index = 0; index < ranges.length; index += 1) {
+          if (
+            mediaTime >= Number(ranges.start(index))
+            && mediaTime <= Number(ranges.end(index))
+          ) {
+            return true;
+          }
+        }
+      } catch (error) {}
+      return false;
+    }
+
+    function clearPendingSilenceCompaction(completed = false) {
+      if (silenceCompactionRecoveryTimer !== null) {
+        window.clearTimeout(silenceCompactionRecoveryTimer);
+        silenceCompactionRecoveryTimer = null;
+      }
+      const pending = pendingSilenceCompaction;
+      pendingSilenceCompaction = null;
+      if (completed && pending !== null) {
+        compactedNextCueKey = pending.nextCueKey;
+        playbackStatusHoldUntilMs = 0;
+      }
+      return pending;
+    }
+
+    function scheduleSilenceCompactionRecovery() {
+      if (silenceCompactionRecoveryTimer !== null) return;
+      silenceCompactionRecoveryTimer = window.setTimeout(() => {
+        silenceCompactionRecoveryTimer = null;
+        if (!running || pendingSilenceCompaction === null) return;
+        showPlaybackInterruptionStatus("Buffering live audio");
+        nowPlaying.dataset.speaking = "false";
+        requestPendingSilencePlayback();
+      }, SILENCE_COMPACTION_RECOVERY_MS);
+    }
+
+    function requestPendingSilencePlayback() {
+      if (!running || pendingSilenceCompaction === null) return;
+      const pending = pendingSilenceCompaction;
+      scheduleSilenceCompactionRecovery();
+      let playPromise = null;
+      try {
+        playPromise = playbackElement.play();
+      } catch (error) {
+        markPlaybackBlocked(error);
+        return;
+      }
+      if (playPromise) {
+        playPromise.then(() => {
+          if (pendingSilenceCompaction === pending) markPlaying();
+        }).catch((error) => {
+          if (pendingSilenceCompaction === pending) markPlaybackBlocked(error);
+        });
+      } else {
+        if (pendingSilenceCompaction === pending) markPlaying();
+      }
+    }
+
+    function compactHistoricalSilence(playheadAtMs, previousCue, nextCue) {
+      if (
+        !playbackStarted
+        || nowPlaying.dataset.playing !== "true"
+        || pendingSilenceCompaction !== null
+        || previousCue === null
+        || nextCue === null
+      ) {
+        return false;
+      }
+      const previousEndAtMs = Number(previousCue.end_at_ms);
+      const nextStartAtMs = Number(nextCue.start_at_ms);
+      if (
+        !Number.isFinite(previousEndAtMs)
+        || !Number.isFinite(nextStartAtMs)
+        || playheadAtMs < previousEndAtMs
+        || playheadAtMs >= nextStartAtMs
+        || nextStartAtMs - previousEndAtMs <= HISTORICAL_SILENCE_MIN_GAP_MS
+      ) {
+        return false;
+      }
+      const nextCueKey = `${String(nextCue.cue_id || "")}:${nextStartAtMs}`;
+      if (compactedNextCueKey === nextCueKey) return false;
+      const currentTime = Number(playbackElement.currentTime);
+      if (!Number.isFinite(currentTime)) return false;
+      const nextSpeechMediaTime = currentTime + (nextStartAtMs - playheadAtMs) / 1000;
+      const nextSpeechBufferGuardSec = playbackRate === "auto"
+        ? AUTO_NEXT_SPEECH_BUFFER_GUARD_SEC
+        : NEXT_SPEECH_BUFFER_GUARD_SEC;
+      if (
+        !mediaTimeIsBuffered(nextSpeechMediaTime + nextSpeechBufferGuardSec)
+      ) {
+        return false;
+      }
+      const silenceAlreadyHeardMs = Math.max(0, playheadAtMs - previousEndAtMs);
+      const silenceStillNeededMs = Math.max(
+        0,
+        HISTORICAL_SILENCE_KEEP_MS - silenceAlreadyHeardMs
+      );
+      const targetMediaTime = currentTime
+        + (nextStartAtMs - silenceStillNeededMs - playheadAtMs) / 1000;
+      if (
+        !Number.isFinite(targetMediaTime)
+        || targetMediaTime <= currentTime
+        || !mediaTimeIsBuffered(targetMediaTime)
+      ) {
+        return false;
+      }
+      pendingSilenceCompaction = {
+        nextCueKey,
+      };
+      scheduleSilenceCompactionRecovery();
+      try {
+        playbackElement.currentTime = targetMediaTime;
+      } catch (error) {
+        clearPendingSilenceCompaction();
+        return false;
+      }
+      if (playbackRate === "auto") {
+        fastRateActive = false;
+        applyPlaybackRate();
+      }
+      nowPlaying.dataset.speaking = "false";
+      return true;
+    }
+
     function applyCaptionSnapshot(snapshot, requestListenerId) {
       if (!running || !requestListenerId || requestListenerId !== listenerId) return;
       const playheadAtMs = estimatedPlaybackAtMs(snapshot);
       if (playheadAtMs === null) return;
       const cues = Array.isArray(snapshot && snapshot.cues) ? snapshot.cues : [];
       let selected = null;
+      let next = null;
       for (const cue of cues) {
         const startAtMs = Number(cue && cue.start_at_ms);
-        if (!Number.isFinite(startAtMs) || startAtMs > playheadAtMs) continue;
-        if (selected === null || startAtMs >= Number(selected.start_at_ms)) {
+        if (!Number.isFinite(startAtMs)) continue;
+        if (startAtMs > playheadAtMs) {
+          if (next === null || startAtMs < Number(next.start_at_ms)) next = cue;
+        } else if (selected === null || startAtMs >= Number(selected.start_at_ms)) {
           selected = cue;
         }
       }
@@ -691,6 +914,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         nowPlaying.dataset.speaking = "false";
         return;
       }
+      if (pendingSilenceCompaction !== null) return;
+      if (compactHistoricalSilence(playheadAtMs, selected, next)) return;
       setLiveCaption(selected.text, selected.cue_id);
       const endAtMs = Number(selected.end_at_ms);
       nowPlaying.dataset.speaking = String(
@@ -734,14 +959,35 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       }
     }
 
-    function effectivePlaybackRate() {
-      if (catchingUp) return CATCH_UP_RATE;
+    function automaticPlaybackRate(totalBacklog) {
+      if (totalBacklog !== null && totalBacklog >= AUTO_HIGH_LAG_SEC) return 1.5;
+      if (totalBacklog !== null && totalBacklog >= AUTO_FAST_LAG_SEC) return 1.4;
+      if (totalBacklog !== null && totalBacklog >= AUTO_MEDIUM_LAG_SEC) return 1.2;
+      return 1;
+    }
+
+    function effectivePlaybackRate(
+      lag = liveLagSec(),
+      totalBacklog = translatedAudioBacklogSec(lag)
+    ) {
+      if (running && !playbackStarted) return 1;
+      if (playbackRate === "auto") {
+        const targetRate = automaticPlaybackRate(totalBacklog);
+        return targetRate > 1 && !fastRateActive ? 1 : targetRate;
+      }
+      if (catchingUp) return Math.max(CATCH_UP_RATE, playbackRate);
+      if (running && playbackRate > 1) {
+        return fastRateActive ? playbackRate : 1;
+      }
       if (document.hidden) return Math.max(1, playbackRate);
       return playbackRate;
     }
 
-    function applyPlaybackRate() {
-      const effectiveRate = effectivePlaybackRate();
+    function applyPlaybackRate(
+      lag = liveLagSec(),
+      totalBacklog = translatedAudioBacklogSec(lag)
+    ) {
+      const effectiveRate = effectivePlaybackRate(lag, totalBacklog);
       playbackElement.defaultPlaybackRate = effectiveRate;
       playbackElement.playbackRate = effectiveRate;
       if ("preservesPitch" in playbackElement) playbackElement.preservesPitch = true;
@@ -749,18 +995,65 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if ("webkitPreservesPitch" in playbackElement) {
         playbackElement.webkitPreservesPitch = true;
       }
+      return effectiveRate;
     }
 
     function updateLiveLatencyGuard() {
       if (!running) return;
       const lag = liveLagSec();
-      if (lag !== null) {
+      const totalBacklog = translatedAudioBacklogSec(lag);
+      if (playbackRate === "auto") {
+        catchingUp = false;
+        const targetRate = automaticPlaybackRate(totalBacklog);
+        const bufferedAhead = forwardBufferedSec();
+        if (playbackStarted && targetRate > 1 && bufferedAhead !== null) {
+          if (
+            !fastRateActive
+            && bufferedAhead >= AUTO_FAST_RATE_START_BUFFER_SEC
+          ) {
+            fastRateActive = true;
+          } else if (
+            fastRateActive
+            && bufferedAhead <= AUTO_FAST_RATE_STOP_BUFFER_SEC
+          ) {
+            fastRateActive = false;
+          }
+        } else {
+          fastRateActive = false;
+        }
+      } else if (lag !== null) {
         if (!catchingUp && lag >= CATCH_UP_START_LAG_SEC) catchingUp = true;
         else if (catchingUp && lag <= CATCH_UP_STOP_LAG_SEC) catchingUp = false;
+        if (playbackStarted && playbackRate > 1) {
+          if (!fastRateActive && lag >= FAST_RATE_START_LAG_SEC) {
+            fastRateActive = true;
+          } else if (fastRateActive && lag <= FAST_RATE_STOP_LAG_SEC) {
+            fastRateActive = false;
+          }
+        } else {
+          fastRateActive = false;
+        }
+      } else {
+        catchingUp = false;
+        fastRateActive = false;
       }
-      applyPlaybackRate();
-      if (catchingUp && lag !== null) {
-        playbackStatus.textContent = `Catching up / ${Math.ceil(lag)}s behind live`;
+      const effectiveRate = applyPlaybackRate(lag, totalBacklog);
+      if (performance.now() < playbackStatusHoldUntilMs) return;
+      playbackStatusHoldUntilMs = 0;
+      if (!playbackStarted) {
+        playbackStatus.textContent = "Buffering live audio";
+      } else if (lag === null) {
+        playbackStatus.textContent = "Preparing live translation";
+      } else if (totalBacklog !== null && totalBacklog >= AUTO_MEDIUM_LAG_SEC) {
+        playbackStatus.textContent = describeTranslatedAudioBacklog(
+          totalBacklog,
+          effectiveRate
+        );
+      } else if (playbackRate === "auto") {
+        playbackStatus.textContent =
+          `Live translation · Auto ${effectiveRate.toFixed(1)}×`;
+      } else if (playbackRate > 1 && !fastRateActive) {
+        playbackStatus.textContent = "Live edge / using 1.0x for smooth audio";
       } else {
         playbackStatus.textContent = "Listening to live translation";
       }
@@ -824,18 +1117,26 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function markPlaying() {
       if (!running) return;
+      clearPendingSilenceCompaction(true);
+      playbackStarted = true;
       resumeButton.hidden = true;
       connectionStatus.textContent = "Connected";
       setCard(connectionCard, "ok");
-      playbackStatus.textContent = "Listening to live translation";
       nowPlaying.dataset.playing = "true";
       beginCaptionPolling();
       refreshCaptionForPlayhead();
       setMediaPlaybackState("playing");
+      updateLiveLatencyGuard();
     }
 
     function markPlaybackBlocked(error) {
       if (!running) return;
+      clearPendingSilenceCompaction();
+      playbackStarted = false;
+      fastRateActive = false;
+      catchingUp = false;
+      playbackStatusHoldUntilMs = 0;
+      applyPlaybackRate();
       const blocked = error && error.name === "NotAllowedError";
       connectionStatus.textContent = blocked ? "Tap to continue" : "Audio unavailable";
       setCard(connectionCard, blocked ? "warn" : "error");
@@ -858,13 +1159,21 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         if (!response.ok) throw new Error(`status request failed: ${response.status}`);
         const status = await response.json();
         if (!running) return;
+        const reportedBacklogMs = Number(status.translated_audio_backlog_ms);
+        const fallbackPendingAudioMs = Number(status.pending_audio_ms);
+        const serverBacklogMs = Number.isFinite(reportedBacklogMs)
+          ? reportedBacklogMs
+          : fallbackPendingAudioMs;
+        serverTranslatedAudioBacklogSec = Number.isFinite(serverBacklogMs)
+          ? Math.max(0, serverBacklogMs) / 1000
+          : 0;
         producerStatus.textContent = status.producer_active ? "Service live" : "Waiting for service";
         setCard(producerCard, status.producer_active ? "ok" : "warn");
         const listeners = Number(status.listener_count || 0);
-        const pendingAudioSec = Math.ceil(Number(status.pending_audio_ms || 0) / 1000);
         queueStatus.textContent = status.encoder_active
-          ? `Live / ${listeners} listeners${pendingAudioSec > 0 ? ` / ${pendingAudioSec}s queued` : ""}`
+          ? `Live · ${listeners} listening`
           : "Preparing stream";
+        updateLiveLatencyGuard();
       } catch (error) {
         if (!running) return;
         producerStatus.textContent = "Status unavailable";
@@ -907,6 +1216,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     function startListeningFromGesture() {
       if (running) return;
       running = true;
+      playbackStarted = false;
+      fastRateActive = false;
+      catchingUp = false;
+      playbackStatusHoldUntilMs = 0;
+      serverTranslatedAudioBacklogSec = 0;
       listenerId = createListenerId();
       startButton.disabled = true;
       stopButton.disabled = false;
@@ -924,8 +1238,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       playbackElement.playsInline = true;
       const streamUrl =
         `/api/tts/live/${encodeURIComponent(listenerId)}/index.m3u8`;
-      const sourceConfigured = configurePlaybackSource(streamUrl);
       applyPlaybackRate();
+      const sourceConfigured = configurePlaybackSource(streamUrl);
 
       if (!sourceConfigured) {
         beginStatusPolling();
@@ -945,6 +1259,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function resumeListeningFromGesture() {
       if (!running || !playbackElement.src) return;
+      playbackStarted = false;
+      fastRateActive = false;
+      catchingUp = false;
+      playbackStatusHoldUntilMs = 0;
+      applyPlaybackRate();
       resumeButton.hidden = true;
       connectionStatus.textContent = "Restoring audio";
       setCard(connectionCard, "warn");
@@ -968,12 +1287,18 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     function stopListening() {
       const closingListenerId = listenerId;
       listenerId = "";
-      running = false;
       catchingUp = false;
+      playbackStarted = false;
+      fastRateActive = false;
+      playbackStatusHoldUntilMs = 0;
+      applyPlaybackRate();
+      running = false;
       stopStatusPolling();
       stopCaptionPolling();
       captionSnapshot = null;
       captionCueId = "";
+      compactedNextCueKey = "";
+      clearPendingSilenceCompaction();
       playbackElement.pause();
       destroyHlsController();
       playbackElement.removeAttribute("src");
@@ -1028,15 +1353,35 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     resumeButton.addEventListener("click", resumeListeningFromGesture);
     stopButton.addEventListener("click", stopListening);
     playbackElement.addEventListener("playing", markPlaying);
+    playbackElement.addEventListener("seeked", () => {
+      if (!running || pendingSilenceCompaction === null) return;
+      requestPendingSilencePlayback();
+    });
     playbackElement.addEventListener("waiting", () => {
       if (!running) return;
-      playbackStatus.textContent = "Buffering live audio";
+      if (pendingSilenceCompaction !== null) {
+        scheduleSilenceCompactionRecovery();
+        return;
+      }
+      playbackStarted = false;
+      fastRateActive = false;
+      catchingUp = false;
+      applyPlaybackRate();
+      showPlaybackInterruptionStatus("Buffering live audio");
       nowPlaying.dataset.playing = "false";
       nowPlaying.dataset.speaking = "false";
     });
     playbackElement.addEventListener("stalled", () => {
       if (!running) return;
-      playbackStatus.textContent = "Reconnecting to live audio";
+      if (pendingSilenceCompaction !== null) {
+        scheduleSilenceCompactionRecovery();
+        return;
+      }
+      playbackStarted = false;
+      fastRateActive = false;
+      catchingUp = false;
+      applyPlaybackRate();
+      showPlaybackInterruptionStatus("Reconnecting to live audio");
       nowPlaying.dataset.playing = "false";
       nowPlaying.dataset.speaking = "false";
     });
@@ -1050,7 +1395,9 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       try {
         window.localStorage.setItem(PLAYBACK_RATE_STORAGE_KEY, String(playbackRate));
       } catch (error) {}
-      applyPlaybackRate();
+      fastRateActive = false;
+      if (running) updateLiveLatencyGuard();
+      else applyPlaybackRate();
     });
     playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard);
     playbackElement.addEventListener("timeupdate", refreshCaptionForPlayhead);

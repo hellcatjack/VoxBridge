@@ -603,7 +603,20 @@ def test_ws_segment_redecode_commits_new_terminal_sentence_after_resegmentation(
     assert committed.count(terminal) == 1
 
 
-def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "redecode_case",
+    (
+        "completed_unit_regression",
+        "unsafe_divergence",
+        "context_echo",
+        "effective_completed_unit_regression",
+    ),
+)
+def test_ws_segment_redecode_rejects_unsafe_candidate_and_releases_fallback(
+    monkeypatch,
+    tmp_path,
+    redecode_case,
+):
     first = "The first sufficiently long sentence is already complete."
     second = "The second sufficiently long sentence is already complete."
     third = "The third sufficiently long sentence is already complete."
@@ -613,6 +626,43 @@ def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_
     merged_correction = (
         "The first sufficiently long sentence is already complete, and the second "
         f"sufficiently long sentence is already complete. {third} {fourth} {terminal}"
+    )
+    divergent_correction = (
+        "Unrelated travelers carefully cataloged every lighthouse beside the northern coast. "
+        "Several musicians rehearsed a difficult symphony inside the restored theater. "
+        "Gardeners planted winter vegetables throughout the newly prepared community plots. "
+        "Engineers inspected each bridge before the regional transportation meeting began. "
+        "Astronomers photographed distant galaxies during an exceptionally clear evening."
+    )
+    context_echo_terms = [
+        "UnrelatedTravelersCatalogedLighthouses",
+        "MusiciansRehearsedSymphonies",
+        "GardenersPlantedVegetables",
+        "EngineersInspectedBridges",
+        "AstronomersPhotographedGalaxies",
+    ]
+    context_echo_correction = ". ".join(context_echo_terms) + "."
+    accepted_correction = streaming_text.replace(
+        terminal,
+        "The terminal sentence will remain clearly visible.",
+    )
+    corrected_text = (
+        merged_correction
+        if redecode_case == "completed_unit_regression"
+        else (
+            context_echo_correction
+            if redecode_case == "context_echo"
+            else (
+                accepted_correction
+                if redecode_case == "effective_completed_unit_regression"
+                else divergent_correction
+            )
+        )
+    )
+    context_terms = (
+        context_echo_terms
+        if redecode_case == "context_echo"
+        else []
     )
 
     class RegressiveResegmentationASR(_FakeASR):
@@ -629,14 +679,20 @@ def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_
 
         def transcribe(self, audio, context="", language=None):
             super().transcribe(audio, context=context, language=language)
-            return [SimpleNamespace(language="English", text=merged_correction)]
+            return [SimpleNamespace(language="English", text=corrected_text)]
 
     monkeypatch.setattr(
         demo_streaming_ws,
         "_should_skip_stream_decode",
         lambda **kwargs: False,
     )
-    trace_path = tmp_path / "completed-unit-regression.jsonl"
+    if redecode_case == "effective_completed_unit_regression":
+        monkeypatch.setattr(
+            demo_streaming_ws,
+            "_effective_completed_unit_counts",
+            lambda *args, **kwargs: (2, 1),
+        )
+    trace_path = tmp_path / f"rejected-{redecode_case}.jsonl"
     args = _args()
     args.force_language = "English"
     args.final_redecode_on_stop = False
@@ -647,14 +703,30 @@ def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_
     args.vad_min_active_sec = 0.2
     args.segment_overlap_sec = 0.0
     args.early_translation_stable_hits = 99
+    args.asr_context_max_chars = 1000
+    args.tts_revision_stable_sec = 0.0
+    args.tts_latest_revision_grace_sec = 0.0
     args.subtitle_trace_log = True
     args.subtitle_trace_log_file = str(trace_path)
     fake_asr = RegressiveResegmentationASR()
+    app = _create_app(
+        args,
+        fake_asr,
+        translator=_FakeTranslator(),
+        tts_synthesizer=_FakeTTSSynthesizer(),
+    )
+    listener = app.state.tts_broadcast.register("anonymous")
     events = []
 
-    with TestClient(_create_app(args, fake_asr)).websocket_connect("/ws") as ws:
+    with TestClient(app).websocket_connect("/ws") as ws:
         ws.receive_json()
-        ws.send_json({"type": "start", "language": "English"})
+        ws.send_json(
+            {
+                "type": "start",
+                "language": "English",
+                "asr_context_terms": context_terms,
+            }
+        )
         _receive_until_type(ws, "started")
         frame = np.full(6400, 20_000, dtype="<i2").tobytes()
         for _ in range(2):
@@ -676,7 +748,7 @@ def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_
                 "capture_sample_index": 24000,
             }
         )
-        _poll_ws_with_ping(
+        terminal_commit = _poll_ws_with_ping(
             ws,
             events,
             lambda message: (
@@ -684,6 +756,25 @@ def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_
                 and message.get("text") == terminal
             ),
         )
+        _poll_ws_with_ping(
+            ws,
+            events,
+            lambda message: (
+                message.get("type") == "sentence_translation"
+                and message.get("sentence_id") == terminal_commit["sentence_id"]
+            ),
+        )
+
+        broadcast_events = []
+        for _ in range(40):
+            broadcast_events.extend(_drain_listener_events(listener))
+            if any(
+                event.get("type") == "tts_job"
+                and event.get("sentence_id") == terminal_commit["sentence_id"]
+                for event in broadcast_events
+            ):
+                break
+            time.sleep(0.01)
 
     rows = [
         json.loads(line)
@@ -693,8 +784,15 @@ def test_ws_segment_redecode_rejects_completed_unit_regression(monkeypatch, tmp_
     assert len(fake_asr.transcribe_calls) == 1
     assert any(
         row.get("event") == "segment_final_redecode_skipped"
-        and row.get("reason") == "completed_unit_regression"
+        and row.get("reason") == redecode_case
         for row in rows
+    )
+    assert any(row.get("event") == "tts_source_sealed" for row in rows)
+    assert not any(row.get("event") == "tts_source_seal_deferred" for row in rows)
+    assert any(
+        event.get("type") == "tts_job"
+        and event.get("sentence_id") == terminal_commit["sentence_id"]
+        for event in broadcast_events
     )
     committed = [
         str(message.get("text") or "")
@@ -2228,6 +2326,9 @@ def test_removing_one_hls_listener_does_not_stop_shared_encoder(tmp_path):
         assert status["preparation_active"] is False
         assert status["prepared_audio_count"] == 0
         assert status["pending_audio_ms"] == 1750
+        assert status["translated_audio_backlog_ms"] == 1750
+        assert status["translated_audio_backlog_count"] == 0
+        assert status["translated_audio_backlog_estimated"] is False
 
     assert encoders[0].closed == 1
 

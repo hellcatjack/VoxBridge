@@ -45,13 +45,17 @@ support. Both paths consume the same shared stream and call
 synthesis or encoder. The continuous stream carries silence when no translated
 speech is ready.
 
-The page provides per-device playback-rate choices from `0.8x` through `1.2x`
-in `0.1x` steps. The value is stored only in browser `localStorage` and applies
-to the one native media element; it never creates another synthesis or encoder.
-A stored value outside the current allowlist falls back to `1.0x`. A listener
-that reaches 12 seconds behind the HLS live edge temporarily catches up at
-`1.2x` and restores the selected rate inside five seconds. A hidden or locked
-page uses at least `1.0x`. This guard does not seek or discard translated speech.
+The page defaults to per-device `Auto` playback and also offers fixed choices
+from `0.8x` through `1.4x` in `0.1x` steps. The value is stored only in browser
+`localStorage` and applies to the one native media element; it never creates
+another synthesis or encoder. A stored value outside the current allowlist
+falls back to `Auto`. Auto selects `1.0x`, `1.2x`, `1.4x`, or `1.5x` at strict
+10-, 30-, and 40-second end-to-end backlog boundaries. Faster playback starts
+with at least four seconds buffered and returns to `1.0x` at two seconds. A
+listener using a fixed slow rate that reaches 12 seconds behind the HLS live
+edge temporarily catches up at `1.2x` and restores the selected rate inside
+five seconds. A hidden or locked page uses at least `1.0x`. This fixed-rate
+guard does not seek or discard translated speech.
 
 ### `GET /listen/assets/hls.min.js`
 
@@ -84,6 +88,9 @@ Returns public foreground diagnostics for the shared stream:
   "preparation_active": false,
   "prepared_audio_count": 1,
   "pending_audio_ms": 0,
+  "translated_audio_backlog_ms": 82000,
+  "translated_audio_backlog_count": 9,
+  "translated_audio_backlog_estimated": true,
   "encoder_active": true,
   "producer_active": true,
   "last_error": ""
@@ -99,8 +106,15 @@ waiting for speculative Kokoro work, `preparation_active` identifies that kind
 of in-flight work, and `prepared_audio_count` counts exact revisions cached but
 not yet permitted into the live stream. `pending_audio_ms` measures synthesized PCM, including
 the inter-sentence pause, that has not yet been written into the real-time HLS
-timeline. It therefore exposes ordered playback backlog that `queue_depth`
-cannot represent.
+timeline. `translated_audio_backlog_ms` adds every unique successful
+translation known to the shared publisher but not yet submitted to that HLS
+timeline. Prepared revisions contribute their exact PCM duration; revisions
+still waiting for Kokoro contribute a rolling per-language duration estimate.
+`translated_audio_backlog_count` is the number of those unique revisions, so a
+revision present in both preparation and stable-release queues is counted only
+once. `translated_audio_backlog_estimated` is true while any contribution still
+uses an estimate. These fields describe server-side future audio only; a device
+adds its own distance from the current HLS live edge for an end-to-end backlog.
 
 ### `GET /api/tts/live/{listener_id}/index.m3u8`
 

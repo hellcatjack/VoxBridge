@@ -108,7 +108,7 @@ WorkingDirectory=%h/src/VoxBridge
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-%h/.config/voxbridge/voxbridge.env
 ExecStart=%h/src/VoxBridge/.venv/bin/python -m voxbridge.cli.demo_streaming_ws \
-  --asr-model-path Qwen/Qwen3-ASR-1.7B \
+  --asr-model-path Qwen/Qwen3-ASR-0.6B \
   --backend vllm \
   --host 127.0.0.1 \
   --port 8024 \
@@ -132,6 +132,46 @@ Add translation, VAD, context schedule, queue, or model-memory flags to `ExecSta
 ```bash
 .venv/bin/python -m voxbridge.cli.demo_streaming_ws --help
 ```
+
+### Couple the translation API lifecycle
+
+The production host can make the existing Q8_0 llama.cpp translation server a
+managed dependency of VoxBridge. Install the tracked translation unit,
+readiness probe, and main-service drop-in:
+
+```bash
+mkdir -p ~/.local/libexec ~/.config/systemd/user/voxbridge-8024.service.d
+install -m 755 deploy/systemd/voxbridge-wait-translation.sh \
+  ~/.local/libexec/voxbridge-wait-translation
+install -m 644 deploy/systemd/voxbridge-translation.service \
+  ~/.config/systemd/user/voxbridge-translation.service
+install -m 644 deploy/systemd/voxbridge-8024-translation.conf \
+  ~/.config/systemd/user/voxbridge-8024.service.d/translation.conf
+systemctl --user daemon-reload
+```
+
+`voxbridge-translation.service` invokes
+`/app/llama.cpp/llama-server-normal.sh start`, tracks its PID, and waits until
+`GET http://127.0.0.1:8001/v1/models` exposes
+`tencent/HY-MT1.5-1.8B-GGUF:Q8_0`. The public listener remains
+`0.0.0.0:8001`; the loopback URL is only the local readiness probe.
+VoxBridge starts only after that check succeeds. The reverse stop ordering
+releases WebSocket, ASR, translation, and TTS work before invoking
+`/app/llama.cpp/llama-server-normal.sh stop`.
+
+Do not enable or invoke the translation service separately after installing
+this coupling. Manage the stack through the existing VoxBridge unit:
+
+```bash
+systemctl --user start voxbridge-8024.service
+systemctl --user stop voxbridge-8024.service
+systemctl --user restart voxbridge-8024.service
+```
+
+The translation unit uses `PartOf=voxbridge-8024.service`, while the main
+service drop-in uses `Requires=` and `After=`. Therefore start, stop, and
+restart operations propagate without putting a detached llama-server in
+`ExecStartPre`.
 
 Install the tracked cgroup guard as a drop-in after measuring the normal cold
 start and active-session peak on the target host:
@@ -325,12 +365,12 @@ When no speech is pending, the encoder receives real-time zero PCM so native iOS
 playback can continue after the browser is locked.
 
 `--tts-speed` is the backend Kokoro synthesis baseline and remains global for
-the generated shared WAV. The `/listen` selector is a listener-side playback
-multiplier (`0.8x` through `1.2x` in `0.1x` steps) stored per browser; changing it does not
-restart the service, alter another device, or create another synthesis/cache
-variant. Because this is a live stream, `1.0x` gives the most predictable live-
-edge latency; other rates remain device-local and may change the distance from
-the live edge.
+the generated shared WAV. The `/listen` selector defaults to listener-side
+`Auto` playback and also offers fixed multipliers (`0.8x` through `1.4x` in
+`0.1x` steps) stored per browser; changing it does not restart the service,
+alter another device, or create another synthesis/cache variant. Because this
+is a live stream, `1.0x` gives the most predictable live-edge latency; other
+rates remain device-local and may change the distance from the live edge.
 
 The publisher appends a fixed `300ms` zero-PCM sentence pause after each Kokoro
 clip. The global translated-speech queue uses `--tts-listener-queue-size` as its
@@ -342,10 +382,23 @@ for that epoch.
 
 `GET /api/tts/live/status` reports `queue_depth` including the item currently in
 Kokoro, exposes `synthesis_active`, and reports synthesized FIFO backlog as
-`pending_audio_ms`. Playback rates below `1.0x` still consume encoded silence,
-so the listener applies a non-skipping live-latency guard: at a 12-second gap
-from the live edge it temporarily uses `1.2x`, restores the selected rate inside
-five seconds, and uses at least `1.0x` while the page is hidden or locked.
+`pending_audio_ms`. It also reports de-duplicated future translated audio as
+`translated_audio_backlog_ms`; use `translated_audio_backlog_count` and
+`translated_audio_backlog_estimated` to distinguish queued revisions and
+estimated durations. Auto selects `1.2x`, `1.4x`, or `1.5x` from the end-to-end
+sum of device HLS lag and `translated_audio_backlog_ms`, using strict 10-, 30-,
+and 40-second thresholds. A rate above `1.0x` activates only after the device
+has at least four seconds of playable HLS and returns to `1.0x` at two seconds,
+which prevents an estimated server backlog from causing immediate underruns.
+Manual playback rates below `1.0x` still consume encoded silence, so the
+listener retains its non-skipping 12-second catch-up guard and uses at least
+`1.0x` while the page is hidden or locked.
+
+When the next caption and its following audio are already buffered, the
+listener may compact a long historical idle-carrier gap while retaining at
+least 500ms of natural silence. The compaction is committed only after playback
+returns to `playing`; an internal seek that remains in `waiting` is retried
+after 800ms rather than permanently marking that caption as handled.
 
 The publisher also retains at most 256 caption cues for audio already released
 to the current HLS encoder epoch. Each cue uses the PCM media timeline submitted
@@ -419,10 +472,13 @@ Load and start the service:
 systemctl --user daemon-reload
 systemctl --user enable --now voxbridge-8024.service
 systemctl --user status voxbridge-8024.service --no-pager -l
-ss -lntp | rg ':8024'
+systemctl --user status voxbridge-translation.service --no-pager -l
+ss -lntp | rg ':(8001|8024)'
 ```
 
-Only one managed backend should own port `8024`. Do not start a second manual backend beside the user service.
+Only one managed backend should own port `8024`, and only one managed
+llama-server should own port `8001`. Do not start either backend manually
+beside the user services.
 
 ### Install bounded user log rotation
 
@@ -473,9 +529,11 @@ Check systemd and the listener:
 
 ```bash
 systemctl --user is-active voxbridge-8024.service
+systemctl --user is-active voxbridge-translation.service
 systemctl --user show voxbridge-8024.service \
   -p MainPID -p NRestarts -p MemoryCurrent --no-pager
-ss -lntp | rg ':8024'
+ss -lntp | rg ':(8001|8024)'
+curl --fail --silent http://127.0.0.1:8001/v1/models
 ```
 
 Check process topology:

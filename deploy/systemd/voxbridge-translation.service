@@ -1,0 +1,22 @@
+[Unit]
+Description=VoxBridge OpenAI-compatible translation service
+Wants=network-online.target
+After=network-online.target
+PartOf=voxbridge-8024.service
+Before=voxbridge-8024.service
+
+[Service]
+Type=forking
+PIDFile=/app/llama.cpp/build/bin/llama-server-normal.pid
+Environment=VOXBRIDGE_TRANSLATION_MODELS_URL=http://127.0.0.1:8001/v1/models
+Environment=VOXBRIDGE_TRANSLATION_MODEL=tencent/HY-MT1.5-1.8B-GGUF:Q8_0
+Environment=VOXBRIDGE_TRANSLATION_READY_TIMEOUT_SEC=120
+ExecStart=/app/llama.cpp/llama-server-normal.sh start
+ExecStartPost=%h/.local/libexec/voxbridge-wait-translation
+ExecStop=/app/llama.cpp/llama-server-normal.sh stop
+ExecStopPost=-/app/llama.cpp/llama-server-normal.sh stop
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=150
+TimeoutStopSec=30
+KillMode=control-group

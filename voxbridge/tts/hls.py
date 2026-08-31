@@ -22,6 +22,12 @@ from .jobs import TTSReadyItem
 
 logger = logging.getLogger(__name__)
 
+BACKLOG_PUBLISH_RATE = 1.4
+DEFAULT_ENGLISH_AUDIO_MS_PER_CHAR = 65.0
+DEFAULT_CHINESE_AUDIO_MS_PER_CHAR = 180.0
+MIN_ESTIMATED_SENTENCE_AUDIO_MS = 500
+DURATION_ESTIMATE_ALPHA = 0.25
+
 
 class HLSError(Exception):
     """Base error for the shared translated-speech stream."""
@@ -80,6 +86,9 @@ class HLSStreamStatus:
     preparation_active: bool
     prepared_audio_count: int
     pending_audio_ms: int
+    translated_audio_backlog_ms: int
+    translated_audio_backlog_count: int
+    translated_audio_backlog_estimated: bool
     encoder_active: bool
     last_error: str
 
@@ -409,7 +418,8 @@ class FFmpegHLSEncoder:
                     )
                 if writing_audio and not active:
                     self._pcm_queue.task_done()
-                await asyncio.sleep(frame_sec)
+                publish_rate = BACKLOG_PUBLISH_RATE if writing_audio else 1.0
+                await asyncio.sleep(frame_sec / publish_rate)
         except asyncio.CancelledError:
             raise
         except (BrokenPipeError, ConnectionResetError, HLSUnavailable) as exc:
@@ -557,6 +567,8 @@ class SharedHLSTTSPublisher:
         )
         self._preparation_pending: dict[tuple[str, int, str, str], TTSReadyItem] = {}
         self._prepared_audio: dict[tuple[str, int, str, str], _PreparedAudio] = {}
+        self._known_items: dict[tuple[str, int, str, str], TTSReadyItem] = {}
+        self._audio_ms_per_char: dict[str, float] = {}
         self._latest_key_by_sentence: dict[str, tuple[str, int, str, str]] = {}
         self._work_available = asyncio.Event()
         self._encoder: HLSEncoder | None = None
@@ -577,6 +589,19 @@ class SharedHLSTTSPublisher:
 
     @property
     def status(self) -> HLSStreamStatus:
+        pending_audio_ms = max(
+            0,
+            int(getattr(self._encoder, "pending_audio_ms", 0) or 0),
+        )
+        future_audio_ms = 0
+        backlog_estimated = False
+        for key, item in self._known_items.items():
+            prepared = self._prepared_audio.get(key)
+            if prepared is not None:
+                future_audio_ms += int(prepared.audio_ms)
+            else:
+                future_audio_ms += self._estimate_item_audio_ms(item)
+                backlog_estimated = True
         return HLSStreamStatus(
             available=not self._closed and self._synthesizer is not None,
             listener_count=len(self._leases),
@@ -585,10 +610,10 @@ class SharedHLSTTSPublisher:
             preparation_queue_depth=len(self._preparation_pending),
             preparation_active=self._inflight_kind == "prepare",
             prepared_audio_count=len(self._prepared_audio),
-            pending_audio_ms=max(
-                0,
-                int(getattr(self._encoder, "pending_audio_ms", 0) or 0),
-            ),
+            pending_audio_ms=pending_audio_ms,
+            translated_audio_backlog_ms=pending_audio_ms + future_audio_ms,
+            translated_audio_backlog_count=len(self._known_items),
+            translated_audio_backlog_estimated=backlog_estimated,
             encoder_active=self._encoder is not None,
             last_error=self._last_error,
         )
@@ -610,6 +635,42 @@ class SharedHLSTTSPublisher:
             text_hash,
         )
 
+    @staticmethod
+    def _language_key(language: str) -> str:
+        normalized = str(language or "").strip().lower()
+        if "chinese" in normalized or "中文" in normalized:
+            return "chinese"
+        return "english"
+
+    def _estimate_item_audio_ms(self, item: TTSReadyItem) -> int:
+        language = self._language_key(item.target_language)
+        default_ms_per_char = (
+            DEFAULT_CHINESE_AUDIO_MS_PER_CHAR
+            if language == "chinese"
+            else DEFAULT_ENGLISH_AUDIO_MS_PER_CHAR
+        )
+        ms_per_char = self._audio_ms_per_char.get(language, default_ms_per_char)
+        text_chars = max(1, len(str(item.text or "").strip()))
+        return max(
+            MIN_ESTIMATED_SENTENCE_AUDIO_MS,
+            round(text_chars * ms_per_char) + self._sentence_pause_ms,
+        )
+
+    def _observe_item_audio_ms(self, item: TTSReadyItem, audio_ms: int) -> None:
+        text_chars = len(str(item.text or "").strip())
+        if text_chars < 1:
+            return
+        language = self._language_key(item.target_language)
+        speech_audio_ms = max(1, int(audio_ms) - self._sentence_pause_ms)
+        observed = speech_audio_ms / text_chars
+        previous = self._audio_ms_per_char.get(language)
+        self._audio_ms_per_char[language] = (
+            observed
+            if previous is None
+            else previous * (1.0 - DURATION_ESTIMATE_ALPHA)
+            + observed * DURATION_ESTIMATE_ALPHA
+        )
+
     def _select_latest_item_locked(
         self,
         item: TTSReadyItem,
@@ -623,6 +684,9 @@ class SharedHLSTTSPublisher:
         for prepared_key in list(self._prepared_audio):
             if prepared_key[0] == sentence_id and prepared_key != key:
                 del self._prepared_audio[prepared_key]
+        for known_key in list(self._known_items):
+            if known_key[0] == sentence_id and known_key != key:
+                del self._known_items[known_key]
 
     def _retain_latest_idle_item_locked(self) -> int:
         """Collapse pre-listener speech to the current live sentence."""
@@ -648,6 +712,7 @@ class SharedHLSTTSPublisher:
                 self._latest_key_by_sentence.pop(sentence_id, None)
             self._preparation_pending.pop(key, None)
             self._prepared_audio.pop(key, None)
+            self._known_items.pop(key, None)
 
         dropped = len(stale)
         if dropped:
@@ -719,8 +784,9 @@ class SharedHLSTTSPublisher:
             except asyncio.QueueFull as exc:
                 if self._leases and self._encoder is not None:
                     raise HLSQueueFull("shared HLS TTS queue is full") from exc
-                self._queue.get_nowait()
+                dropped_item = self._queue.get_nowait()
                 self._queue.task_done()
+                self._known_items.pop(self._item_key(dropped_item), None)
                 self._queue.put_nowait(item)
                 self._idle_backlog_dropped += 1
                 if self._idle_backlog_dropped == 1 or self._idle_backlog_dropped % 32 == 0:
@@ -729,6 +795,7 @@ class SharedHLSTTSPublisher:
                         self._idle_backlog_dropped,
                         self._queue.qsize(),
                     )
+            self._known_items[key] = item
             self._work_available.set()
             return True
 
@@ -746,6 +813,7 @@ class SharedHLSTTSPublisher:
                 return False
             key = self._item_key(item)
             self._select_latest_item_locked(item, key)
+            self._known_items[key] = item
             if (
                 key in self._prepared_audio
                 or key in self._preparation_pending
@@ -770,11 +838,12 @@ class SharedHLSTTSPublisher:
             dropped = 0
             while True:
                 try:
-                    self._queue.get_nowait()
+                    dropped_item = self._queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 else:
                     self._queue.task_done()
+                    self._known_items.pop(self._item_key(dropped_item), None)
                     dropped += 1
             return dropped
 
@@ -914,10 +983,7 @@ class SharedHLSTTSPublisher:
                     synthesis_ms = round((time.monotonic() - synthesis_started) * 1000)
                     audio_ms = max(
                         1,
-                        int(
-                            getattr(audio, "duration_ms", 0)
-                            or (len(pcm) * 1000 / (self._sample_rate * 2))
-                        ),
+                        round(len(pcm) * 1000 / (self._sample_rate * 2)),
                     )
                     prepared = _PreparedAudio(
                         pcm=pcm,
@@ -927,6 +993,7 @@ class SharedHLSTTSPublisher:
                         synthesis_ms=synthesis_ms,
                         prepared_at=self._clock(),
                     )
+                    self._observe_item_audio_ms(item, audio_ms)
 
                 if kind == "prepare":
                     cached = False
@@ -954,6 +1021,8 @@ class SharedHLSTTSPublisher:
                     continue
 
                 receipt = await encoder.append_pcm(prepared.pcm)
+                async with self._lock:
+                    self._known_items.pop(key, None)
                 if isinstance(receipt, HLSAppendReceipt):
                     cue_start_at_ms = (
                         int(receipt.start_at_ms)
@@ -1000,6 +1069,9 @@ class SharedHLSTTSPublisher:
                 raise
             except Exception as exc:
                 self._last_error = type(exc).__name__
+                if kind == "release" and key is not None:
+                    async with self._lock:
+                        self._known_items.pop(key, None)
                 logger.warning(
                     "shared HLS TTS item failed source_order=%d error=%s",
                     int(item.source_order),
@@ -1042,6 +1114,7 @@ class SharedHLSTTSPublisher:
             self._active_root = None
             self._preparation_pending.clear()
             self._prepared_audio.clear()
+            self._known_items.clear()
             self._latest_key_by_sentence.clear()
             self._caption_cues.clear()
             self._work_available.clear()

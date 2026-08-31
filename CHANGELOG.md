@@ -6,6 +6,13 @@ All notable public changes to VoxBridge are documented here.
 
 ### Fixed
 
+- Hardened shared HLS listening with end-to-end translated-audio backlog,
+  per-device Auto speed control, playhead-aligned captions, and recoverable
+  historical-silence compaction that cannot permanently strand playback in a
+  buffering state.
+- Coupled the Q8_0 llama.cpp translation API to the VoxBridge user service with
+  PID supervision, model-aware readiness checking, ordered startup, and
+  propagated stop/restart operations.
 - Prevented high-confidence quiet speech from being discarded by the energy
   decode gate by adding an opt-in Silero decode rescue that cannot cut segments
   or commit text. Rescue now uses accumulated evidence across a coalesced batch,

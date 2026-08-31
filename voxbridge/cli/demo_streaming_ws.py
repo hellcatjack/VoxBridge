@@ -5718,6 +5718,15 @@ def _create_app(
                 "preparation_active": bool(status.preparation_active),
                 "prepared_audio_count": int(status.prepared_audio_count),
                 "pending_audio_ms": int(status.pending_audio_ms),
+                "translated_audio_backlog_ms": int(
+                    status.translated_audio_backlog_ms
+                ),
+                "translated_audio_backlog_count": int(
+                    status.translated_audio_backlog_count
+                ),
+                "translated_audio_backlog_estimated": bool(
+                    status.translated_audio_backlog_estimated
+                ),
                 "encoder_active": bool(status.encoder_active),
                 "producer_active": bool(app.state.tts_broadcast.producer_active),
                 "last_error": str(status.last_error),
@@ -6924,6 +6933,7 @@ def _create_app(
                 previous_units, _ = _split_subtitle_units(previous_text)
                 corrected_units, _ = _split_subtitle_units(corrected_text)
                 if len(corrected_units) < len(previous_units):
+                    local_state._voxbridge_segment_final_redecode_validated = True
                     _trace_event(
                         f"{event_prefix}_skipped",
                         reason="completed_unit_regression",
@@ -6972,6 +6982,7 @@ def _create_app(
                 ):
                     context_echo_reason = "context_fragment_echo"
                 if context_echo_reason:
+                    local_state._voxbridge_segment_final_redecode_validated = True
                     _trace_event(
                         f"{event_prefix}_skipped",
                         reason=str(context_echo_reason),
@@ -6991,6 +7002,7 @@ def _create_app(
                         corrected_text,
                     )
                 ):
+                    local_state._voxbridge_segment_final_redecode_validated = True
                     _trace_event(
                         f"{event_prefix}_skipped",
                         reason="unsafe_divergence",
@@ -9208,7 +9220,7 @@ def _create_app(
                     local_state.text = final_text
                     if hasattr(local_state, "_raw_decoded"):
                         local_state._raw_decoded = final_text
-                    local_state._voxbridge_segment_final_redecode_validated = False
+                    local_state._voxbridge_segment_final_redecode_validated = True
                     local_state._voxbridge_segment_final_redecode_applied = False
                     context_final_applied = False
                     segment_final_context_applied = False
@@ -12627,7 +12639,7 @@ def _build_tts_synthesizer(args: argparse.Namespace, *, translator: Any) -> Any:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VoxBridge Streaming Web Demo (HTTPS + WebSocket)")
-    p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B", help="Model name or local path")
+    p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-0.6B", help="Model name or local path")
     p.add_argument("--backend", default="vllm", choices=["transformers", "vllm"], help="Inference backend")
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
     p.add_argument("--port", type=int, default=8024, help="Bind port")
@@ -12744,7 +12756,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--translation-api-model",
-        default="tencent/HY-MT1.5-1.8B-GGUF:Q4_K_M",
+        default="tencent/HY-MT1.5-1.8B-GGUF:Q8_0",
         help="OpenAI-compatible translation model name",
     )
     p.add_argument(
@@ -12854,7 +12866,7 @@ def parse_args() -> argparse.Namespace:
         default="/data/Qwen3-ASR/models/kokoro/config-v1.1-zh.json",
         help="Kokoro v1.1 Chinese vocabulary config",
     )
-    p.add_argument("--tts-en-voice", default="af_heart", help="English Kokoro voice")
+    p.add_argument("--tts-en-voice", default="am_michael", help="English Kokoro voice")
     p.add_argument("--tts-zh-voice", default="zf_001", help="Chinese Kokoro voice")
     p.add_argument("--tts-speed", type=float, default=1.05, help="Kokoro speaking speed")
     p.add_argument(

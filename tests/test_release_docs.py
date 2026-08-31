@@ -55,8 +55,8 @@ def test_readme_declares_the_supported_runtime_contract():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "8024" in readme
     assert ".venv/bin/python" in readme
-    assert "Qwen/Qwen3-ASR-1.7B" in readme
-    assert "Qwen/Qwen3-ASR-0.6B" not in readme
+    assert "Qwen/Qwen3-ASR-0.6B" in readme
+    assert "Qwen/Qwen3-ASR-1.7B" not in readme
     assert "sentence_id" in readme
     assert "revision" in readme
 
@@ -215,6 +215,34 @@ def test_user_service_templates_bound_log_rotation():
     assert "%h/.config/voxbridge/logrotate.conf" in service
     assert "OnUnitActiveSec=1h" in timer
     assert "Persistent=true" in timer
+
+
+def test_user_service_couples_translation_lifecycle_and_readiness():
+    translation = (
+        ROOT / "deploy" / "systemd" / "voxbridge-translation.service"
+    ).read_text(encoding="utf-8")
+    dependency = (
+        ROOT / "deploy" / "systemd" / "voxbridge-8024-translation.conf"
+    ).read_text(encoding="utf-8")
+    readiness = (
+        ROOT / "deploy" / "systemd" / "voxbridge-wait-translation.sh"
+    ).read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    assert "Type=forking" in translation
+    assert "PIDFile=/app/llama.cpp/build/bin/llama-server-normal.pid" in translation
+    assert "ExecStart=/app/llama.cpp/llama-server-normal.sh start" in translation
+    assert "ExecStop=/app/llama.cpp/llama-server-normal.sh stop" in translation
+    assert "PartOf=voxbridge-8024.service" in translation
+    assert "Before=voxbridge-8024.service" in translation
+    assert "ExecStartPost=%h/.local/libexec/voxbridge-wait-translation" in translation
+    assert "Requires=voxbridge-translation.service" in dependency
+    assert "After=voxbridge-translation.service" in dependency
+    assert "ExecStartPre" not in dependency
+    assert "/v1/models" in readiness
+    assert "tencent/HY-MT1.5-1.8B-GGUF:Q8_0" in readiness
+    assert "systemctl --user start voxbridge-8024.service" in deployment
+    assert "systemctl --user stop voxbridge-8024.service" in deployment
 
 
 def test_docs_publish_runtime_budget_and_tts_finality_contract():

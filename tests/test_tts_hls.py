@@ -621,7 +621,67 @@ async def test_status_reports_pcm_audio_waiting_for_real_time_encoder(tmp_path):
         await publisher.touch_listener("iphone-a", "owner-a")
 
         assert publisher.status.pending_audio_ms == 1750
+        assert publisher.status.translated_audio_backlog_ms == 1750
+        assert publisher.status.translated_audio_backlog_count == 0
+        assert publisher.status.translated_audio_backlog_estimated is False
     finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_status_includes_prepared_translation_before_hls_publish(tmp_path):
+    encoder = FakeEncoder(tmp_path / "stream")
+    encoder.pending_audio_ms = 1750
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=FakeSynthesizer(
+            make_wav(duration_ms=250),
+            duration_ms=250,
+        ),
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        clock=FakeClock(),
+        sentence_pause_ms=300,
+    )
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        assert await publisher.prepare(
+            ready_item(text="Successfully translated but not released.")
+        ) is True
+        await wait_until(lambda: publisher.status.prepared_audio_count == 1)
+
+        status = publisher.status
+        assert status.pending_audio_ms == 1750
+        assert status.translated_audio_backlog_ms == 2300
+        assert status.translated_audio_backlog_count == 1
+        assert status.translated_audio_backlog_estimated is False
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_status_counts_prepared_and_release_queue_overlap_once(tmp_path):
+    worker_gate = asyncio.Event()
+    encoder = FakeEncoder(tmp_path / "stream")
+    encoder.pending_audio_ms = 1750
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=FakeSynthesizer(make_wav()),
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        clock=FakeClock(),
+        worker_start_gate=worker_gate,
+    )
+    item = ready_item(text="One successfully translated sentence.")
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        assert await publisher.prepare(item) is True
+        assert await publisher.publish(item) is True
+
+        status = publisher.status
+        assert status.translated_audio_backlog_count == 1
+        assert status.translated_audio_backlog_ms > status.pending_audio_ms
+        assert status.translated_audio_backlog_estimated is True
+    finally:
+        worker_gate.set()
         await publisher.close()
 
 
@@ -878,6 +938,42 @@ async def test_ffmpeg_encoder_tracks_audio_until_writer_consumes_it(tmp_path):
         with pytest.raises(asyncio.CancelledError):
             await writer
         encoder._process = None
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_encoder_bursts_backlog_but_keeps_idle_carrier_realtime(
+    tmp_path,
+    monkeypatch,
+):
+    delays: list[float] = []
+
+    async def record_three_delays(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 3:
+            raise asyncio.CancelledError
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    monkeypatch.setattr(asyncio, "sleep", record_three_delays)
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+        frame_ms=100,
+    )
+    encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
+    await encoder.append_pcm(bytes(round(8000 * 0.2) * 2))
+
+    with pytest.raises(asyncio.CancelledError):
+        await encoder._writer_loop()
+
+    assert delays == pytest.approx([0.1 / 1.4, 0.1 / 1.4, 0.1])
+    encoder._process = None
 
 
 @pytest.mark.asyncio

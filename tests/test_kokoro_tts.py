@@ -87,7 +87,7 @@ def test_english_synthesis_returns_pcm16_wav(tmp_path):
         assert wav.getframerate() == 24000
         assert wav.getnframes() == 3
     call = factory.models[0].calls[0]
-    assert call.voice == "af_heart"
+    assert call.voice == "am_michael"
     assert call.lang == "en-us"
     assert call.is_phonemes is False
 

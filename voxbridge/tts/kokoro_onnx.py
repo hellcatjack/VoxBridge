@@ -24,7 +24,7 @@ class KokoroTTSConfig:
     chinese_model_path: Path
     chinese_voices_path: Path
     chinese_config_path: Path
-    english_voice: str = "af_heart"
+    english_voice: str = "am_michael"
     chinese_voice: str = "zf_001"
     speed: float = 1.05
     cpu_threads: int = 4
