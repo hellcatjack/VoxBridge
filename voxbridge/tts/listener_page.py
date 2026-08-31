@@ -265,11 +265,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       display: none;
     }
 
-    .now-playing[data-speaking="false"] strong {
-      color: #53635c;
-      opacity: 0.72;
-    }
-
     .playback-state {
       min-width: 0;
       align-self: end;

@@ -1161,6 +1161,14 @@ def test_listener_retains_caption_between_cues_without_empty_transition(listener
     listener_page.wait_for_function(
         "document.querySelector('#liveCaption').textContent.startsWith('The first')"
     )
+    listener_page.wait_for_function(
+        "document.querySelector('#nowPlaying').dataset.speaking === 'true'"
+    )
+    listener_page.wait_for_timeout(250)
+    speaking_style = listener_page.eval_on_selector(
+        "#liveCaption",
+        "node => ({ color: getComputedStyle(node).color, opacity: getComputedStyle(node).opacity })",
+    )
     listener_page.evaluate(
         """() => {
           const caption = document.querySelector("#liveCaption");
@@ -1175,9 +1183,15 @@ def test_listener_retains_caption_between_cues_without_empty_transition(listener
     listener_page.wait_for_function(
         "document.querySelector('#nowPlaying').dataset.speaking === 'false'"
     )
+    listener_page.wait_for_timeout(250)
     assert listener_page.text_content("#liveCaption") == (
         "The first spoken sentence remains visible."
     )
+    retained_style = listener_page.eval_on_selector(
+        "#liveCaption",
+        "node => ({ color: getComputedStyle(node).color, opacity: getComputedStyle(node).opacity })",
+    )
+    assert retained_style == speaking_style
 
     _set_live_lag(listener_page, current_time=98, live_edge=100)
     listener_page.wait_for_function(
