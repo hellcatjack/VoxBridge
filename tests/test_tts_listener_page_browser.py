@@ -457,7 +457,7 @@ def test_unsupported_legacy_rate_falls_back_to_default(listener_page):
     ) == 1
 
 
-def _start_historical_silence_harness(
+def _start_shared_timeline_gap_harness(
     listener_page,
     *,
     gap_ms=3000,
@@ -1120,130 +1120,19 @@ def test_desktop_caption_uses_hls_playing_date_when_playlist_edges_desynchronize
     )
 
 
-@pytest.mark.parametrize(
-    ("gap_ms", "playing_at_ms", "buffered_end", "expected_current_time"),
-    [
-        (3000, 104_100, 80.0, 52.5),
-        (3000, 104_700, 80.0, 52.3),
-        (800, 104_100, 80.0, 50.0),
-        (3000, 104_100, 52.0, 50.0),
-    ],
-    ids=[
-        "long-buffered-gap",
-        "natural-pause-already-heard",
-        "natural-gap",
-        "next-speech-not-buffered",
-    ],
-)
-def test_listener_only_compacts_long_buffered_silence(
-    listener_page,
-    gap_ms,
-    playing_at_ms,
-    buffered_end,
-    expected_current_time,
-):
-    _start_historical_silence_harness(
+def test_listener_keeps_shared_playhead_when_future_speech_is_buffered(listener_page):
+    _start_shared_timeline_gap_harness(
         listener_page,
-        gap_ms=gap_ms,
-        playing_at_ms=playing_at_ms,
+        gap_ms=3000,
+        playing_at_ms=104_100,
     )
 
-    _set_buffered_range(listener_page, start=0.0, end=buffered_end)
+    _set_buffered_range(listener_page, start=0.0, end=80.0)
 
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.currentTime"
-    ) == pytest.approx(expected_current_time)
-
-
-def test_auto_compaction_requires_two_seconds_of_next_speech_buffer(listener_page):
-    _start_historical_silence_harness(listener_page)
-
-    _set_buffered_range(listener_page, start=0.0, end=54.89)
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.currentTime"
     ) == pytest.approx(50.0)
-
-    _set_buffered_range(listener_page, start=0.0, end=54.9)
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.currentTime"
-    ) == pytest.approx(52.5)
-
-
-def test_auto_compaction_returns_to_normal_rate(listener_page):
-    _start_historical_silence_harness(listener_page)
-
-    _set_buffered_range(listener_page, start=0.0, end=80.0)
-
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.currentTime"
-    ) == pytest.approx(52.5)
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.playbackRate"
-    ) == 1
-
-
-def test_auto_compaction_retries_playback_when_seek_stays_waiting(listener_page):
-    _start_historical_silence_harness(listener_page)
-    listener_page.evaluate(
-        """() => {
-          const playback = document.querySelector("#ttsPlayback");
-          const originalPlay = HTMLMediaElement.prototype.play;
-          window.__ttsCompactionRecoveryCalls = 0;
-          HTMLMediaElement.prototype.play = function() {
-            if (this !== playback) return originalPlay.call(this);
-            window.__ttsCompactionRecoveryCalls += 1;
-            if (window.__ttsCompactionRecoveryCalls === 1) {
-              return new Promise(() => {});
-            }
-            return originalPlay.call(this);
-          };
-          Object.defineProperty(playback, "currentTime", {
-            configurable: true,
-            get: () => window.__ttsCurrentTime,
-            set: value => {
-              window.__ttsCurrentTime = Number(value);
-              playback.dispatchEvent(new Event("seeking"));
-              playback.dispatchEvent(new Event("waiting"));
-              playback.dispatchEvent(new Event("seeked"));
-            },
-          });
-        }"""
-    )
-
-    _set_buffered_range(listener_page, start=0.0, end=80.0)
-
-    listener_page.wait_for_function(
-        """() => (
-          window.__ttsCompactionRecoveryCalls >= 2
-          && document.querySelector("#nowPlaying").dataset.playing === "true"
-        )""",
-        timeout=2500,
-    )
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.currentTime"
-    ) == pytest.approx(52.5)
-    assert not listener_page.text_content("#playbackStatus").startswith(
-        "Buffering live audio"
-    )
-
-
-@pytest.mark.parametrize(
-    ("buffered_end", "expected_current_time"),
-    [(56.89, 50.0), (56.9, 52.5)],
-    ids=["less-than-four-seconds", "four-seconds"],
-)
-def test_manual_fast_compaction_retains_four_second_guard(
-    listener_page,
-    buffered_end,
-    expected_current_time,
-):
-    _start_historical_silence_harness(listener_page, playback_rate="1.4")
-
-    _set_buffered_range(listener_page, start=0.0, end=buffered_end)
-
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.currentTime"
-    ) == pytest.approx(expected_current_time)
+    assert listener_page.get_attribute("#nowPlaying", "data-playing") == "true"
 
 
 def test_listener_retains_caption_between_cues_without_empty_transition(listener_page):

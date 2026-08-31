@@ -559,11 +559,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const AUTO_FAST_LAG_SEC = 30;
     const AUTO_HIGH_LAG_SEC = 40;
     const CAPTION_POLL_INTERVAL_MS = 500;
-    const HISTORICAL_SILENCE_MIN_GAP_MS = 900;
-    const HISTORICAL_SILENCE_KEEP_MS = 500;
-    const AUTO_NEXT_SPEECH_BUFFER_GUARD_SEC = 2;
-    const NEXT_SPEECH_BUFFER_GUARD_SEC = 4;
-    const SILENCE_COMPACTION_RECOVERY_MS = 800;
     const PLAYBACK_INTERRUPTION_STATUS_HOLD_MS = 1500;
     const MIN_CAPTION_FONT_PX = 8;
 
@@ -579,9 +574,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let playbackStatusHoldUntilMs = 0;
     let captionSnapshot = null;
     let captionCueId = "";
-    let compactedNextCueKey = "";
-    let pendingSilenceCompaction = null;
-    let silenceCompactionRecoveryTimer = null;
     let captionResizeFrame = null;
     let hlsController = null;
     let serverTranslatedAudioBacklogSec = 0;
@@ -764,148 +756,19 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       revealCaption();
     }
 
-    function mediaTimeIsBuffered(mediaTime) {
-      const ranges = playbackElement.buffered;
-      if (!ranges || !Number.isFinite(mediaTime)) return false;
-      try {
-        for (let index = 0; index < ranges.length; index += 1) {
-          if (
-            mediaTime >= Number(ranges.start(index))
-            && mediaTime <= Number(ranges.end(index))
-          ) {
-            return true;
-          }
-        }
-      } catch (error) {}
-      return false;
-    }
-
-    function clearPendingSilenceCompaction(completed = false) {
-      if (silenceCompactionRecoveryTimer !== null) {
-        window.clearTimeout(silenceCompactionRecoveryTimer);
-        silenceCompactionRecoveryTimer = null;
-      }
-      const pending = pendingSilenceCompaction;
-      pendingSilenceCompaction = null;
-      if (completed && pending !== null) {
-        compactedNextCueKey = pending.nextCueKey;
-        playbackStatusHoldUntilMs = 0;
-      }
-      return pending;
-    }
-
-    function scheduleSilenceCompactionRecovery() {
-      if (silenceCompactionRecoveryTimer !== null) return;
-      silenceCompactionRecoveryTimer = window.setTimeout(() => {
-        silenceCompactionRecoveryTimer = null;
-        if (!running || pendingSilenceCompaction === null) return;
-        showPlaybackInterruptionStatus("Buffering live audio");
-        nowPlaying.dataset.speaking = "false";
-        requestPendingSilencePlayback();
-      }, SILENCE_COMPACTION_RECOVERY_MS);
-    }
-
-    function requestPendingSilencePlayback() {
-      if (!running || pendingSilenceCompaction === null) return;
-      const pending = pendingSilenceCompaction;
-      scheduleSilenceCompactionRecovery();
-      let playPromise = null;
-      try {
-        playPromise = playbackElement.play();
-      } catch (error) {
-        markPlaybackBlocked(error);
-        return;
-      }
-      if (playPromise) {
-        playPromise.then(() => {
-          if (pendingSilenceCompaction === pending) markPlaying();
-        }).catch((error) => {
-          if (pendingSilenceCompaction === pending) markPlaybackBlocked(error);
-        });
-      } else {
-        if (pendingSilenceCompaction === pending) markPlaying();
-      }
-    }
-
-    function compactHistoricalSilence(playheadAtMs, previousCue, nextCue) {
-      if (
-        !playbackStarted
-        || nowPlaying.dataset.playing !== "true"
-        || pendingSilenceCompaction !== null
-        || previousCue === null
-        || nextCue === null
-      ) {
-        return false;
-      }
-      const previousEndAtMs = Number(previousCue.end_at_ms);
-      const nextStartAtMs = Number(nextCue.start_at_ms);
-      if (
-        !Number.isFinite(previousEndAtMs)
-        || !Number.isFinite(nextStartAtMs)
-        || playheadAtMs < previousEndAtMs
-        || playheadAtMs >= nextStartAtMs
-        || nextStartAtMs - previousEndAtMs <= HISTORICAL_SILENCE_MIN_GAP_MS
-      ) {
-        return false;
-      }
-      const nextCueKey = `${String(nextCue.cue_id || "")}:${nextStartAtMs}`;
-      if (compactedNextCueKey === nextCueKey) return false;
-      const currentTime = Number(playbackElement.currentTime);
-      if (!Number.isFinite(currentTime)) return false;
-      const nextSpeechMediaTime = currentTime + (nextStartAtMs - playheadAtMs) / 1000;
-      const nextSpeechBufferGuardSec = playbackRate === "auto"
-        ? AUTO_NEXT_SPEECH_BUFFER_GUARD_SEC
-        : NEXT_SPEECH_BUFFER_GUARD_SEC;
-      if (
-        !mediaTimeIsBuffered(nextSpeechMediaTime + nextSpeechBufferGuardSec)
-      ) {
-        return false;
-      }
-      const silenceAlreadyHeardMs = Math.max(0, playheadAtMs - previousEndAtMs);
-      const silenceStillNeededMs = Math.max(
-        0,
-        HISTORICAL_SILENCE_KEEP_MS - silenceAlreadyHeardMs
-      );
-      const targetMediaTime = currentTime
-        + (nextStartAtMs - silenceStillNeededMs - playheadAtMs) / 1000;
-      if (
-        !Number.isFinite(targetMediaTime)
-        || targetMediaTime <= currentTime
-        || !mediaTimeIsBuffered(targetMediaTime)
-      ) {
-        return false;
-      }
-      pendingSilenceCompaction = {
-        nextCueKey,
-      };
-      scheduleSilenceCompactionRecovery();
-      try {
-        playbackElement.currentTime = targetMediaTime;
-      } catch (error) {
-        clearPendingSilenceCompaction();
-        return false;
-      }
-      if (playbackRate === "auto") {
-        fastRateActive = false;
-        applyPlaybackRate();
-      }
-      nowPlaying.dataset.speaking = "false";
-      return true;
-    }
-
     function applyCaptionSnapshot(snapshot, requestListenerId) {
       if (!running || !requestListenerId || requestListenerId !== listenerId) return;
       const playheadAtMs = estimatedPlaybackAtMs(snapshot);
       if (playheadAtMs === null) return;
       const cues = Array.isArray(snapshot && snapshot.cues) ? snapshot.cues : [];
       let selected = null;
-      let next = null;
       for (const cue of cues) {
         const startAtMs = Number(cue && cue.start_at_ms);
         if (!Number.isFinite(startAtMs)) continue;
-        if (startAtMs > playheadAtMs) {
-          if (next === null || startAtMs < Number(next.start_at_ms)) next = cue;
-        } else if (selected === null || startAtMs >= Number(selected.start_at_ms)) {
+        if (
+          startAtMs <= playheadAtMs
+          && (selected === null || startAtMs >= Number(selected.start_at_ms))
+        ) {
           selected = cue;
         }
       }
@@ -914,8 +777,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         nowPlaying.dataset.speaking = "false";
         return;
       }
-      if (pendingSilenceCompaction !== null) return;
-      if (compactHistoricalSilence(playheadAtMs, selected, next)) return;
       setLiveCaption(selected.text, selected.cue_id);
       const endAtMs = Number(selected.end_at_ms);
       nowPlaying.dataset.speaking = String(
@@ -1117,7 +978,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function markPlaying() {
       if (!running) return;
-      clearPendingSilenceCompaction(true);
       playbackStarted = true;
       resumeButton.hidden = true;
       connectionStatus.textContent = "Connected";
@@ -1131,7 +991,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function markPlaybackBlocked(error) {
       if (!running) return;
-      clearPendingSilenceCompaction();
       playbackStarted = false;
       fastRateActive = false;
       catchingUp = false;
@@ -1297,8 +1156,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       stopCaptionPolling();
       captionSnapshot = null;
       captionCueId = "";
-      compactedNextCueKey = "";
-      clearPendingSilenceCompaction();
       playbackElement.pause();
       destroyHlsController();
       playbackElement.removeAttribute("src");
@@ -1353,16 +1210,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     resumeButton.addEventListener("click", resumeListeningFromGesture);
     stopButton.addEventListener("click", stopListening);
     playbackElement.addEventListener("playing", markPlaying);
-    playbackElement.addEventListener("seeked", () => {
-      if (!running || pendingSilenceCompaction === null) return;
-      requestPendingSilencePlayback();
-    });
     playbackElement.addEventListener("waiting", () => {
       if (!running) return;
-      if (pendingSilenceCompaction !== null) {
-        scheduleSilenceCompactionRecovery();
-        return;
-      }
       playbackStarted = false;
       fastRateActive = false;
       catchingUp = false;
@@ -1373,10 +1222,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     });
     playbackElement.addEventListener("stalled", () => {
       if (!running) return;
-      if (pendingSilenceCompaction !== null) {
-        scheduleSilenceCompactionRecovery();
-        return;
-      }
       playbackStarted = false;
       fastRateActive = false;
       catchingUp = false;
