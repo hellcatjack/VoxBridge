@@ -295,6 +295,8 @@ class FFmpegHLSEncoder:
         self._pending_pcm_bytes = 0
         self._submitted_pcm_bytes = 0
         self._scheduled_end_pcm_bytes = 0
+        self._bootstrap_pcm_bytes_total = 0
+        self._bootstrap_pcm_bytes_remaining = 0
         self._timeline_origin_at_ms: int | None = None
         self._closed = False
 
@@ -307,6 +309,15 @@ class FFmpegHLSEncoder:
     def playlist_path(self) -> Path:
         return self.root / "index.m3u8"
 
+    def _required_bootstrap_pcm_bytes(self) -> int:
+        frame_sec = self._frame_bytes / (self.sample_rate * 2)
+        aac_frame_sec = 1024 / self.sample_rate
+        # Cross one HLS boundary and leave enough PCM for the writer and AAC
+        # encoders to emit the packet that finalizes the first segment.
+        bootstrap_sec = self.segment_sec + frame_sec + aac_frame_sec
+        frame_count = max(1, math.ceil(bootstrap_sec / frame_sec))
+        return frame_count * self._frame_bytes
+
     async def start(self) -> None:
         if self._process is not None:
             return
@@ -318,6 +329,10 @@ class FFmpegHLSEncoder:
             "-hide_banner",
             "-loglevel",
             "error",
+            "-analyzeduration",
+            "0",
+            "-probesize",
+            "32",
             "-f",
             "s16le",
             "-ar",
@@ -351,6 +366,12 @@ class FFmpegHLSEncoder:
             )
         except OSError as exc:
             raise HLSUnavailable("failed to start FFmpeg") from exc
+        self._bootstrap_pcm_bytes_total = self._required_bootstrap_pcm_bytes()
+        self._bootstrap_pcm_bytes_remaining = self._bootstrap_pcm_bytes_total
+        self._scheduled_end_pcm_bytes = max(
+            self._scheduled_end_pcm_bytes,
+            self._bootstrap_pcm_bytes_total,
+        )
         self._writer_task = asyncio.create_task(self._writer_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -390,21 +411,27 @@ class FFmpegHLSEncoder:
         frame_bytes = self._frame_bytes
         frame_samples = frame_bytes // 2
         frame_sec = frame_samples / self.sample_rate
-        silence = self._idle_carrier_pcm
         active = b""
         try:
             while True:
-                if not active:
-                    try:
-                        active = self._pcm_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        active = b""
-                writing_audio = bool(active)
-                chunk = active[:frame_bytes] if writing_audio else silence
-                consumed_bytes = len(chunk) if writing_audio else 0
-                active = active[len(chunk) :] if writing_audio else b""
-                if len(chunk) < frame_bytes:
-                    chunk += bytes(frame_bytes - len(chunk))
+                bootstrapping = self._bootstrap_pcm_bytes_remaining > 0
+                if bootstrapping:
+                    chunk = self._idle_carrier_pcm
+                    self._bootstrap_pcm_bytes_remaining = max(
+                        0,
+                        self._bootstrap_pcm_bytes_remaining - frame_bytes,
+                    )
+                    writing_audio = False
+                    consumed_bytes = 0
+                else:
+                    if not active:
+                        active = await self._pcm_queue.get()
+                    writing_audio = True
+                    chunk = active[:frame_bytes]
+                    consumed_bytes = len(chunk)
+                    active = active[len(chunk) :]
+                    if len(chunk) < frame_bytes:
+                        chunk += bytes(frame_bytes - len(chunk))
                 process = self._process
                 if process is None or process.returncode is not None or process.stdin is None:
                     raise HLSUnavailable("FFmpeg exited while streaming")
@@ -416,8 +443,8 @@ class FFmpegHLSEncoder:
                         0,
                         self._pending_pcm_bytes - consumed_bytes,
                     )
-                if writing_audio and not active:
-                    self._pcm_queue.task_done()
+                    if not active:
+                        self._pcm_queue.task_done()
                 publish_rate = BACKLOG_PUBLISH_RATE if writing_audio else 1.0
                 await asyncio.sleep(frame_sec / publish_rate)
         except asyncio.CancelledError:
@@ -485,6 +512,8 @@ class FFmpegHLSEncoder:
         self._pending_pcm_bytes = 0
         self._submitted_pcm_bytes = 0
         self._scheduled_end_pcm_bytes = 0
+        self._bootstrap_pcm_bytes_total = 0
+        self._bootstrap_pcm_bytes_remaining = 0
         self._timeline_origin_at_ms = None
         writer = self._writer_task
         self._writer_task = None
