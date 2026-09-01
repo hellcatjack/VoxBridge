@@ -139,13 +139,17 @@ Caption polling remains advisory and provides the next cue and its absolute
 program-time marker. A listener may compact only when all of these conditions
 hold:
 
-1. Playback is running and currently in the gap after the previous cue.
+1. The listener has started playback and is currently in the gap after the
+   previous cue. A native `waiting` event does not disqualify compaction because
+   this is the exact state in which newly buffered speech must end the wait.
 2. The next cue has a positive disposable gap and a valid `resume_at_ms`.
 3. At least 500ms of carrier is disposable; smaller differences are left alone
    to avoid a risky seek for negligible benefit.
 4. The computed media target and at least 1.0 second beyond the next speech
    start are already inside one buffered media range.
 5. No seek for that exact cue has previously been attempted by this listener.
+   Attempted cue keys are kept in an epoch-scoped set bounded by the existing
+   caption-history limit.
 
 The listener accounts for silence already heard. If `heard_gap_ms` is the time
 since the previous cue ended, it keeps only the remaining natural gap:
