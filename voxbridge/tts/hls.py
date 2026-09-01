@@ -22,7 +22,9 @@ from .jobs import TTSReadyItem
 
 logger = logging.getLogger(__name__)
 
-BACKLOG_PUBLISH_RATE = 2.0
+ACTIVE_PCM_BURST_RATE = 2.0
+ACTIVE_PCM_BURST_MEDIA_SEC = 2.0
+TAIL_PUBLISH_RATE = 2.0
 DEFAULT_ENGLISH_AUDIO_MS_PER_CHAR = 65.0
 DEFAULT_CHINESE_AUDIO_MS_PER_CHAR = 180.0
 MIN_ESTIMATED_SENTENCE_AUDIO_MS = 500
@@ -74,6 +76,7 @@ class HLSListenerLease:
 class HLSAppendReceipt:
     start_at_ms: int
     end_at_ms: int
+    discardable_gap_before_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +412,10 @@ class FFmpegHLSEncoder:
             raise HLSUnavailable("HLS media timeline is unavailable")
         await self._pcm_queue.put(data)
         bytes_per_second = self.sample_rate * 2
+        discardable_gap_bytes = max(
+            0,
+            self._submitted_pcm_bytes - self._scheduled_end_pcm_bytes,
+        )
         start_pcm_bytes = max(
             self._submitted_pcm_bytes,
             self._scheduled_end_pcm_bytes,
@@ -431,7 +438,14 @@ class FFmpegHLSEncoder:
             or end_at_ms > self._tail_flush_target_at_ms
         ):
             self._tail_flush_target_at_ms = end_at_ms
-        return HLSAppendReceipt(start_at_ms=start_at_ms, end_at_ms=end_at_ms)
+        discardable_gap_before_ms = round(
+            discardable_gap_bytes * 1000.0 / bytes_per_second
+        )
+        return HLSAppendReceipt(
+            start_at_ms=start_at_ms,
+            end_at_ms=end_at_ms,
+            discardable_gap_before_ms=discardable_gap_before_ms,
+        )
 
     async def _flush_tail_until_visible(self, *, frame_sec: float) -> None:
         target_at_ms = self._tail_flush_target_at_ms
@@ -442,7 +456,7 @@ class FFmpegHLSEncoder:
         flush_media_sec = flush_pcm_bytes_remaining / bytes_per_second
         deadline = asyncio.get_running_loop().time() + max(
             1.0,
-            flush_media_sec / BACKLOG_PUBLISH_RATE + 0.75,
+            flush_media_sec / TAIL_PUBLISH_RATE + 0.75,
         )
         while self._pcm_queue.empty():
             live_edge_at_ms = self.live_edge_at_ms()
@@ -476,13 +490,16 @@ class FFmpegHLSEncoder:
                 flush_pcm_bytes_remaining - len(self._idle_carrier_pcm),
             )
             await process.stdin.drain()
-            await asyncio.sleep(frame_sec / BACKLOG_PUBLISH_RATE)
+            await asyncio.sleep(frame_sec / TAIL_PUBLISH_RATE)
 
     async def _writer_loop(self) -> None:
         frame_bytes = self._frame_bytes
         frame_samples = frame_bytes // 2
         frame_sec = frame_samples / self.sample_rate
         active = b""
+        active_burst_bytes_remaining = round(
+            self.sample_rate * 2 * ACTIVE_PCM_BURST_MEDIA_SEC
+        )
         try:
             while True:
                 bootstrapping = self._bootstrap_pcm_bytes_remaining > 0
@@ -501,6 +518,9 @@ class FFmpegHLSEncoder:
                         except asyncio.QueueEmpty:
                             await self._flush_tail_until_visible(frame_sec=frame_sec)
                             active = await self._pcm_queue.get()
+                            active_burst_bytes_remaining = round(
+                                self.sample_rate * 2 * ACTIVE_PCM_BURST_MEDIA_SEC
+                            )
                     writing_audio = True
                     chunk = active[:frame_bytes]
                     consumed_bytes = len(chunk)
@@ -520,7 +540,13 @@ class FFmpegHLSEncoder:
                     )
                     if not active:
                         self._pcm_queue.task_done()
-                publish_rate = BACKLOG_PUBLISH_RATE if writing_audio else 1.0
+                publish_rate = 1.0
+                if writing_audio and active_burst_bytes_remaining > 0:
+                    publish_rate = ACTIVE_PCM_BURST_RATE
+                    active_burst_bytes_remaining = max(
+                        0,
+                        active_burst_bytes_remaining - len(chunk),
+                    )
                 await asyncio.sleep(frame_sec / publish_rate)
         except asyncio.CancelledError:
             raise

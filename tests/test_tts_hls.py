@@ -1003,6 +1003,25 @@ async def test_ffmpeg_append_receipts_follow_media_timeline_fifo(tmp_path):
     encoder._process = None
 
 
+@pytest.mark.asyncio
+async def test_ffmpeg_append_receipt_reports_only_previously_submitted_carrier(tmp_path):
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+    )
+    encoder._process = SimpleNamespace(returncode=None)
+    encoder._timeline_origin_at_ms = 100_000
+    encoder._scheduled_end_pcm_bytes = 32_000
+    encoder._submitted_pcm_bytes = 48_000
+
+    first = await encoder.append_pcm(bytes(8000 * 2))
+    second = await encoder.append_pcm(bytes(8000 * 2))
+
+    assert first.discardable_gap_before_ms == 1000
+    assert second.discardable_gap_before_ms == 0
+    encoder._process = None
+
+
 def test_hls_live_edge_uses_last_complete_program_date_time_segment():
     playlist = """#EXTM3U
 #EXT-X-PROGRAM-DATE-TIME:2026-08-11T10:00:00.000-04:00
@@ -1106,24 +1125,23 @@ async def test_ffmpeg_encoder_tracks_audio_until_writer_consumes_it(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_encoder_publishes_with_two_x_listener_headroom(
+async def test_ffmpeg_encoder_limits_two_x_burst_to_two_seconds(
     tmp_path,
     monkeypatch,
 ):
     real_sleep = asyncio.sleep
     delays: list[float] = []
-    writes: list[bytes] = []
-    wrote_two_frames = asyncio.Event()
+    wrote_twenty_one_frames = asyncio.Event()
 
     async def record_delay(delay: float) -> None:
         delays.append(delay)
+        if len(delays) >= 21:
+            wrote_twenty_one_frames.set()
         await real_sleep(0)
 
     class FakeStdin:
         def write(self, data: bytes) -> None:
-            writes.append(bytes(data))
-            if len(writes) == 2:
-                wrote_two_frames.set()
+            del data
 
         async def drain(self) -> None:
             return None
@@ -1136,16 +1154,115 @@ async def test_ffmpeg_encoder_publishes_with_two_x_listener_headroom(
     )
     encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
     encoder._timeline_origin_at_ms = 100_000
-    await encoder.append_pcm(bytes(round(8000 * 0.2) * 2))
+    await encoder.append_pcm(bytes(round(8000 * 3.0) * 2))
 
     writer = asyncio.create_task(encoder._writer_loop())
     try:
-        await asyncio.wait_for(wrote_two_frames.wait(), timeout=1)
-        while len(delays) < 2:
+        await asyncio.wait_for(wrote_twenty_one_frames.wait(), timeout=1)
+
+        assert delays[:20] == pytest.approx([0.05] * 20)
+        assert delays[20] == pytest.approx(0.1)
+        assert encoder.pending_audio_ms > 0
+        assert writer.done() is False
+    finally:
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+        encoder._process = None
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_encoder_does_not_reset_burst_between_adjacent_clips(
+    tmp_path,
+    monkeypatch,
+):
+    real_sleep = asyncio.sleep
+    delays: list[float] = []
+    wrote_twenty_one_frames = asyncio.Event()
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) >= 21:
+            wrote_twenty_one_frames.set()
+        await real_sleep(0)
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    monkeypatch.setattr(asyncio, "sleep", record_delay)
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+        frame_ms=100,
+    )
+    encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
+    await encoder.append_pcm(bytes(round(8000 * 1.5) * 2))
+    await encoder.append_pcm(bytes(round(8000 * 1.5) * 2))
+
+    writer = asyncio.create_task(encoder._writer_loop())
+    try:
+        await asyncio.wait_for(wrote_twenty_one_frames.wait(), timeout=1)
+
+        assert delays[:20] == pytest.approx([0.05] * 20)
+        assert delays[20] == pytest.approx(0.1)
+    finally:
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+        encoder._process = None
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_encoder_resets_burst_after_genuine_queue_starvation(
+    tmp_path,
+    monkeypatch,
+):
+    real_sleep = asyncio.sleep
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    async def skip_tail_flush(*, frame_sec: float) -> None:
+        del frame_sec
+
+    monkeypatch.setattr(asyncio, "sleep", record_delay)
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+        frame_ms=100,
+    )
+    encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
+    encoder._flush_tail_until_visible = skip_tail_flush
+    await encoder.append_pcm(bytes(round(8000 * 2.1) * 2))
+
+    writer = asyncio.create_task(encoder._writer_loop())
+    try:
+        while encoder.pending_audio_ms:
+            await real_sleep(0)
+        await real_sleep(0)
+        delay_count_before_resume = len(delays)
+
+        await encoder.append_pcm(bytes(round(8000 * 0.1) * 2))
+        while len(delays) == delay_count_before_resume:
             await real_sleep(0)
 
-        assert max(delays[:2]) <= 0.05
-        assert writer.done() is False
+        assert delays[20] == pytest.approx(0.1)
+        assert delays[delay_count_before_resume] == pytest.approx(0.05)
     finally:
         writer.cancel()
         with pytest.raises(asyncio.CancelledError):
