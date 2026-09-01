@@ -538,6 +538,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const MIN_CAPTION_FONT_PX = 8;
     const MIN_DISCARDABLE_GAP_MS = 500;
     const NEXT_SPEECH_BUFFER_GUARD_MS = 1000;
+    const NEXT_SPEECH_SEEKABLE_GUARD_MS = 100;
 
     let listenerId = "";
     let running = false;
@@ -735,6 +736,28 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       return false;
     }
 
+    function seekableRangeContainsBoth(targetMediaTime, guardedMediaTime) {
+      const ranges = playbackElement.seekable;
+      if (!ranges) return false;
+      try {
+        for (let index = 0; index < ranges.length; index += 1) {
+          const start = Number(ranges.start(index));
+          const end = Number(ranges.end(index));
+          if (
+            Number.isFinite(start)
+            && Number.isFinite(end)
+            && targetMediaTime >= start
+            && targetMediaTime <= end
+            && guardedMediaTime >= start
+            && guardedMediaTime <= end
+          ) {
+            return true;
+          }
+        }
+      } catch (error) {}
+      return false;
+    }
+
     function compactBufferedWaitingGap(playheadAtMs, previousCue, nextCue) {
       if (!running || !playbackStarted || !previousCue || !nextCue) return false;
       const previousEndAtMs = Number(previousCue.end_at_ms);
@@ -772,11 +795,17 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         + (targetProgramAtMs - playheadAtMs) / 1000;
       const guardedMediaTime = currentTime
         + (nextStartAtMs + NEXT_SPEECH_BUFFER_GUARD_MS - playheadAtMs) / 1000;
+      const seekableGuardedMediaTime = currentTime
+        + (nextStartAtMs + NEXT_SPEECH_SEEKABLE_GUARD_MS - playheadAtMs) / 1000;
       if (
         !Number.isFinite(targetMediaTime)
         || !Number.isFinite(guardedMediaTime)
+        || !Number.isFinite(seekableGuardedMediaTime)
         || targetMediaTime <= currentTime
-        || !bufferedRangeContainsBoth(targetMediaTime, guardedMediaTime)
+        || (
+          !bufferedRangeContainsBoth(targetMediaTime, guardedMediaTime)
+          && !seekableRangeContainsBoth(targetMediaTime, seekableGuardedMediaTime)
+        )
       ) {
         return false;
       }

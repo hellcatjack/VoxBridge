@@ -168,7 +168,7 @@ def _install_hls_harness(
           if (window.__ttsFastSeekThrows) {{
             throw new DOMException("seek failed", "InvalidStateError");
           }}
-          this.currentTime = Number(value);
+          window.__ttsCurrentTime = Number(value);
         }};
         HTMLMediaElement.prototype.load = function() {{}};
         window.fetch = function(url, options = {{}}) {{
@@ -232,7 +232,10 @@ def _set_live_lag(listener_page, *, current_time: float, live_edge: float):
           Object.defineProperty(playback, "currentTime", {
             configurable: true,
             get: () => window.__ttsCurrentTime,
-            set: value => { window.__ttsCurrentTime = Number(value); },
+            set: value => {
+              window.__ttsSeekCalls.push(Number(value));
+              window.__ttsCurrentTime = Number(value);
+            },
           });
           Object.defineProperty(playback, "seekable", {
             configurable: true,
@@ -880,8 +883,9 @@ def test_listener_adds_no_natural_pause_after_gap_was_already_heard(listener_pag
     assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
 
 
-def test_listener_waits_for_guarded_speech_buffer_then_seeks_once(listener_page):
+def test_listener_uses_guarded_buffer_when_speech_is_not_yet_seekable(listener_page):
     _start_shared_timeline_gap_harness(listener_page)
+    _set_live_lag(listener_page, current_time=50.0, live_edge=52.9)
 
     _set_buffered_range(listener_page, start=0.0, end=53.8)
     assert listener_page.evaluate("window.__ttsSeekCalls") == []
@@ -891,6 +895,57 @@ def test_listener_waits_for_guarded_speech_buffer_then_seeks_once(listener_page)
     listener_page.wait_for_timeout(600)
 
     assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([52.5])
+
+
+@pytest.mark.parametrize(
+    ("native_hls", "hls_js_supported", "fast_seek_supported"),
+    [(True, False, True), (False, True, False), (False, True, True)],
+)
+def test_listener_skips_unbuffered_carrier_once_speech_is_seekable(
+    listener_page,
+    native_hls,
+    hls_js_supported,
+    fast_seek_supported,
+):
+    _start_shared_timeline_gap_harness(
+        listener_page,
+        gap_ms=21_800,
+        discardable_gap_ms=21_500,
+        playing_at_ms=104_100,
+        native_hls=native_hls,
+        hls_js_supported=hls_js_supported,
+    )
+    if native_hls:
+        listener_page.locator("#ttsPlayback").evaluate(
+            "node => { node.getStartDate = () => new Date(54_100); }"
+        )
+    if not fast_seek_supported:
+        listener_page.evaluate("HTMLMediaElement.prototype.fastSeek = undefined")
+
+    _set_buffered_range(listener_page, start=0.0, end=50.2)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([71.5])
+    assert listener_page.evaluate("window.__ttsPauseCalls") == 0
+    assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
+
+
+def test_listener_waits_until_unbuffered_speech_is_seekable(listener_page):
+    _start_shared_timeline_gap_harness(
+        listener_page,
+        gap_ms=21_800,
+        discardable_gap_ms=21_500,
+        playing_at_ms=104_100,
+    )
+    _set_live_lag(listener_page, current_time=50.0, live_edge=71.5)
+    _set_buffered_range(listener_page, start=0.0, end=50.2)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == []
+
+    _set_live_lag(listener_page, current_time=50.0, live_edge=72.0)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([71.5])
+    assert listener_page.evaluate("window.__ttsPauseCalls") == 0
+    assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
 
 
 @pytest.mark.parametrize("discardable_gap_ms", [0, 499])

@@ -222,9 +222,13 @@ when the media element cannot provide a valid start date. The page therefore
 displays what that device is hearing instead of the newest server translation.
 Between cues it keeps the previous sentence visible without clearing, dimming,
 or flashing the text. When both `resume_at_ms` and the next second of speech are
-inside one media buffer range, the page performs one guarded seek for that cue.
-It never changes the fixed `1.0` media rate and has no custom pause/play/retry
-recovery loop. The response uses `Cache-Control: no-store`. Caption
+inside one media buffer range, the page performs an immediately buffered seek.
+Otherwise it seeks as soon as the target and `100ms` beyond the next speech start
+are inside one media `seekable` range, allowing native HLS or hls.js to load the
+target fragment instead of consuming accumulated idle carrier. Each cue is
+attempted at most once. The page never changes the fixed `1.0` media rate and has
+no custom pause/play/retry recovery loop. The response uses `Cache-Control:
+no-store`. Caption
 polling is advisory and does not gate HLS audio; lock-screen playback continues
 if polling is suspended or temporarily fails.
 
