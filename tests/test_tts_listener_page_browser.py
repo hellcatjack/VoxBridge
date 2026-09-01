@@ -928,6 +928,31 @@ def test_native_hls_uses_precise_seek_instead_of_fast_seek(listener_page):
     assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
 
 
+def test_native_hls_waits_for_seekable_even_when_target_is_buffered(listener_page):
+    _start_shared_timeline_gap_harness(
+        listener_page,
+        gap_ms=21_800,
+        discardable_gap_ms=21_500,
+        playing_at_ms=104_100,
+        native_hls=True,
+        hls_js_supported=False,
+    )
+    listener_page.locator("#ttsPlayback").evaluate(
+        "node => { node.getStartDate = () => new Date(54_100); }"
+    )
+    _set_live_lag(listener_page, current_time=50.0, live_edge=71.0)
+
+    _set_buffered_range(listener_page, start=0.0, end=73.0)
+
+    assert listener_page.evaluate("window.__ttsCurrentTimeSeekCalls") == []
+
+    _set_live_lag(listener_page, current_time=50.0, live_edge=72.0)
+
+    assert listener_page.evaluate(
+        "window.__ttsCurrentTimeSeekCalls"
+    ) == pytest.approx([71.45])
+
+
 def test_native_hls_keeps_decoder_preroll_before_next_speech(listener_page):
     _start_shared_timeline_gap_harness(
         listener_page,

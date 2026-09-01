@@ -808,15 +808,23 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         + (nextStartAtMs + NEXT_SPEECH_BUFFER_GUARD_MS - playheadAtMs) / 1000;
       const seekableGuardedMediaTime = currentTime
         + (nextStartAtMs + NEXT_SPEECH_SEEKABLE_GUARD_MS - playheadAtMs) / 1000;
+      const bufferedReady = bufferedRangeContainsBoth(
+        targetMediaTime,
+        guardedMediaTime
+      );
+      const seekableReady = seekableRangeContainsBoth(
+        targetMediaTime,
+        seekableGuardedMediaTime
+      );
+      const targetReady = hlsController === null
+        ? seekableReady
+        : bufferedReady || seekableReady;
       if (
         !Number.isFinite(targetMediaTime)
         || !Number.isFinite(guardedMediaTime)
         || !Number.isFinite(seekableGuardedMediaTime)
         || targetMediaTime <= currentTime
-        || (
-          !bufferedRangeContainsBoth(targetMediaTime, guardedMediaTime)
-          && !seekableRangeContainsBoth(targetMediaTime, seekableGuardedMediaTime)
-        )
+        || !targetReady
       ) {
         return false;
       }
