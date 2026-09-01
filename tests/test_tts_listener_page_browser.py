@@ -865,6 +865,21 @@ def test_listener_compacts_buffered_waiting_gap_without_restarting_playback(
     ) == [1, 1]
 
 
+def test_listener_adds_no_natural_pause_after_gap_was_already_heard(listener_page):
+    _start_shared_timeline_gap_harness(
+        listener_page,
+        gap_ms=3000,
+        discardable_gap_ms=2500,
+        playing_at_ms=106_900,
+    )
+
+    _set_buffered_range(listener_page, start=0.0, end=52.0)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([50.1])
+    assert listener_page.evaluate("window.__ttsPauseCalls") == 0
+    assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
+
+
 def test_listener_waits_for_guarded_speech_buffer_then_seeks_once(listener_page):
     _start_shared_timeline_gap_harness(listener_page)
 

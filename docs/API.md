@@ -42,8 +42,10 @@ queue. Desktop Chrome, Edge, and Firefox use the locally served hls.js MSE fallb
 when MSE AAC is available, even if desktop Chrome reports unreliable native HLS
 support. Both paths consume the same shared stream and call
 `play()` from the Start gesture; neither fetches sentence WAVs nor creates another
-synthesis or encoder. The continuous stream carries silence when no translated
-speech is ready.
+synthesis or encoder. The continuous stream carries a near-silent decodable
+carrier at real-time `1.0x` when no translated speech is ready. This keeps the
+live playlist advancing through long speech gaps so native Safari can resume
+without a new play gesture.
 
 Playback Speed is a read-only shared status. Every browser keeps the HTML media
 element at `defaultPlaybackRate = 1.0` and `playbackRate = 1.0`; hls.js is also
@@ -62,8 +64,11 @@ cacheable for one day. Its pinned version, upstream release, SHA-256 digest, and
 Apache-2.0 license are stored with the vendored asset.
 
 The listener verifies both hls.js MSE support and the `mp4a.40.2` AAC codec before
-selecting this path. The shared encoder emits a near-silent decodable carrier while
-idle because exact zero PCM can produce MPEG-TS segments with no AAC frames.
+selecting this path. The shared encoder continuously emits a near-silent decodable
+carrier at real-time `1.0x` while idle because exact zero PCM can produce MPEG-TS
+segments with no AAC frames. New speech is checked once per encoder frame
+(default `100ms`), and queued adjacent clips are selected before carrier, so this
+keepalive does not add an inter-sentence pause or speech backlog.
 
 ### `GET /listen/qr.svg`
 
@@ -201,11 +206,12 @@ caption cues for the current encoder epoch and clears them when that shared
 stream ends.
 
 `discardable_gap_before_ms` is the clamped part of the preceding cue gap caused
-only by carrier PCM submitted while FFmpeg was finalizing an HLS tail and waiting
-for another translation. It never includes the normal sentence pause or model
-edge silence. `resume_at_ms` is `null` when no such carrier exists; otherwise it
-is the absolute program-time point after the disposable carrier from which the
-remaining continuous-speech natural gap must still be preserved.
+only by continuous idle carrier PCM submitted while waiting for another
+translation. It never includes the normal sentence pause or model edge silence.
+`resume_at_ms` is `null` when no such carrier exists; otherwise it is the absolute
+program-time point after the disposable carrier from which only the still-unheard
+part of the natural gap must be preserved. If the actual wait already covered the
+natural gap, the browser targets the next speech start and adds no extra pause.
 
 On Safari, the listener maps the native media timeline to an absolute playhead
 using `getStartDate() + currentTime` and selects the newest cue whose start is

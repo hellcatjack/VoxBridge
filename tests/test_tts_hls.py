@@ -1162,6 +1162,105 @@ async def test_ffmpeg_encoder_tracks_audio_until_writer_consumes_it(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ffmpeg_encoder_continues_realtime_carrier_without_audio_debt(
+    tmp_path,
+    monkeypatch,
+):
+    real_sleep = asyncio.sleep
+    delays: list[float] = []
+    writes: list[bytes] = []
+    wrote_two_idle_frames = asyncio.Event()
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            writes.append(bytes(data))
+            if len(writes) >= 3:
+                wrote_two_idle_frames.set()
+
+        async def drain(self) -> None:
+            return None
+
+    monkeypatch.setattr(asyncio, "sleep", record_delay)
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+        frame_ms=100,
+    )
+    encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
+    speech_frame = b"\x01\x00" * 800
+    await encoder.append_pcm(speech_frame)
+
+    writer = asyncio.create_task(encoder._writer_loop())
+    try:
+        await asyncio.wait_for(wrote_two_idle_frames.wait(), timeout=1)
+
+        assert writes[:3] == [
+            speech_frame,
+            encoder._idle_carrier_pcm,
+            encoder._idle_carrier_pcm,
+        ]
+        assert delays[:3] == pytest.approx([0.05, 0.1, 0.1])
+        assert encoder.pending_audio_ms == 0
+    finally:
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+        encoder._process = None
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_encoder_inserts_no_carrier_between_adjacent_clips(
+    tmp_path,
+    monkeypatch,
+):
+    real_sleep = asyncio.sleep
+    writes: list[bytes] = []
+    wrote_both_clips = asyncio.Event()
+
+    async def yield_immediately(delay: float) -> None:
+        del delay
+        await real_sleep(0)
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            writes.append(bytes(data))
+            if len(writes) >= 2:
+                wrote_both_clips.set()
+
+        async def drain(self) -> None:
+            return None
+
+    monkeypatch.setattr(asyncio, "sleep", yield_immediately)
+    encoder = FFmpegHLSEncoder(
+        tmp_path / "live",
+        sample_rate=8000,
+        frame_ms=100,
+    )
+    encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
+    encoder._timeline_origin_at_ms = 100_000
+    first = b"\x01\x00" * 800
+    second = b"\x02\x00" * 800
+    await encoder.append_pcm(first)
+    await encoder.append_pcm(second)
+
+    writer = asyncio.create_task(encoder._writer_loop())
+    try:
+        await asyncio.wait_for(wrote_both_clips.wait(), timeout=1)
+
+        assert writes[:2] == [first, second]
+    finally:
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+        encoder._process = None
+
+
+@pytest.mark.asyncio
 async def test_ffmpeg_encoder_limits_two_x_burst_to_two_seconds(
     tmp_path,
     monkeypatch,
@@ -1273,9 +1372,6 @@ async def test_ffmpeg_encoder_resets_burst_after_genuine_queue_starvation(
         async def drain(self) -> None:
             return None
 
-    async def skip_tail_flush(*, frame_sec: float) -> None:
-        del frame_sec
-
     monkeypatch.setattr(asyncio, "sleep", record_delay)
     encoder = FFmpegHLSEncoder(
         tmp_path / "live",
@@ -1284,7 +1380,6 @@ async def test_ffmpeg_encoder_resets_burst_after_genuine_queue_starvation(
     )
     encoder._process = SimpleNamespace(returncode=None, stdin=FakeStdin())
     encoder._timeline_origin_at_ms = 100_000
-    encoder._flush_tail_until_visible = skip_tail_flush
     await encoder.append_pcm(bytes(round(8000 * 2.1) * 2))
 
     writer = asyncio.create_task(encoder._writer_loop())
@@ -1393,7 +1488,7 @@ async def test_ffmpeg_encoder_produces_shared_aac_hls_segment(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_encoder_bootstrap_is_decodable_and_does_not_keep_advancing(
+async def test_ffmpeg_encoder_bootstrap_is_decodable_and_keeps_live_playlist_advancing(
     tmp_path,
 ):
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
@@ -1446,15 +1541,19 @@ async def test_ffmpeg_encoder_bootstrap_is_decodable_and_does_not_keep_advancing
 
         await asyncio.sleep(0.8)
 
-        assert encoder.playlist_text() == idle_playlist
-        assert parse_hls_live_edge_at_ms(encoder.playlist_text()) == idle_edge
+        advanced_playlist = encoder.playlist_text()
+        advanced_edge = parse_hls_live_edge_at_ms(advanced_playlist)
+        assert advanced_playlist != idle_playlist
+        assert advanced_edge is not None
+        assert idle_edge is not None
+        assert advanced_edge > idle_edge
         assert encoder.pending_audio_ms == 0
     finally:
         await encoder.close()
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_encoder_resumes_after_idle_with_bounded_tail_padding(tmp_path):
+async def test_ffmpeg_encoder_resumes_after_continuous_idle_carrier(tmp_path):
     if shutil.which("ffmpeg") is None:
         pytest.skip("FFmpeg is unavailable")
     encoder = FFmpegHLSEncoder(
@@ -1490,16 +1589,24 @@ async def test_ffmpeg_encoder_resumes_after_idle_with_bounded_tail_padding(tmp_p
         first_idle_edge = parse_hls_live_edge_at_ms(first_idle_playlist)
 
         await asyncio.sleep(0.8)
-        assert encoder.playlist_text() == first_idle_playlist
+        continued_idle_playlist = encoder.playlist_text()
+        continued_idle_edge = parse_hls_live_edge_at_ms(continued_idle_playlist)
+        assert continued_idle_playlist != first_idle_playlist
+        assert continued_idle_edge is not None
+        assert first_idle_edge is not None
+        assert continued_idle_edge > first_idle_edge
 
         second = await encoder.append_pcm(tone)
-        tail_padding_ms = second.start_at_ms - first.end_at_ms
-        assert 0 <= tail_padding_ms <= 600
+        assert second.discardable_gap_before_ms > 0
+        assert (
+            second.start_at_ms - first.end_at_ms
+            == second.discardable_gap_before_ms
+        )
         await wait_until(lambda: encoder.pending_audio_ms == 0, timeout=3)
         await wait_until(
             lambda: (
                 parse_hls_live_edge_at_ms(encoder.playlist_text()) or 0
-            ) > (first_idle_edge or 0),
+            ) >= second.end_at_ms,
             timeout=3,
         )
     finally:
@@ -1507,7 +1614,7 @@ async def test_ffmpeg_encoder_resumes_after_idle_with_bounded_tail_padding(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_encoder_publishes_complete_latest_clip_before_pausing(tmp_path):
+async def test_ffmpeg_encoder_publishes_complete_latest_clip_and_stays_live(tmp_path):
     if shutil.which("ffmpeg") is None:
         pytest.skip("FFmpeg is unavailable")
     encoder = FFmpegHLSEncoder(
@@ -1535,10 +1642,17 @@ async def test_ffmpeg_encoder_publishes_complete_latest_clip_before_pausing(tmp_
             timeout=3,
         )
         completed_playlist = encoder.playlist_text()
+        completed_edge = parse_hls_live_edge_at_ms(completed_playlist)
+        assert completed_edge is not None
 
         await asyncio.sleep(1.2)
 
-        assert encoder.playlist_text() == completed_playlist
+        live_playlist = encoder.playlist_text()
+        live_edge = parse_hls_live_edge_at_ms(live_playlist)
+        assert live_playlist != completed_playlist
+        assert live_edge is not None
+        assert live_edge > completed_edge
+        assert completed_edge >= receipt.end_at_ms
     finally:
         await encoder.close()
 

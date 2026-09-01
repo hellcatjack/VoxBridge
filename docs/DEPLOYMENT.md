@@ -350,7 +350,9 @@ Safari uses native HLS so iPhone lock-screen playback remains independent of
 foreground JavaScript. Desktop Chrome, Edge, and Firefox use the vendored hls.js
 MSE fallback from `/listen/assets/hls.min.js` when AAC MSE is available. The
 server's idle carrier remains acoustically silent but forces FFmpeg to include
-decodable AAC frames instead of producing table-only MPEG-TS segments.
+decodable AAC frames instead of producing table-only MPEG-TS segments. While any
+listener lease remains active, that carrier is written at real-time `1.0x` so the
+live playlist continues updating within its target segment duration.
 The pinned build and license live under `voxbridge/tts/vendor/`; package builds
 must include those files. Do not replace it with a runtime CDN dependency.
 The backend keeps a bounded pre-listener pool of up to 128 stable translations
@@ -366,8 +368,10 @@ encoder, shared queue, speech epoch, and global speed controller continue
 unchanged. Removing or expiring the final lease clears all epoch-specific state.
 One worker synthesizes each translation once, and one FFmpeg
 process writes a continuous 24 kHz mono AAC/HLS timeline shared by all devices.
-When no speech is pending, the encoder receives real-time zero PCM so native iOS
-playback can continue after the browser is locked.
+When no speech is pending, the encoder receives a real-time near-silent carrier so
+native iOS playback can survive a long speech gap and continue after the browser
+is locked. The writer checks for new speech once per encoder frame (default
+`100ms`).
 
 `--tts-speed` is the backend Kokoro synthesis baseline and remains global for
 displayed `1.0x`. The default global Auto controller multiplies that baseline
@@ -380,9 +384,10 @@ Chrome consume the same server-paced shared stream.
 
 After genuine PCM queue starvation, the encoder may publish active PCM at
 `2.0x` for one bounded two-second media burst, then it sustains real-time `1.0x`
-publication. Adjacent queued sentences share that burst budget; only another
-real empty-queue wait resets it. Tail-finalization carrier remains accelerated,
-but it is not speech debt. This keeps long unpublished PCM visible to the
+publication. Adjacent queued sentences are dequeued before any carrier can be
+inserted and share that burst budget; only another real empty-queue wait resets
+it. Idle carrier is published at real-time `1.0x` and is not speech debt. This
+keeps long unpublished PCM visible to the
 unchanged Auto tiers instead of hiding it in HLS faster than listeners consume
 the timeline.
 
@@ -422,11 +427,13 @@ to the current HLS encoder epoch. Each cue uses the PCM media timeline submitted
 to FFmpeg, includes the AAC 1024-sample presentation delay, removes synthesized
 edge silence by waveform activity, and excludes the fixed 300ms sentence pause.
 Each cue also reports `discardable_gap_before_ms` for only the wait-generated
-tail carrier and `resume_at_ms` for the point that preserves the normal natural
-gap before the next sentence. The browser requires that resume point and one
-second beyond the next speech start to be in the same buffered range, then makes
-one one-shot seek per cue. It does not pause, call play, schedule a retry, or
-change the media rate as part of compaction.
+idle carrier and `resume_at_ms` for the point that preserves only the unelapsed
+part of the normal natural gap before the next sentence. If the listener already
+heard at least that natural gap, the target is the next speech start and no extra
+pause is added. The browser requires that resume point and one second beyond the
+next speech start to be in the same buffered range, then makes one one-shot seek
+per cue. It does not pause, call play, schedule a retry, or change the media rate
+as part of compaction.
 `/listen` polls the listener-scoped caption snapshot only while the page is
 visible. Safari maps its native media timeline with `getStartDate() +
 currentTime`, so a stale device playlist or local network buffer does not move
