@@ -85,6 +85,8 @@ class HLSCaptionCue:
     start_at_ms: int
     end_at_ms: int
     text: str
+    discardable_gap_before_ms: int = 0
+    resume_at_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1125,6 +1127,7 @@ class SharedHLSTTSPublisher:
             displayed_multiplier = 1.0
             effective_speed = self._baseline_tts_speed
             decision_backlog_ms = 0
+            speed_source = "decision"
             async with self._lock:
                 try:
                     item = self._queue.get_nowait()
@@ -1149,16 +1152,18 @@ class SharedHLSTTSPublisher:
                 self._inflight_item = item
                 self._inflight_key = key
                 self._inflight_kind = kind
-                displayed_multiplier, effective_speed, decision_backlog_ms = (
-                    self._select_synthesis_speed_locked(key, kind)
-                )
-                if prepared is not None and not math.isclose(
-                    prepared.effective_speed,
-                    effective_speed,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                ):
-                    prepared = None
+                if prepared is not None:
+                    _, decision_backlog_ms, _, _ = self._backlog_snapshot()
+                    displayed_multiplier = prepared.displayed_multiplier
+                    effective_speed = prepared.effective_speed
+                    self._global_speed_multiplier = displayed_multiplier
+                    speed_source = "prepared"
+                    if key == self._first_epoch_item_key:
+                        self._first_epoch_item_key = None
+                else:
+                    displayed_multiplier, effective_speed, decision_backlog_ms = (
+                        self._select_synthesis_speed_locked(key, kind)
+                    )
             try:
                 encoder = self._encoder
                 if encoder is None or item is None or key is None:
@@ -1167,7 +1172,7 @@ class SharedHLSTTSPublisher:
                 if prepared is None:
                     synthesis_started = time.monotonic()
                     logger.info(
-                        "shared HLS TTS %s started epoch=%s source_order=%d revision=%d text_chars=%d stable_pending=%d prepare_pending=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f",
+                        "shared HLS TTS %s started epoch=%s source_order=%d revision=%d text_chars=%d stable_pending=%d prepare_pending=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f speed_source=%s",
                         "preparation" if kind == "prepare" else "synthesis",
                         self._speech_epoch_id,
                         int(item.source_order),
@@ -1178,6 +1183,7 @@ class SharedHLSTTSPublisher:
                         decision_backlog_ms,
                         displayed_multiplier,
                         effective_speed,
+                        speed_source,
                     )
                     audio = await asyncio.to_thread(
                         self._synthesizer.synthesize,
@@ -1249,6 +1255,7 @@ class SharedHLSTTSPublisher:
                     continue
 
                 receipt = await encoder.append_pcm(prepared.pcm)
+                published_discardable_gap_ms = 0
                 async with self._lock:
                     self._known_items.pop(key, None)
                 if isinstance(receipt, HLSAppendReceipt):
@@ -1262,6 +1269,37 @@ class SharedHLSTTSPublisher:
                         + int(prepared.cue_end_offset_ms),
                     )
                     if cue_end_at_ms > cue_start_at_ms:
+                        previous = (
+                            self._caption_cues[-1]
+                            if self._caption_cues
+                            else None
+                        )
+                        actual_gap_ms = (
+                            0
+                            if previous is None
+                            else max(
+                                0,
+                                cue_start_at_ms - previous.end_at_ms,
+                            )
+                        )
+                        discardable_gap_ms = min(
+                            actual_gap_ms,
+                            max(
+                                0,
+                                int(receipt.discardable_gap_before_ms),
+                            ),
+                        )
+                        published_discardable_gap_ms = discardable_gap_ms
+                        natural_gap_ms = max(
+                            0,
+                            actual_gap_ms - discardable_gap_ms,
+                        )
+                        resume_at_ms = (
+                            cue_start_at_ms - natural_gap_ms
+                            if previous is not None
+                            and discardable_gap_ms > 0
+                            else None
+                        )
                         epoch = self._active_root.name if self._active_root else ""
                         cue_key = (
                             f"{epoch}:{item.sentence_id}:{int(item.revision)}:"
@@ -1275,6 +1313,8 @@ class SharedHLSTTSPublisher:
                                 start_at_ms=cue_start_at_ms,
                                 end_at_ms=cue_end_at_ms,
                                 text=str(item.text),
+                                discardable_gap_before_ms=discardable_gap_ms,
+                                resume_at_ms=resume_at_ms,
                             )
                         )
                 self._last_error = ""
@@ -1283,7 +1323,7 @@ class SharedHLSTTSPublisher:
                     round((self._clock() - prepared.prepared_at) * 1000),
                 )
                 logger.info(
-                    "shared HLS TTS audio published epoch=%s source_order=%d revision=%d cache_hit=%s synthesis_ms=%d preparation_age_ms=%d audio_ms=%d pending=%d pending_audio_ms=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f",
+                    "shared HLS TTS audio published epoch=%s source_order=%d revision=%d cache_hit=%s synthesis_ms=%d preparation_age_ms=%d audio_ms=%d pending=%d pending_audio_ms=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f speed_source=%s discardable_gap_before_ms=%d",
                     self._speech_epoch_id,
                     int(item.source_order),
                     int(item.revision),
@@ -1296,6 +1336,8 @@ class SharedHLSTTSPublisher:
                     decision_backlog_ms,
                     displayed_multiplier,
                     effective_speed,
+                    speed_source,
+                    published_discardable_gap_ms,
                 )
             except asyncio.CancelledError:
                 raise

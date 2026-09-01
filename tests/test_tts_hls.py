@@ -68,6 +68,7 @@ class FakeEncoder:
         self.receipts: list[HLSAppendReceipt] = []
         self.pending_audio_ms = 0
         self.next_start_at_ms = 100_000
+        self.next_discardable_gap_before_ms = 0
 
     async def start(self) -> None:
         self.start_count += 1
@@ -81,9 +82,13 @@ class FakeEncoder:
     async def append_pcm(self, pcm: bytes) -> HLSAppendReceipt:
         self.appended.append(pcm)
         duration_ms = round(len(pcm) * 1000 / (24000 * 2))
+        discardable_gap_before_ms = self.next_discardable_gap_before_ms
+        self.next_discardable_gap_before_ms = 0
+        self.next_start_at_ms += discardable_gap_before_ms
         receipt = HLSAppendReceipt(
             start_at_ms=self.next_start_at_ms,
             end_at_ms=self.next_start_at_ms + duration_ms,
+            discardable_gap_before_ms=discardable_gap_before_ms,
         )
         self.receipts.append(receipt)
         self.next_start_at_ms = receipt.end_at_ms
@@ -224,7 +229,7 @@ async def test_worker_applies_global_multiplier_as_absolute_kokoro_speed(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_release_regenerates_prepared_audio_when_global_speed_changed(tmp_path):
+async def test_release_reuses_speed_selected_when_audio_was_prepared(tmp_path):
     synth = FakeSynthesizer(make_wav(duration_ms=250))
     encoder = FakeEncoder(tmp_path / "stream")
     encoder.pending_audio_ms = 10_000
@@ -235,7 +240,7 @@ async def test_release_regenerates_prepared_audio_when_global_speed_changed(tmp_
         baseline_tts_speed=1.05,
         clock=FakeClock(),
     )
-    item = ready_item(text="Prepared at the old speed.")
+    item = ready_item(text="Keep the selected accelerated voice.")
     try:
         await publisher.touch_listener("iphone-a", "owner-a")
         assert await publisher.prepare(item) is True
@@ -246,7 +251,8 @@ async def test_release_regenerates_prepared_audio_when_global_speed_changed(tmp_
         assert await publisher.publish(item) is True
         await publisher.wait_idle()
 
-        assert [call[2] for call in synth.speed_calls] == pytest.approx([1.26, 1.05])
+        assert [call[2] for call in synth.speed_calls] == pytest.approx([1.26])
+        assert publisher.status.global_speed_multiplier == 1.2
         assert len(encoder.appended) == 1
     finally:
         await publisher.close()
@@ -560,6 +566,37 @@ async def test_caption_cue_excludes_synthesized_edge_silence(tmp_path):
         cue = publisher.caption_snapshot("iphone-a", "owner-a").cues[0]
         assert cue.start_at_ms == 100_080
         assert cue.end_at_ms == 100_330
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_caption_cue_marks_only_wait_generated_carrier(tmp_path):
+    synth = FakeSynthesizer(make_wav(duration_ms=100), duration_ms=100)
+    encoder = FakeEncoder(tmp_path / "stream")
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        sentence_pause_ms=300,
+        clock=FakeClock(),
+    )
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        assert await publisher.publish(ready_item(20, text="First.")) is True
+        await publisher.wait_idle()
+
+        encoder.next_discardable_gap_before_ms = 1_000
+        assert await publisher.publish(ready_item(21, text="Second.")) is True
+        await publisher.wait_idle()
+
+        first, second = publisher.caption_snapshot(
+            "iphone-a", "owner-a"
+        ).cues
+        assert first.discardable_gap_before_ms == 0
+        assert first.resume_at_ms is None
+        assert second.discardable_gap_before_ms == 1_000
+        assert second.start_at_ms - second.resume_at_ms == 300
     finally:
         await publisher.close()
 
