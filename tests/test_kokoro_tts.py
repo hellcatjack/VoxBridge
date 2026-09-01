@@ -112,6 +112,31 @@ def test_chinese_synthesis_uses_misaki_phonemes(tmp_path):
     assert factory.calls[0]["vocab_config"].name == "chinese_config_path"
 
 
+def test_synthesis_accepts_absolute_per_call_speed(tmp_path):
+    factory = FakeFactory()
+    synth = KokoroOnnxSynthesizer(
+        config=make_config(tmp_path, speed=1.05),
+        kokoro_factory=factory,
+    )
+
+    synth.synthesize("Catch up now.", "English", speed=1.575)
+    synth.synthesize("Back at baseline.", "English")
+
+    assert factory.models[0].calls[0].speed == pytest.approx(1.575)
+    assert factory.models[0].calls[1].speed == pytest.approx(1.05)
+
+
+@pytest.mark.parametrize("speed", [0.49, 2.01, float("inf"), float("nan")])
+def test_synthesis_rejects_invalid_per_call_speed(tmp_path, speed):
+    synth = KokoroOnnxSynthesizer(
+        config=make_config(tmp_path),
+        kokoro_factory=FakeFactory(),
+    )
+
+    with pytest.raises(TTSSynthesisError, match="speed"):
+        synth.synthesize("Invalid speed.", "English", speed=speed)
+
+
 def test_adapter_passes_cpu_only_runtime_configuration(tmp_path):
     factory = FakeFactory()
     synth = KokoroOnnxSynthesizer(

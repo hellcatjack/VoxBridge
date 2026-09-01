@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,7 +143,13 @@ class KokoroOnnxSynthesizer:
             return "Chinese"
         raise TTSSynthesisError(f"unsupported target language: {target_language}")
 
-    def synthesize(self, text: str, target_language: str) -> SynthesizedAudio:
+    def synthesize(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        speed: float | None = None,
+    ) -> SynthesizedAudio:
         if not isinstance(text, str) or not text.strip():
             raise TTSSynthesisError("TTS text must be non-empty")
         if len(text) > self.config.max_chars:
@@ -150,6 +157,9 @@ class KokoroOnnxSynthesizer:
                 f"TTS text exceeds the {self.config.max_chars} character limit"
             )
         language = self._normalize_language(target_language)
+        effective_speed = self.config.speed if speed is None else float(speed)
+        if not math.isfinite(effective_speed) or not 0.5 <= effective_speed <= 2.0:
+            raise TTSSynthesisError("TTS speed must be between 0.5 and 2.0")
 
         try:
             with self._inference_lock:
@@ -176,7 +186,7 @@ class KokoroOnnxSynthesizer:
                 samples, sample_rate = model.create(
                     model_input,
                     voice=voice,
-                    speed=self.config.speed,
+                    speed=effective_speed,
                     lang=lang,
                     is_phonemes=is_phonemes,
                 )
