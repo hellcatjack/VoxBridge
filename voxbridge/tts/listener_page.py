@@ -335,25 +335,26 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       gap: 10px;
     }
 
-    .playback-settings label {
+    .playback-settings > span {
       color: var(--forest);
       font-size: 12px;
       font-weight: 850;
       letter-spacing: 0.03em;
     }
 
-    .playback-settings select {
+    .playback-settings strong {
       min-width: 104px;
       height: 34px;
-      padding: 0 30px 0 12px;
+      padding: 0 12px;
       border: 1px solid rgba(18, 36, 30, 0.24);
       border-radius: 9px;
       color: var(--forest);
       background: var(--paper);
-      font: inherit;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       font-size: 12px;
       font-weight: 850;
-      cursor: pointer;
     }
 
     .actions {
@@ -504,18 +505,9 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     <audio id="ttsPlayback" preload="none" playsinline hidden></audio>
 
     <section class="controls">
-      <div class="playback-settings">
-        <label for="playbackRate">Playback speed</label>
-        <select id="playbackRate" aria-label="Playback speed">
-          <option value="auto" selected>Auto</option>
-          <option value="0.8">0.8x</option>
-          <option value="0.9">0.9x</option>
-          <option value="1">1.0x</option>
-          <option value="1.1">1.1x</option>
-          <option value="1.2">1.2x</option>
-          <option value="1.3">1.3x</option>
-          <option value="1.4">1.4x</option>
-        </select>
+      <div class="playback-settings" aria-live="polite">
+        <span>Playback speed</span>
+        <strong id="globalSpeedStatus">Auto - 1.0x</strong>
       </div>
       <div class="actions">
         <button id="startListening" type="button">Start Listening</button>
@@ -539,57 +531,27 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const liveCaption = document.getElementById("liveCaption");
     const playbackStatus = document.getElementById("playbackStatus");
     const nowPlaying = document.getElementById("nowPlaying");
-    const playbackRateInput = document.getElementById("playbackRate");
+    const globalSpeedStatus = document.getElementById("globalSpeedStatus");
     const playbackElement = document.getElementById("ttsPlayback");
-    const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";
-    const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4]);
-    const CATCH_UP_START_LAG_SEC = 12;
-    const CATCH_UP_STOP_LAG_SEC = 5;
-    const CATCH_UP_RATE = 1.2;
-    const FAST_RATE_START_LAG_SEC = 2;
-    const FAST_RATE_STOP_LAG_SEC = 1;
-    const AUTO_FAST_RATE_START_BUFFER_SEC = 4;
-    const AUTO_FAST_RATE_STOP_BUFFER_SEC = 2;
-    const AUTO_MEDIUM_LAG_SEC = 10;
-    const AUTO_FAST_LAG_SEC = 30;
-    const AUTO_HIGH_LAG_SEC = 40;
     const CAPTION_POLL_INTERVAL_MS = 500;
     const PLAYBACK_INTERRUPTION_STATUS_HOLD_MS = 1500;
     const MIN_CAPTION_FONT_PX = 8;
 
-    let playbackRate = readPlaybackRate();
     let listenerId = "";
     let running = false;
     let statusTimer = null;
     let captionTimer = null;
     let captionAbortController = null;
-    let catchingUp = false;
     let playbackStarted = false;
     let waitingForMedia = false;
-    let fastRateActive = false;
     let playbackStatusHoldUntilMs = 0;
     let captionSnapshot = null;
     let captionCueId = "";
     let captionResizeFrame = null;
     let hlsController = null;
     let serverTranslatedAudioBacklogSec = 0;
-    playbackRateInput.value = String(playbackRate);
-
-    function normalizePlaybackRate(value) {
-      if (String(value ?? "").trim().toLowerCase() === "auto") return "auto";
-      const parsed = Number(value);
-      return SUPPORTED_PLAYBACK_RATES.has(parsed) ? parsed : "auto";
-    }
-
-    function readPlaybackRate() {
-      try {
-        return normalizePlaybackRate(
-          window.localStorage.getItem(PLAYBACK_RATE_STORAGE_KEY)
-        );
-      } catch (error) {
-        return "auto";
-      }
-    }
+    let globalSpeedMode = "Auto";
+    let globalSpeedMultiplier = 1;
 
     function setCard(card, value) {
       card.dataset.state = value || "";
@@ -626,13 +588,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       return null;
     }
 
-    function playableHeadroomSec(lag = liveLagSec()) {
-      const bufferedAhead = forwardBufferedSec();
-      if (lag === null) return bufferedAhead;
-      if (bufferedAhead === null) return lag;
-      return Math.max(lag, bufferedAhead);
-    }
-
     function expectedMediaWaitStatus() {
       return serverTranslatedAudioBacklogSec > 0
         ? "Preparing next translated sentence"
@@ -649,11 +604,6 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         : `${label} · ${bufferedAhead.toFixed(1)}s buffered ahead`;
     }
 
-    function translatedAudioBacklogSec(lag = liveLagSec()) {
-      if (lag === null) return null;
-      return Math.max(0, lag) + Math.max(0, serverTranslatedAudioBacklogSec);
-    }
-
     function formatDurationSec(value) {
       const totalSec = Math.max(0, Math.ceil(Number(value) || 0));
       if (totalSec < 60) return `${totalSec}s`;
@@ -662,14 +612,9 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
     }
 
-    function describeTranslatedAudioBacklog(totalSec, effectiveRate) {
-      const mediaDuration = formatDurationSec(totalSec);
-      const catchUpDuration = formatDurationSec(totalSec / effectiveRate);
-      const rate = playbackRate === "auto"
-        ? `Auto ${effectiveRate.toFixed(1)}×`
-        : `${effectiveRate.toFixed(1)}×`;
-      return `About ${mediaDuration} of translated audio waiting`
-        + ` · about ${catchUpDuration} estimated catch-up · ${rate}`;
+    function describeSharedAudioStatus() {
+      return `Speech backlog: ${formatDurationSec(serverTranslatedAudioBacklogSec)}`
+        + ` · Global speed: ${globalSpeedMode} - ${globalSpeedMultiplier.toFixed(1)}x`;
     }
 
     function estimatedPlaybackAtMs(snapshot) {
@@ -829,85 +774,14 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       }
     }
 
-    function automaticPlaybackRate(totalBacklog) {
-      if (totalBacklog !== null && totalBacklog >= AUTO_HIGH_LAG_SEC) return 1.5;
-      if (totalBacklog !== null && totalBacklog >= AUTO_FAST_LAG_SEC) return 1.4;
-      if (totalBacklog !== null && totalBacklog >= AUTO_MEDIUM_LAG_SEC) return 1.2;
-      return 1;
+    function forceNormalPlaybackRate() {
+      playbackElement.defaultPlaybackRate = 1;
+      playbackElement.playbackRate = 1;
     }
 
-    function effectivePlaybackRate(
-      lag = liveLagSec(),
-      totalBacklog = translatedAudioBacklogSec(lag)
-    ) {
-      if (running && !playbackStarted) return 1;
-      if (playbackRate === "auto") {
-        const targetRate = automaticPlaybackRate(totalBacklog);
-        return targetRate > 1 && !fastRateActive ? 1 : targetRate;
-      }
-      if (catchingUp) return Math.max(CATCH_UP_RATE, playbackRate);
-      if (running && playbackRate > 1) {
-        return fastRateActive ? playbackRate : 1;
-      }
-      if (document.hidden) return Math.max(1, playbackRate);
-      return playbackRate;
-    }
-
-    function applyPlaybackRate(
-      lag = liveLagSec(),
-      totalBacklog = translatedAudioBacklogSec(lag)
-    ) {
-      const effectiveRate = effectivePlaybackRate(lag, totalBacklog);
-      playbackElement.defaultPlaybackRate = effectiveRate;
-      playbackElement.playbackRate = effectiveRate;
-      if ("preservesPitch" in playbackElement) playbackElement.preservesPitch = true;
-      if ("mozPreservesPitch" in playbackElement) playbackElement.mozPreservesPitch = true;
-      if ("webkitPreservesPitch" in playbackElement) {
-        playbackElement.webkitPreservesPitch = true;
-      }
-      return effectiveRate;
-    }
-
-    function updateLiveLatencyGuard() {
+    function updateLiveAudioStatus() {
+      forceNormalPlaybackRate();
       if (!running) return;
-      const lag = liveLagSec();
-      const totalBacklog = translatedAudioBacklogSec(lag);
-      if (playbackRate === "auto") {
-        catchingUp = false;
-        const targetRate = automaticPlaybackRate(totalBacklog);
-        const playableHeadroom = playableHeadroomSec(lag);
-        if (playbackStarted && targetRate > 1 && playableHeadroom !== null) {
-          if (
-            !fastRateActive
-            && playableHeadroom >= AUTO_FAST_RATE_START_BUFFER_SEC
-          ) {
-            fastRateActive = true;
-          } else if (
-            fastRateActive
-            && playableHeadroom <= AUTO_FAST_RATE_STOP_BUFFER_SEC
-          ) {
-            fastRateActive = false;
-          }
-        } else {
-          fastRateActive = false;
-        }
-      } else if (lag !== null) {
-        if (!catchingUp && lag >= CATCH_UP_START_LAG_SEC) catchingUp = true;
-        else if (catchingUp && lag <= CATCH_UP_STOP_LAG_SEC) catchingUp = false;
-        if (playbackStarted && playbackRate > 1) {
-          if (!fastRateActive && lag >= FAST_RATE_START_LAG_SEC) {
-            fastRateActive = true;
-          } else if (fastRateActive && lag <= FAST_RATE_STOP_LAG_SEC) {
-            fastRateActive = false;
-          }
-        } else {
-          fastRateActive = false;
-        }
-      } else {
-        catchingUp = false;
-        fastRateActive = false;
-      }
-      const effectiveRate = applyPlaybackRate(lag, totalBacklog);
       if (waitingForMedia) {
         playbackStatusHoldUntilMs = 0;
         playbackStatus.textContent = expectedMediaWaitStatus();
@@ -917,20 +791,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       playbackStatusHoldUntilMs = 0;
       if (!playbackStarted) {
         playbackStatus.textContent = "Buffering live audio";
-      } else if (lag === null) {
-        playbackStatus.textContent = "Preparing live translation";
-      } else if (totalBacklog !== null && totalBacklog >= AUTO_MEDIUM_LAG_SEC) {
-        playbackStatus.textContent = describeTranslatedAudioBacklog(
-          totalBacklog,
-          effectiveRate
-        );
-      } else if (playbackRate === "auto") {
-        playbackStatus.textContent =
-          `Live translation · Auto ${effectiveRate.toFixed(1)}×`;
-      } else if (playbackRate > 1 && !fastRateActive) {
-        playbackStatus.textContent = "Live edge / using 1.0x for smooth audio";
+      } else if (serverTranslatedAudioBacklogSec > 0) {
+        playbackStatus.textContent = describeSharedAudioStatus();
       } else {
-        playbackStatus.textContent = "Listening to live translation";
+        playbackStatus.textContent =
+          `Live translation · Global speed: ${globalSpeedMode} - ${globalSpeedMultiplier.toFixed(1)}x`;
       }
     }
 
@@ -972,7 +837,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         return true;
       }
       if (hlsJsSupported) {
-        hlsController = new Hls();
+        hlsController = new Hls({ maxLiveSyncPlaybackRate: 1 });
         hlsController.loadSource(streamUrl);
         hlsController.attachMedia(playbackElement);
         return true;
@@ -1001,17 +866,15 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       beginCaptionPolling();
       refreshCaptionForPlayhead();
       setMediaPlaybackState("playing");
-      updateLiveLatencyGuard();
+      updateLiveAudioStatus();
     }
 
     function markPlaybackBlocked(error) {
       if (!running) return;
       waitingForMedia = false;
       playbackStarted = false;
-      fastRateActive = false;
-      catchingUp = false;
       playbackStatusHoldUntilMs = 0;
-      applyPlaybackRate();
+      forceNormalPlaybackRate();
       const blocked = error && error.name === "NotAllowedError";
       connectionStatus.textContent = blocked ? "Tap to continue" : "Audio unavailable";
       setCard(connectionCard, blocked ? "warn" : "error");
@@ -1042,13 +905,20 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         serverTranslatedAudioBacklogSec = Number.isFinite(serverBacklogMs)
           ? Math.max(0, serverBacklogMs) / 1000
           : 0;
+        globalSpeedMode = status.global_speed_mode === "fixed" ? "Fixed" : "Auto";
+        const reportedSpeedMultiplier = Number(status.global_speed_multiplier);
+        globalSpeedMultiplier = Number.isFinite(reportedSpeedMultiplier)
+          ? Math.max(0.5, reportedSpeedMultiplier)
+          : 1;
+        globalSpeedStatus.textContent =
+          `${globalSpeedMode} - ${globalSpeedMultiplier.toFixed(1)}x`;
         producerStatus.textContent = status.producer_active ? "Service live" : "Waiting for service";
         setCard(producerCard, status.producer_active ? "ok" : "warn");
         const listeners = Number(status.listener_count || 0);
         queueStatus.textContent = status.encoder_active
           ? `Live · ${listeners} listening`
           : "Preparing stream";
-        updateLiveLatencyGuard();
+        updateLiveAudioStatus();
       } catch (error) {
         if (!running) return;
         producerStatus.textContent = "Status unavailable";
@@ -1093,10 +963,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       running = true;
       playbackStarted = false;
       waitingForMedia = false;
-      fastRateActive = false;
-      catchingUp = false;
       playbackStatusHoldUntilMs = 0;
       serverTranslatedAudioBacklogSec = 0;
+      globalSpeedMode = "Auto";
+      globalSpeedMultiplier = 1;
+      globalSpeedStatus.textContent = "Auto - 1.0x";
       listenerId = createListenerId();
       startButton.disabled = true;
       stopButton.disabled = false;
@@ -1114,7 +985,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       playbackElement.playsInline = true;
       const streamUrl =
         `/api/tts/live/${encodeURIComponent(listenerId)}/index.m3u8`;
-      applyPlaybackRate();
+      forceNormalPlaybackRate();
       const sourceConfigured = configurePlaybackSource(streamUrl);
 
       if (!sourceConfigured) {
@@ -1137,10 +1008,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (!running || !playbackElement.src) return;
       playbackStarted = false;
       waitingForMedia = false;
-      fastRateActive = false;
-      catchingUp = false;
       playbackStatusHoldUntilMs = 0;
-      applyPlaybackRate();
+      forceNormalPlaybackRate();
       resumeButton.hidden = true;
       connectionStatus.textContent = "Restoring audio";
       setCard(connectionCard, "warn");
@@ -1164,12 +1033,10 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     function stopListening() {
       const closingListenerId = listenerId;
       listenerId = "";
-      catchingUp = false;
       playbackStarted = false;
       waitingForMedia = false;
-      fastRateActive = false;
       playbackStatusHoldUntilMs = 0;
-      applyPlaybackRate();
+      forceNormalPlaybackRate();
       running = false;
       stopStatusPolling();
       stopCaptionPolling();
@@ -1186,6 +1053,9 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       connectionStatus.textContent = "Stopped";
       producerStatus.textContent = "Waiting";
       queueStatus.textContent = "Not joined";
+      globalSpeedMode = "Auto";
+      globalSpeedMultiplier = 1;
+      globalSpeedStatus.textContent = "Auto - 1.0x";
       liveCaption.textContent = "Waiting to start";
       fitLiveCaption();
       playbackStatus.textContent = "Start listening to join the shared stream";
@@ -1223,7 +1093,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       } catch (error) {}
     }
 
-    applyPlaybackRate();
+    forceNormalPlaybackRate();
     configureMediaSession();
 
     startButton.addEventListener("click", startListeningFromGesture);
@@ -1233,6 +1103,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     playbackElement.addEventListener("waiting", () => {
       if (!running) return;
       waitingForMedia = true;
+      forceNormalPlaybackRate();
       playbackStatusHoldUntilMs = 0;
       playbackStatus.textContent = expectedMediaWaitStatus();
       nowPlaying.dataset.playing = "false";
@@ -1242,9 +1113,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (!running) return;
       waitingForMedia = false;
       playbackStarted = false;
-      fastRateActive = false;
-      catchingUp = false;
-      applyPlaybackRate();
+      forceNormalPlaybackRate();
       showPlaybackInterruptionStatus("Reconnecting to live audio");
       nowPlaying.dataset.playing = "false";
       nowPlaying.dataset.speaking = "false";
@@ -1253,22 +1122,12 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (!running) return;
       markPlaybackBlocked(playbackElement.error || new Error("media error"));
     });
-    playbackRateInput.addEventListener("change", () => {
-      playbackRate = normalizePlaybackRate(playbackRateInput.value);
-      playbackRateInput.value = String(playbackRate);
-      try {
-        window.localStorage.setItem(PLAYBACK_RATE_STORAGE_KEY, String(playbackRate));
-      } catch (error) {}
-      fastRateActive = false;
-      if (running) updateLiveLatencyGuard();
-      else applyPlaybackRate();
-    });
-    playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard);
+    playbackElement.addEventListener("timeupdate", updateLiveAudioStatus);
     playbackElement.addEventListener("timeupdate", refreshCaptionForPlayhead);
-    playbackElement.addEventListener("progress", updateLiveLatencyGuard);
+    playbackElement.addEventListener("progress", updateLiveAudioStatus);
     playbackElement.addEventListener("progress", refreshCaptionForPlayhead);
     document.addEventListener("visibilitychange", () => {
-      updateLiveLatencyGuard();
+      updateLiveAudioStatus();
       if (!document.hidden) void pollCaptions();
     });
     window.addEventListener("resize", scheduleCaptionFit);
