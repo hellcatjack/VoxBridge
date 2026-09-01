@@ -27,6 +27,20 @@ DEFAULT_ENGLISH_AUDIO_MS_PER_CHAR = 65.0
 DEFAULT_CHINESE_AUDIO_MS_PER_CHAR = 180.0
 MIN_ESTIMATED_SENTENCE_AUDIO_MS = 500
 DURATION_ESTIMATE_ALPHA = 0.25
+ItemKey = tuple[str, int, str, str]
+
+
+def select_global_tts_multiplier(backlog_ms: int) -> float:
+    """Return the shared Auto multiplier for conservative unpublished speech."""
+
+    value = max(0, int(backlog_ms))
+    if value >= 40_000:
+        return 1.5
+    if value >= 30_000:
+        return 1.4
+    if value >= 10_000:
+        return 1.2
+    return 1.0
 
 
 class HLSError(Exception):
@@ -89,6 +103,10 @@ class HLSStreamStatus:
     translated_audio_backlog_ms: int
     translated_audio_backlog_count: int
     translated_audio_backlog_estimated: bool
+    speech_epoch_id: str
+    global_speed_mode: str
+    global_speed_multiplier: float
+    tts_effective_speed: float
     encoder_active: bool
     last_error: str
 
@@ -622,6 +640,8 @@ class SharedHLSTTSPublisher:
         caption_history_size: int = 256,
         sample_rate: int = 24000,
         sentence_pause_ms: int = 300,
+        baseline_tts_speed: float = 1.05,
+        auto_speed_enabled: bool = True,
         clock: Callable[[], float] = time.monotonic,
         worker_start_gate: asyncio.Event | None = None,
     ) -> None:
@@ -635,6 +655,10 @@ class SharedHLSTTSPublisher:
             raise ValueError("preparation_cache_size must be positive")
         if caption_history_size <= 0:
             raise ValueError("caption_history_size must be positive")
+        if not math.isfinite(float(baseline_tts_speed)) or not (
+            0.5 <= float(baseline_tts_speed) <= 2.0
+        ):
+            raise ValueError("baseline_tts_speed must be between 0.5 and 2.0")
         self._synthesizer = synthesizer
         self._root_dir = Path(root_dir)
         self._encoder_factory = encoder_factory or (lambda root: FFmpegHLSEncoder(root))
@@ -642,6 +666,8 @@ class SharedHLSTTSPublisher:
         self._max_listeners = int(max_listeners)
         self._sample_rate = max(8000, int(sample_rate))
         self._sentence_pause_ms = max(0, int(sentence_pause_ms))
+        self._baseline_tts_speed = float(baseline_tts_speed)
+        self._auto_speed_enabled = bool(auto_speed_enabled)
         self._clock = clock
         self._worker_start_gate = worker_start_gate
         self._leases: dict[str, HLSListenerLease] = {}
@@ -650,23 +676,26 @@ class SharedHLSTTSPublisher:
         self._caption_cues: deque[HLSCaptionCue] = deque(
             maxlen=int(caption_history_size)
         )
-        self._preparation_pending: dict[tuple[str, int, str, str], TTSReadyItem] = {}
-        self._prepared_audio: dict[tuple[str, int, str, str], _PreparedAudio] = {}
-        self._known_items: dict[tuple[str, int, str, str], TTSReadyItem] = {}
+        self._preparation_pending: dict[ItemKey, TTSReadyItem] = {}
+        self._prepared_audio: dict[ItemKey, _PreparedAudio] = {}
+        self._known_items: dict[ItemKey, TTSReadyItem] = {}
         self._audio_ms_per_char: dict[str, float] = {}
-        self._latest_key_by_sentence: dict[str, tuple[str, int, str, str]] = {}
+        self._latest_key_by_sentence: dict[str, ItemKey] = {}
         self._work_available = asyncio.Event()
         self._encoder: HLSEncoder | None = None
         self._active_root: Path | None = None
         self._worker: asyncio.Task[None] | None = None
         self._reaper: asyncio.Task[None] | None = None
         self._inflight_item: TTSReadyItem | None = None
-        self._inflight_key: tuple[str, int, str, str] | None = None
+        self._inflight_key: ItemKey | None = None
         self._inflight_kind = ""
         self._lock = asyncio.Lock()
         self._closed = False
         self._last_error = ""
         self._idle_backlog_dropped = 0
+        self._speech_epoch_id = ""
+        self._global_speed_multiplier = 1.0
+        self._first_epoch_item_key: ItemKey | None = None
 
     @property
     def listener_count(self) -> int:
@@ -674,6 +703,33 @@ class SharedHLSTTSPublisher:
 
     @property
     def status(self) -> HLSStreamStatus:
+        pending_audio_ms, backlog_ms, backlog_count, backlog_estimated = (
+            self._backlog_snapshot()
+        )
+        multiplier = self._global_speed_multiplier if self._speech_epoch_id else 1.0
+        return HLSStreamStatus(
+            available=not self._closed and self._synthesizer is not None,
+            listener_count=len(self._leases),
+            queue_depth=self._queue.qsize() + int(self._inflight_kind == "release"),
+            synthesis_active=self._inflight_item is not None,
+            preparation_queue_depth=len(self._preparation_pending),
+            preparation_active=self._inflight_kind == "prepare",
+            prepared_audio_count=len(self._prepared_audio),
+            pending_audio_ms=pending_audio_ms,
+            translated_audio_backlog_ms=backlog_ms,
+            translated_audio_backlog_count=backlog_count,
+            translated_audio_backlog_estimated=backlog_estimated,
+            speech_epoch_id=self._speech_epoch_id,
+            global_speed_mode="auto" if self._auto_speed_enabled else "fixed",
+            global_speed_multiplier=multiplier,
+            tts_effective_speed=self._baseline_tts_speed * multiplier,
+            encoder_active=self._encoder is not None,
+            last_error=self._last_error,
+        )
+
+    def _backlog_snapshot(self) -> tuple[int, int, int, bool]:
+        if not self._leases or self._encoder is None or not self._speech_epoch_id:
+            return 0, 0, 0, False
         pending_audio_ms = max(
             0,
             int(getattr(self._encoder, "pending_audio_ms", 0) or 0),
@@ -687,20 +743,11 @@ class SharedHLSTTSPublisher:
             else:
                 future_audio_ms += self._estimate_item_audio_ms(item)
                 backlog_estimated = True
-        return HLSStreamStatus(
-            available=not self._closed and self._synthesizer is not None,
-            listener_count=len(self._leases),
-            queue_depth=self._queue.qsize() + int(self._inflight_kind == "release"),
-            synthesis_active=self._inflight_item is not None,
-            preparation_queue_depth=len(self._preparation_pending),
-            preparation_active=self._inflight_kind == "prepare",
-            prepared_audio_count=len(self._prepared_audio),
-            pending_audio_ms=pending_audio_ms,
-            translated_audio_backlog_ms=pending_audio_ms + future_audio_ms,
-            translated_audio_backlog_count=len(self._known_items),
-            translated_audio_backlog_estimated=backlog_estimated,
-            encoder_active=self._encoder is not None,
-            last_error=self._last_error,
+        return (
+            pending_audio_ms,
+            pending_audio_ms + future_audio_ms,
+            len(self._known_items),
+            backlog_estimated,
         )
 
     @staticmethod
@@ -711,7 +758,7 @@ class SharedHLSTTSPublisher:
         return normalized
 
     @staticmethod
-    def _item_key(item: TTSReadyItem) -> tuple[str, int, str, str]:
+    def _item_key(item: TTSReadyItem) -> ItemKey:
         text_hash = hashlib.sha256(str(item.text).encode("utf-8")).hexdigest()
         return (
             str(item.sentence_id),
@@ -734,7 +781,8 @@ class SharedHLSTTSPublisher:
             if language == "chinese"
             else DEFAULT_ENGLISH_AUDIO_MS_PER_CHAR
         )
-        ms_per_char = self._audio_ms_per_char.get(language, default_ms_per_char)
+        observed_ms_per_char = self._audio_ms_per_char.get(language, 0.0)
+        ms_per_char = max(default_ms_per_char, observed_ms_per_char * 1.10)
         text_chars = max(1, len(str(item.text or "").strip()))
         return max(
             MIN_ESTIMATED_SENTENCE_AUDIO_MS,
@@ -759,7 +807,7 @@ class SharedHLSTTSPublisher:
     def _select_latest_item_locked(
         self,
         item: TTSReadyItem,
-        key: tuple[str, int, str, str],
+        key: ItemKey,
     ) -> None:
         sentence_id = str(item.sentence_id)
         self._latest_key_by_sentence[sentence_id] = key
@@ -773,7 +821,7 @@ class SharedHLSTTSPublisher:
             if known_key[0] == sentence_id and known_key != key:
                 del self._known_items[known_key]
 
-    def _retain_latest_idle_item_locked(self) -> int:
+    def _retain_latest_idle_item_locked(self) -> tuple[int, ItemKey | None]:
         """Collapse pre-listener speech to the current live sentence."""
 
         queued: list[TTSReadyItem] = []
@@ -785,7 +833,7 @@ class SharedHLSTTSPublisher:
             self._queue.task_done()
             queued.append(item)
         if not queued:
-            return 0
+            return 0, None
 
         latest = queued[-1]
         self._queue.put_nowait(latest)
@@ -808,7 +856,7 @@ class SharedHLSTTSPublisher:
                 self._queue.qsize(),
                 self._idle_backlog_dropped,
             )
-        return dropped
+        return dropped, self._item_key(latest)
 
     async def touch_listener(self, listener_id: str, owner_key: str) -> HLSListenerLease:
         listener = self._require_identity(listener_id, "listener_id")
@@ -823,7 +871,7 @@ class SharedHLSTTSPublisher:
             if existing is None and len(self._leases) >= self._max_listeners:
                 raise HLSListenerCapacityExceeded("listener capacity reached")
             if self._encoder is None:
-                self._retain_latest_idle_item_locked()
+                _, retained_key = self._retain_latest_idle_item_locked()
                 root = self._root_dir / f"epoch-{uuid.uuid4().hex}"
                 encoder = self._encoder_factory(root)
                 try:
@@ -832,6 +880,9 @@ class SharedHLSTTSPublisher:
                     shutil.rmtree(root, ignore_errors=True)
                     raise
                 self._active_root = root
+                self._speech_epoch_id = root.name
+                self._global_speed_multiplier = 1.0
+                self._first_epoch_item_key = retained_key
                 self._encoder = encoder
                 self._worker = asyncio.create_task(self._worker_loop())
                 self._reaper = asyncio.create_task(self._reaper_loop())
@@ -1197,6 +1248,15 @@ class SharedHLSTTSPublisher:
             self._reaper = None
             self._encoder = None
             self._active_root = None
+            self._speech_epoch_id = ""
+            self._global_speed_multiplier = 1.0
+            self._first_epoch_item_key = None
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._queue.task_done()
             self._preparation_pending.clear()
             self._prepared_audio.clear()
             self._known_items.clear()
@@ -1248,4 +1308,5 @@ __all__ = [
     "decode_mono_pcm16_wav",
     "parse_hls_live_edge_at_ms",
     "parse_hls_timeline_origin_at_ms",
+    "select_global_tts_multiplier",
 ]

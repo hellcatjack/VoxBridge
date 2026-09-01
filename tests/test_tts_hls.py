@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import voxbridge.tts.hls as hls_module
 from voxbridge.tts.hls import (
     FFmpegHLSEncoder,
     HLSAppendReceipt,
@@ -40,9 +41,17 @@ class FakeSynthesizer:
         self.wav_bytes = wav_bytes
         self.duration_ms = int(duration_ms)
         self.calls: list[tuple[str, str]] = []
+        self.speed_calls: list[tuple[str, str, float | None]] = []
 
-    def synthesize(self, text: str, target_language: str):
+    def synthesize(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        speed: float | None = None,
+    ):
         self.calls.append((text, target_language))
+        self.speed_calls.append((text, target_language, speed))
         return SimpleNamespace(
             wav_bytes=self.wav_bytes,
             sample_rate=24000,
@@ -132,6 +141,60 @@ async def wait_until(predicate, *, timeout: float = 1.0) -> None:
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(_wait(), timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    ("backlog_ms", "expected"),
+    [
+        (0, 1.0),
+        (9_999, 1.0),
+        (10_000, 1.2),
+        (29_999, 1.2),
+        (30_000, 1.4),
+        (39_999, 1.4),
+        (40_000, 1.5),
+    ],
+)
+def test_global_tts_multiplier_boundaries(backlog_ms, expected):
+    assert hls_module.select_global_tts_multiplier(backlog_ms) == expected
+
+
+@pytest.mark.asyncio
+async def test_speech_epoch_skips_idle_debt_and_survives_first_listener_exit(
+    tmp_path,
+):
+    synth = FakeSynthesizer(make_wav())
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: FakeEncoder(root),
+        root_dir=tmp_path,
+        baseline_tts_speed=1.05,
+        clock=FakeClock(),
+    )
+    try:
+        await publisher.publish(ready_item(0))
+        await publisher.publish(ready_item(1))
+        assert publisher.status.speech_epoch_id == ""
+        assert publisher.status.translated_audio_backlog_ms == 0
+        assert publisher.status.translated_audio_backlog_count == 0
+
+        await publisher.touch_listener("iphone-a", "owner-a")
+        epoch = publisher.status.speech_epoch_id
+        assert epoch.startswith("epoch-")
+        await publisher.touch_listener("chrome-b", "owner-b")
+        await publisher.wait_idle()
+        assert synth.calls == [("Stable translation 1.", "English")]
+
+        await publisher.remove_listener("iphone-a", "owner-a")
+        assert publisher.status.speech_epoch_id == epoch
+        assert publisher.status.listener_count == 1
+
+        await publisher.remove_listener("chrome-b", "owner-b")
+        assert publisher.status.speech_epoch_id == ""
+        assert publisher.status.global_speed_multiplier == 1.0
+        assert publisher.status.translated_audio_backlog_ms == 0
+    finally:
+        await publisher.close()
 
 
 @pytest.mark.asyncio
