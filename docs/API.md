@@ -166,9 +166,9 @@ audio. Preparation never writes PCM to HLS; only the existing ordered stability
 release can publish it. Stable release reuses an exact cache hit, including work
 already in flight, so it does not create a second Kokoro synthesis. The cache is
 bounded to eight entries and is cleared with the listener epoch. Prepared audio
-records its displayed multiplier and effective Kokoro speed; a result prepared
-for a different speed tier is discarded and regenerated rather than published
-at the wrong global speed.
+records its displayed multiplier and effective Kokoro speed. Stable release
+keeps the speed selected when that exact revision began synthesis and reuses its
+PCM even if the unpublished backlog has since crossed into a lower Auto tier.
 
 ### `GET /api/tts/live/{listener_id}/captions`
 
@@ -182,7 +182,9 @@ Returns the recent translated caption cues for the matching live HLS lease:
       "cue_id": "a3f85d7f59ee7f29",
       "start_at_ms": 1786399995200,
       "end_at_ms": 1786399997880,
-      "text": "The sentence currently being spoken."
+      "text": "The sentence currently being spoken.",
+      "discardable_gap_before_ms": 0,
+      "resume_at_ms": null
     }
   ]
 }
@@ -198,6 +200,13 @@ and the fixed `300ms` inter-sentence pause. The server retains at most 256
 caption cues for the current encoder epoch and clears them when that shared
 stream ends.
 
+`discardable_gap_before_ms` is the clamped part of the preceding cue gap caused
+only by carrier PCM submitted while FFmpeg was finalizing an HLS tail and waiting
+for another translation. It never includes the normal sentence pause or model
+edge silence. `resume_at_ms` is `null` when no such carrier exists; otherwise it
+is the absolute program-time point after the disposable carrier from which the
+remaining continuous-speech natural gap must still be preserved.
+
 On Safari, the listener maps the native media timeline to an absolute playhead
 using `getStartDate() + currentTime` and selects the newest cue whose start is
 not later than that device-local position. This remains correct when the
@@ -206,7 +215,10 @@ server-live-edge estimate is only a compatibility fallback
 when the media element cannot provide a valid start date. The page therefore
 displays what that device is hearing instead of the newest server translation.
 Between cues it keeps the previous sentence visible without clearing, dimming,
-or flashing the text. The response uses `Cache-Control: no-store`. Caption
+or flashing the text. When both `resume_at_ms` and the next second of speech are
+inside one media buffer range, the page performs one guarded seek for that cue.
+It never changes the fixed `1.0` media rate and has no custom pause/play/retry
+recovery loop. The response uses `Cache-Control: no-store`. Caption
 polling is advisory and does not gate HLS audio; lock-screen playback continues
 if polling is suspended or temporarily fails.
 

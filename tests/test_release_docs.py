@@ -106,7 +106,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "--disable-tts-global-auto-speed" in readme
     assert "0.8x" not in readme
     assert "0.75x" not in readme
-    assert "2.0x" not in readme
+    assert "媒体播放率 2.0x" not in readme
     assert "300ms" in readme
     assert "pending_audio_ms" in readme
     assert "uv pip install --python .venv/bin/python -e '.[tts]'" in readme
@@ -156,6 +156,8 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "read-only shared status" in api
     assert "per-device `Auto`" not in api
     assert "localStorage" not in api
+    assert "discardable_gap_before_ms" in api
+    assert "resume_at_ms" in api
 
     assert "--enable-tts" in deployment
     assert "--tts-en-model-path" in deployment
@@ -179,6 +181,9 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "bounded pre-listener pool" in deployment
     assert "retains only the latest stable" in deployment
     assert "public bearer capability" in deployment
+    assert "two-second" in deployment.lower()
+    assert "one-shot" in deployment.lower()
+    assert "不循环重试" in readme
     assert "main subtitle page remains authenticated" in deployment
     assert "CPUExecutionProvider" in deployment
     assert "/listen" in deployment

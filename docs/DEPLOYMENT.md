@@ -378,6 +378,14 @@ already synthesized or published PCM is never retimed. Every `/listen` media
 element remains at HTML playback rate `1.0`, so iPhone Safari and desktop
 Chrome consume the same server-paced shared stream.
 
+After genuine PCM queue starvation, the encoder may publish active PCM at
+`2.0x` for one bounded two-second media burst, then it sustains real-time `1.0x`
+publication. Adjacent queued sentences share that burst budget; only another
+real empty-queue wait resets it. Tail-finalization carrier remains accelerated,
+but it is not speech debt. This keeps long unpublished PCM visible to the
+unchanged Auto tiers instead of hiding it in HLS faster than listeners consume
+the timeline.
+
 To roll back only the adaptive controller, add
 `--disable-tts-global-auto-speed`. This keeps server synthesis fixed at
 `--tts-speed` and keeps every browser at media rate `1.0`; it does not restore
@@ -413,6 +421,12 @@ The publisher also retains at most 256 caption cues for audio already released
 to the current HLS encoder epoch. Each cue uses the PCM media timeline submitted
 to FFmpeg, includes the AAC 1024-sample presentation delay, removes synthesized
 edge silence by waveform activity, and excludes the fixed 300ms sentence pause.
+Each cue also reports `discardable_gap_before_ms` for only the wait-generated
+tail carrier and `resume_at_ms` for the point that preserves the normal natural
+gap before the next sentence. The browser requires that resume point and one
+second beyond the next speech start to be in the same buffered range, then makes
+one one-shot seek per cue. It does not pause, call play, schedule a retry, or
+change the media rate as part of compaction.
 `/listen` polls the listener-scoped caption snapshot only while the page is
 visible. Safari maps its native media timeline with `getStartDate() +
 currentTime`, so a stale device playlist or local network buffer does not move
@@ -427,8 +441,9 @@ Kokoro preparation for the exact sentence revision. It does not append PCM to
 HLS or bypass `--tts-revision-stable-sec`; stable ordered release consumes the
 prepared result only when sentence ID, revision, target language, and text digest
 still match. A revision change discards stale audio. Prepared PCM also records
-the effective Kokoro speed; if the global tier changes before release, a
-wrong-speed cache entry is discarded and regenerated. The fixed eight-entry
+the displayed multiplier and effective Kokoro speed selected when synthesis
+began; stable release reuses that exact PCM even if the current Auto tier is now
+lower. The fixed eight-entry
 cache and the stable queue share one Kokoro worker, and the cache is removed
 when the listener epoch ends. Monitor `preparation_queue_depth`,
 `preparation_active`, and `prepared_audio_count` separately from `queue_depth`
