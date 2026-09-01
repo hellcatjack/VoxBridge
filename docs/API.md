@@ -45,17 +45,14 @@ support. Both paths consume the same shared stream and call
 synthesis or encoder. The continuous stream carries silence when no translated
 speech is ready.
 
-The page defaults to per-device `Auto` playback and also offers fixed choices
-from `0.8x` through `1.4x` in `0.1x` steps. The value is stored only in browser
-`localStorage` and applies to the one native media element; it never creates
-another synthesis or encoder. A stored value outside the current allowlist
-falls back to `Auto`. Auto selects `1.0x`, `1.2x`, `1.4x`, or `1.5x` at strict
-10-, 30-, and 40-second end-to-end backlog boundaries. Faster playback starts
-with at least four seconds buffered and returns to `1.0x` at two seconds. A
-listener using a fixed slow rate that reaches 12 seconds behind the HLS live
-edge temporarily catches up at `1.2x` and restores the selected rate inside
-five seconds. A hidden or locked page uses at least `1.0x`. This fixed-rate
-guard does not seek or discard translated speech.
+Playback Speed is a read-only shared status. Every browser keeps the HTML media
+element at `defaultPlaybackRate = 1.0` and `playbackRate = 1.0`; hls.js is also
+configured with `maxLiveSyncPlaybackRate: 1`. The publisher selects the audible
+Auto multiplier for each sentence and passes the resulting absolute speed to
+Kokoro before synthesis. All listeners therefore receive the same already-paced
+PCM instead of relying on browser-specific live-HLS rate control. A device's
+buffering state, HLS playhead, visibility, and join time do not change the
+global multiplier.
 
 ### `GET /listen/assets/hls.min.js`
 
@@ -91,6 +88,10 @@ Returns public foreground diagnostics for the shared stream:
   "translated_audio_backlog_ms": 82000,
   "translated_audio_backlog_count": 9,
   "translated_audio_backlog_estimated": true,
+  "speech_epoch_id": "b295d74643d84c8d9ed0a25104266f3a",
+  "global_speed_mode": "auto",
+  "global_speed_multiplier": 1.5,
+  "tts_effective_speed": 1.575,
   "encoder_active": true,
   "producer_active": true,
   "last_error": ""
@@ -113,8 +114,21 @@ still waiting for Kokoro contribute a rolling per-language duration estimate.
 `translated_audio_backlog_count` is the number of those unique revisions, so a
 revision present in both preparation and stable-release queues is counted only
 once. `translated_audio_backlog_estimated` is true while any contribution still
-uses an estimate. These fields describe server-side future audio only; a device
-adds its own distance from the current HLS live edge for an end-to-end backlog.
+uses an estimate. An unsynthesized item uses the larger of the language default
+or the recently observed baseline speech duration per character with a 10%
+safety margin, plus the inter-sentence pause once. These fields describe shared
+server-side unpublished speech only; they exclude every device's HLS lag,
+network delay, and audio already published into the live window.
+
+`speech_epoch_id` identifies the current shared TTS/HLS lifetime.
+`global_speed_mode` is `auto` by default or `fixed` when the rollback switch is
+enabled. `global_speed_multiplier` is the displayed shared multiplier selected
+for the next/current sentence, and `tts_effective_speed` is the absolute Kokoro
+value after applying the configured `--tts-speed` baseline. With no listeners,
+there is no active speech epoch: `speech_epoch_id` is empty, all translated
+backlog fields are zero, `global_speed_multiplier` is `1.0`, and
+`tts_effective_speed` equals the configured baseline. Polling this endpoint does
+not start synthesis or create an epoch.
 
 ### `GET /api/tts/live/{listener_id}/index.m3u8`
 
@@ -130,15 +144,19 @@ bearer capability for that short-lived lease, not an authenticated user identity
 The server accepts at most 128 concurrent leases by default; a new listener over
 that bound receives `HTTP 429`, while an existing lease may still refresh.
 
-The publisher also keeps a bounded pre-listener backlog of up to 128 stable
-translations from the current producer session. It does not synthesize them while
-there are no listeners. When the first listener creates a new live epoch, the
-publisher discards stale backlog entries and retains only the latest stable translation
-for the shared Kokoro worker. Future translations continue in source order, so a
-late join or restart begins at the live edge instead of replaying the meeting from
-the beginning. When idle, overflow retains the most recent entries; starting a
-new producer session clears an older idle backlog so speech cannot cross meeting
-boundaries.
+The publisher also keeps a bounded pre-listener pool of up to 128 stable
+translations from the current producer session. It does not synthesize or count
+them as active speech backlog while there are no listeners. When the first
+listener creates a new live epoch, the publisher discards stale entries, retains
+only the latest stable translation, and synthesizes that join sentence at the
+displayed `1.0x` baseline. Future translations continue in source order, so a
+late join or restart begins near the live edge instead of replaying the meeting
+from the beginning. When idle, overflow retains the most recent entries;
+starting a new producer session clears an older idle pool so speech cannot cross
+meeting boundaries. The first listener is only the epoch trigger: adding another
+listener or removing the original one leaves the shared encoder, backlog, and
+speed unchanged while at least one lease remains. Removing the final lease clears
+the epoch and its controller state.
 
 While at least one listener lease is active, translation completion may start
 Kokoro preparation before the source-revision stability gate releases the item.
@@ -147,7 +165,10 @@ language, and a SHA-256 text digest. A newer revision invalidates stale prepared
 audio. Preparation never writes PCM to HLS; only the existing ordered stability
 release can publish it. Stable release reuses an exact cache hit, including work
 already in flight, so it does not create a second Kokoro synthesis. The cache is
-bounded to eight entries and is cleared with the listener epoch.
+bounded to eight entries and is cleared with the listener epoch. Prepared audio
+records its displayed multiplier and effective Kokoro speed; a result prepared
+for a different speed tier is discarded and regenerated rather than published
+at the wrong global speed.
 
 ### `GET /api/tts/live/{listener_id}/captions`
 
@@ -180,12 +201,12 @@ stream ends.
 On Safari, the listener maps the native media timeline to an absolute playhead
 using `getStartDate() + currentTime` and selects the newest cue whose start is
 not later than that device-local position. This remains correct when the
-device's loaded playlist is several segments behind the server and at any local
-playback rate. The server-live-edge estimate is only a compatibility fallback
+device's loaded playlist is several segments behind the server. The
+server-live-edge estimate is only a compatibility fallback
 when the media element cannot provide a valid start date. The page therefore
 displays what that device is hearing instead of the newest server translation.
-Between cues it keeps the previous sentence visible in a subdued state rather
-than clearing the text. The response uses `Cache-Control: no-store`. Caption
+Between cues it keeps the previous sentence visible without clearing, dimming,
+or flashing the text. The response uses `Cache-Control: no-store`. Caption
 polling is advisory and does not gate HLS audio; lock-screen playback continues
 if polling is suspended or temporarily fails.
 

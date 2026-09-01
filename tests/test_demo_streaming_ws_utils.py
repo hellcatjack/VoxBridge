@@ -2335,55 +2335,28 @@ def test_index_template_displays_public_listener_qr_in_control_bar():
     )
 
 
-def test_listener_page_exposes_allowlisted_per_device_playback_rates():
-    assert 'id="playbackRate"' in TTS_LISTENER_HTML
-    assert '<option value="auto" selected>Auto</option>' in TTS_LISTENER_HTML
-    for value in ("0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4"):
-        assert f'<option value="{value}"' in TTS_LISTENER_HTML
-    for removed_value in ("0.75", "1.25", "1.5", "2"):
-        assert f'<option value="{removed_value}"' not in TTS_LISTENER_HTML
-    assert (
-        'const PLAYBACK_RATE_STORAGE_KEY = "voxbridge.ttsPlaybackRate";'
-        in TTS_LISTENER_HTML
-    )
-    assert (
-        "const SUPPORTED_PLAYBACK_RATES = new Set([0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4]);"
-        in TTS_LISTENER_HTML
-    )
+def test_listener_page_exposes_read_only_global_auto_speed():
+    assert 'id="globalSpeedStatus">Auto - 1.0x</strong>' in TTS_LISTENER_HTML
+    assert 'id="playbackRate"' not in TTS_LISTENER_HTML
+    assert "PLAYBACK_RATE_STORAGE_KEY" not in TTS_LISTENER_HTML
+    assert "SUPPORTED_PLAYBACK_RATES" not in TTS_LISTENER_HTML
+    assert "window.localStorage" not in TTS_LISTENER_HTML
 
 
-def test_listener_page_normalizes_and_persists_playback_rate_locally():
-    assert "function normalizePlaybackRate(value)" in TTS_LISTENER_HTML
-    assert 'return "auto";' in TTS_LISTENER_HTML
-    assert (
-        'return SUPPORTED_PLAYBACK_RATES.has(parsed) ? parsed : "auto";'
-        in TTS_LISTENER_HTML
-    )
-    assert (
-        "window.localStorage.getItem(PLAYBACK_RATE_STORAGE_KEY)"
-        in TTS_LISTENER_HTML
-    )
-    assert (
-        "window.localStorage.setItem(PLAYBACK_RATE_STORAGE_KEY, String(playbackRate))"
-        in TTS_LISTENER_HTML
-    )
-    assert 'playbackRateInput.addEventListener("change"' in TTS_LISTENER_HTML
+def test_listener_page_renders_server_global_speed_status_without_writing_it():
+    assert 'status.global_speed_mode === "fixed" ? "Fixed" : "Auto"' in TTS_LISTENER_HTML
+    assert "Number(status.global_speed_multiplier)" in TTS_LISTENER_HTML
+    assert "globalSpeedStatus.textContent =" in TTS_LISTENER_HTML
     assert 'send({ type: "set_playback_rate"' not in TTS_LISTENER_HTML
 
 
-def test_listener_page_applies_rate_to_persistent_pitch_preserving_audio():
+def test_listener_page_forces_persistent_audio_to_normal_playback_rate():
     assert 'id="ttsPlayback"' in TTS_LISTENER_HTML
-    assert (
-        "const effectiveRate = effectivePlaybackRate(lag, totalBacklog);"
-        in TTS_LISTENER_HTML
-    )
-    assert "playbackElement.defaultPlaybackRate = effectiveRate;" in TTS_LISTENER_HTML
-    assert "playbackElement.playbackRate = effectiveRate;" in TTS_LISTENER_HTML
-    assert "if (document.hidden) return Math.max(1, playbackRate);" in TTS_LISTENER_HTML
-    assert 'playbackElement.addEventListener("timeupdate", updateLiveLatencyGuard)' in TTS_LISTENER_HTML
-    assert '"preservesPitch" in playbackElement' in TTS_LISTENER_HTML
-    assert '"mozPreservesPitch" in playbackElement' in TTS_LISTENER_HTML
-    assert '"webkitPreservesPitch" in playbackElement' in TTS_LISTENER_HTML
+    assert "function forceNormalPlaybackRate()" in TTS_LISTENER_HTML
+    assert "playbackElement.defaultPlaybackRate = 1;" in TTS_LISTENER_HTML
+    assert "playbackElement.playbackRate = 1;" in TTS_LISTENER_HTML
+    assert "new Hls({ maxLiveSyncPlaybackRate: 1 })" in TTS_LISTENER_HTML
+    assert "effectivePlaybackRate" not in TTS_LISTENER_HTML
 
 
 def test_listener_page_uses_one_native_hls_element_without_sentence_blob_queue():

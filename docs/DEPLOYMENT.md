@@ -353,24 +353,35 @@ server's idle carrier remains acoustically silent but forces FFmpeg to include
 decodable AAC frames instead of producing table-only MPEG-TS segments.
 The pinned build and license live under `voxbridge/tts/vendor/`; package builds
 must include those files. Do not replace it with a runtime CDN dependency.
-The backend keeps a bounded pre-listener backlog of up to 128 stable translations
-from the current producer session. When the first listener creates a new live
-epoch, the backend discards stale entries and retains only the latest stable translation;
-this is a live-edge join buffer, not a catch-up queue or persisted recording. A new
-producer session clears an older idle backlog. Device-local Stop removes only that
-browser's lease and does not affect other listeners.
+The backend keeps a bounded pre-listener pool of up to 128 stable translations
+from the current producer session. With no listener, it performs no TTS work and
+reports zero active speech backlog. When the first listener creates a new live
+epoch, the backend discards stale entries, retains only the latest stable
+translation, and synthesizes that join sentence at displayed `1.0x`; this is a
+live-edge join buffer, not a catch-up queue or persisted recording. A new
+producer session clears an older idle pool. Device-local Stop removes only that
+browser's lease and does not affect other listeners. The listener that triggered
+the epoch has no special ownership: as long as another lease remains, the
+encoder, shared queue, speech epoch, and global speed controller continue
+unchanged. Removing or expiring the final lease clears all epoch-specific state.
 One worker synthesizes each translation once, and one FFmpeg
 process writes a continuous 24 kHz mono AAC/HLS timeline shared by all devices.
 When no speech is pending, the encoder receives real-time zero PCM so native iOS
 playback can continue after the browser is locked.
 
 `--tts-speed` is the backend Kokoro synthesis baseline and remains global for
-the generated shared WAV. The `/listen` selector defaults to listener-side
-`Auto` playback and also offers fixed multipliers (`0.8x` through `1.4x` in
-`0.1x` steps) stored per browser; changing it does not restart the service,
-alter another device, or create another synthesis/cache variant. Because this
-is a live stream, `1.0x` gives the most predictable live-edge latency; other
-rates remain device-local and may change the distance from the live edge.
+displayed `1.0x`. The default global Auto controller multiplies that baseline
+for each new sentence before Kokoro synthesis. With the recommended baseline
+`1.05`, displayed `1.2x`, `1.4x`, and `1.5x` map to absolute Kokoro speeds
+`1.26`, `1.47`, and `1.575`. The selected value is fixed for the full sentence;
+already synthesized or published PCM is never retimed. Every `/listen` media
+element remains at HTML playback rate `1.0`, so iPhone Safari and desktop
+Chrome consume the same server-paced shared stream.
+
+To roll back only the adaptive controller, add
+`--disable-tts-global-auto-speed`. This keeps server synthesis fixed at
+`--tts-speed` and keeps every browser at media rate `1.0`; it does not restore
+the removed per-device rate selector.
 
 The publisher appends a fixed `300ms` zero-PCM sentence pause after each Kokoro
 clip. The global translated-speech queue uses `--tts-listener-queue-size` as its
@@ -382,23 +393,21 @@ for that epoch.
 
 `GET /api/tts/live/status` reports `queue_depth` including the item currently in
 Kokoro, exposes `synthesis_active`, and reports synthesized FIFO backlog as
-`pending_audio_ms`. It also reports de-duplicated future translated audio as
-`translated_audio_backlog_ms`; use `translated_audio_backlog_count` and
-`translated_audio_backlog_estimated` to distinguish queued revisions and
-estimated durations. Auto selects `1.2x`, `1.4x`, or `1.5x` from the end-to-end
-sum of device HLS lag and `translated_audio_backlog_ms`, using strict 10-, 30-,
-and 40-second thresholds. A rate above `1.0x` activates only after the device
-has at least four seconds of playable HLS and returns to `1.0x` at two seconds,
-which prevents an estimated server backlog from causing immediate underruns.
-Manual playback rates below `1.0x` still consume encoded silence, so the
-listener retains its non-skipping 12-second catch-up guard and uses at least
-`1.0x` while the page is hidden or locked.
+`pending_audio_ms`. It also reports conservative de-duplicated unpublished
+speech as `translated_audio_backlog_ms`; use
+`translated_audio_backlog_count` and `translated_audio_backlog_estimated` to
+distinguish queued revisions and estimated durations. The estimate uses the
+larger of the language default or recently measured baseline speech time per
+character with a 10% safety margin. It excludes device HLS lag, network delay,
+and already published media.
 
-When the next caption and its following audio are already buffered, the
-listener may compact a long historical idle-carrier gap while retaining at
-least 500ms of natural silence. The compaction is committed only after playback
-returns to `playing`; an internal seek that remains in `waiting` is retried
-after 800ms rather than permanently marking that caption as handled.
+At sentence synthesis start, global Auto selects `<10s = 1.0x`,
+`10-<30s = 1.2x`, `30-<40s = 1.4x`, or `>=40s = 1.5x` from that conservative
+server backlog. The response exposes `speech_epoch_id`, `global_speed_mode`,
+`global_speed_multiplier`, and `tts_effective_speed`. A phone that is buffering
+cannot change these values. When there are no listeners, the active backlog and
+count are zero, the epoch ID is empty, the multiplier is `1.0`, and neither
+Kokoro nor FFmpeg is started by status polling.
 
 The publisher also retains at most 256 caption cues for audio already released
 to the current HLS encoder epoch. Each cue uses the PCM media timeline submitted
@@ -406,8 +415,8 @@ to FFmpeg, includes the AAC 1024-sample presentation delay, removes synthesized
 edge silence by waveform activity, and excludes the fixed 300ms sentence pause.
 `/listen` polls the listener-scoped caption snapshot only while the page is
 visible. Safari maps its native media timeline with `getStartDate() +
-currentTime`, so a stale device playlist or a listener-side playback rate does
-not move captions ahead of audible speech. The server live-edge calculation is
+currentTime`, so a stale device playlist or local network buffer does not move
+captions ahead of audible speech. The server live-edge calculation is
 only a fallback for media implementations without a valid start date. A failed
 caption request must not stop or restart HLS playback. Monitor caption endpoint
 errors separately from FFmpeg and audio backlog; a caption failure is a display
@@ -417,10 +426,13 @@ With an active listener, translation completion also queues bounded speculative
 Kokoro preparation for the exact sentence revision. It does not append PCM to
 HLS or bypass `--tts-revision-stable-sec`; stable ordered release consumes the
 prepared result only when sentence ID, revision, target language, and text digest
-still match. A revision change discards stale audio. The fixed eight-entry cache
-and the stable queue share one Kokoro worker, and the cache is removed when the
-listener epoch ends. Monitor `preparation_queue_depth`, `preparation_active`, and
-`prepared_audio_count` separately from `queue_depth` and `pending_audio_ms`.
+still match. A revision change discards stale audio. Prepared PCM also records
+the effective Kokoro speed; if the global tier changes before release, a
+wrong-speed cache entry is discarded and regenerated. The fixed eight-entry
+cache and the stable queue share one Kokoro worker, and the cache is removed
+when the listener epoch ends. Monitor `preparation_queue_depth`,
+`preparation_active`, and `prepared_audio_count` separately from `queue_depth`
+and `pending_audio_ms`.
 
 `--tts-hls-max-listeners 128` bounds active public leases. Each browser generates
 an opaque random listener ID; possession of that ID is a public bearer capability

@@ -101,8 +101,10 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "https://ushome.amycat.com:18024/listen" in readme
     assert "免登录" in readme
     assert "Pittsburgh Christian Church South" in readme
-    assert "0.8x" in readme
     assert "1.2x" in readme
+    assert "1.5x" in readme
+    assert "--disable-tts-global-auto-speed" in readme
+    assert "0.8x" not in readme
     assert "0.75x" not in readme
     assert "2.0x" not in readme
     assert "300ms" in readme
@@ -117,7 +119,10 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert '"preparation_queue_depth"' in api
     assert '"prepared_audio_count"' in api
     assert '"pending_audio_ms"' in api
-    assert "does not seek or discard translated speech" in api
+    assert '"speech_epoch_id"' in api
+    assert '"global_speed_multiplier"' in api
+    assert '"tts_effective_speed"' in api
+    assert "maxLiveSyncPlaybackRate: 1" in api
     assert "GET /api/tts/live/{listener_id}/index.m3u8" in api
     assert "GET /api/tts/live/{listener_id}/captions" in api
     assert '"live_edge_at_ms"' in api
@@ -139,7 +144,7 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "WS /ws/tts" in api
     assert "POST /api/tts/broadcast/jobs/{job_id}/audio" in api
     assert '"type": "tts_received"' in api
-    assert "bounded pre-listener backlog" in api
+    assert "bounded pre-listener pool" in api
     assert "latest stable translation" in api
     assert "exact translation revision" in api
     assert "deprecated" in api
@@ -148,28 +153,31 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "DELETE /api/tts/clients/{client_id}/jobs" in api
     assert '"type": "tts_job"' in api
     assert '"is_stable": true' in api
-    assert "per-device" in api.lower()
-    assert "localStorage" in api
+    assert "read-only shared status" in api
+    assert "per-device `Auto`" not in api
+    assert "localStorage" not in api
 
     assert "--enable-tts" in deployment
     assert "--tts-en-model-path" in deployment
     assert "--tts-zh-model-path" in deployment
     assert "--tts-listener-queue-size" in deployment
     assert "--tts-speed" in deployment
-    assert "listener-side" in deployment.lower()
+    assert "--disable-tts-global-auto-speed" in deployment
+    assert "server-paced shared stream" in deployment
     assert "bounded" in deployment.lower()
     assert "300ms" in deployment
     assert "one FFmpeg" in deployment
     assert "90-second lease" in deployment
-    assert "12-second" in deployment
-    assert "live edge" in deployment
+    assert "10-<30s = 1.2x" in deployment
+    assert ">=40s = 1.5x" in deployment
+    assert "live-edge" in deployment
     assert "caption cue" in deployment.lower()
     assert "getStartDate()" in deployment
     assert "PCM media timeline" in deployment
     assert "256" in deployment
     assert "--tts-hls-max-listeners 128" in deployment
-    assert "bounded pre-listener backlog" in deployment
-    assert "latest stable translation" in deployment
+    assert "bounded pre-listener pool" in deployment
+    assert "retains only the latest stable" in deployment
     assert "public bearer capability" in deployment
     assert "main subtitle page remains authenticated" in deployment
     assert "CPUExecutionProvider" in deployment
