@@ -140,6 +140,8 @@ class _PreparedAudio:
     cue_end_offset_ms: int
     synthesis_ms: int
     prepared_at: float
+    displayed_multiplier: float
+    effective_speed: float
 
 
 def decode_mono_pcm16_wav(wav_bytes: bytes, *, expected_rate: int) -> bytes:
@@ -789,13 +791,20 @@ class SharedHLSTTSPublisher:
             round(text_chars * ms_per_char) + self._sentence_pause_ms,
         )
 
-    def _observe_item_audio_ms(self, item: TTSReadyItem, audio_ms: int) -> None:
+    def _observe_item_audio_ms(
+        self,
+        item: TTSReadyItem,
+        audio_ms: int,
+        *,
+        displayed_multiplier: float,
+    ) -> None:
         text_chars = len(str(item.text or "").strip())
         if text_chars < 1:
             return
         language = self._language_key(item.target_language)
         speech_audio_ms = max(1, int(audio_ms) - self._sentence_pause_ms)
-        observed = speech_audio_ms / text_chars
+        baseline_speech_ms = speech_audio_ms * max(1.0, displayed_multiplier)
+        observed = baseline_speech_ms / text_chars
         previous = self._audio_ms_per_char.get(language)
         self._audio_ms_per_char[language] = (
             observed
@@ -803,6 +812,35 @@ class SharedHLSTTSPublisher:
             else previous * (1.0 - DURATION_ESTIMATE_ALPHA)
             + observed * DURATION_ESTIMATE_ALPHA
         )
+
+    def _select_synthesis_speed_locked(
+        self,
+        key: ItemKey,
+        kind: str,
+    ) -> tuple[float, float, int]:
+        _, backlog_ms, _, _ = self._backlog_snapshot()
+        force_join_baseline = (
+            kind == "release" and key == self._first_epoch_item_key
+        )
+        multiplier = 1.0
+        if self._auto_speed_enabled and not force_join_baseline:
+            multiplier = select_global_tts_multiplier(backlog_ms)
+        effective_speed = self._baseline_tts_speed * multiplier
+        if not math.isfinite(effective_speed) or not 0.5 <= effective_speed <= 2.0:
+            logger.warning(
+                "shared HLS TTS speed fallback epoch=%s backlog_ms=%d multiplier=%.1f effective_speed=%.3f",
+                self._speech_epoch_id,
+                backlog_ms,
+                multiplier,
+                effective_speed,
+            )
+            self._last_error = "TTSSpeedRangeError"
+            multiplier = 1.0
+            effective_speed = self._baseline_tts_speed
+        self._global_speed_multiplier = multiplier
+        if force_join_baseline:
+            self._first_epoch_item_key = None
+        return multiplier, effective_speed, backlog_ms
 
     def _select_latest_item_locked(
         self,
@@ -1055,9 +1093,12 @@ class SharedHLSTTSPublisher:
         while True:
             await self._work_available.wait()
             item: TTSReadyItem | None = None
-            key: tuple[str, int, str, str] | None = None
+            key: ItemKey | None = None
             prepared: _PreparedAudio | None = None
             kind = ""
+            displayed_multiplier = 1.0
+            effective_speed = self._baseline_tts_speed
+            decision_backlog_ms = 0
             async with self._lock:
                 try:
                     item = self._queue.get_nowait()
@@ -1082,6 +1123,16 @@ class SharedHLSTTSPublisher:
                 self._inflight_item = item
                 self._inflight_key = key
                 self._inflight_kind = kind
+                displayed_multiplier, effective_speed, decision_backlog_ms = (
+                    self._select_synthesis_speed_locked(key, kind)
+                )
+                if prepared is not None and not math.isclose(
+                    prepared.effective_speed,
+                    effective_speed,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    prepared = None
             try:
                 encoder = self._encoder
                 if encoder is None or item is None or key is None:
@@ -1090,18 +1141,23 @@ class SharedHLSTTSPublisher:
                 if prepared is None:
                     synthesis_started = time.monotonic()
                     logger.info(
-                        "shared HLS TTS %s started source_order=%d revision=%d text_chars=%d stable_pending=%d prepare_pending=%d",
+                        "shared HLS TTS %s started epoch=%s source_order=%d revision=%d text_chars=%d stable_pending=%d prepare_pending=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f",
                         "preparation" if kind == "prepare" else "synthesis",
+                        self._speech_epoch_id,
                         int(item.source_order),
                         int(item.revision),
                         len(str(item.text)),
                         self.status.queue_depth,
                         self.status.preparation_queue_depth,
+                        decision_backlog_ms,
+                        displayed_multiplier,
+                        effective_speed,
                     )
                     audio = await asyncio.to_thread(
                         self._synthesizer.synthesize,
                         item.text,
                         item.target_language,
+                        speed=effective_speed,
                     )
                     pcm = decode_mono_pcm16_wav(
                         audio.wav_bytes,
@@ -1128,8 +1184,14 @@ class SharedHLSTTSPublisher:
                         cue_end_offset_ms=cue_end_offset_ms,
                         synthesis_ms=synthesis_ms,
                         prepared_at=self._clock(),
+                        displayed_multiplier=displayed_multiplier,
+                        effective_speed=effective_speed,
                     )
-                    self._observe_item_audio_ms(item, audio_ms)
+                    self._observe_item_audio_ms(
+                        item,
+                        audio_ms,
+                        displayed_multiplier=displayed_multiplier,
+                    )
 
                 if kind == "prepare":
                     cached = False
@@ -1145,7 +1207,8 @@ class SharedHLSTTSPublisher:
                             cached = True
                     self._last_error = ""
                     logger.info(
-                        "shared HLS TTS preparation completed source_order=%d revision=%d synthesis_ms=%d audio_ms=%d rtf=%.3f cached=%s prepared=%d",
+                        "shared HLS TTS preparation completed epoch=%s source_order=%d revision=%d synthesis_ms=%d audio_ms=%d rtf=%.3f cached=%s prepared=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f",
+                        self._speech_epoch_id,
                         int(item.source_order),
                         int(item.revision),
                         int(prepared.synthesis_ms),
@@ -1153,6 +1216,9 @@ class SharedHLSTTSPublisher:
                         prepared.synthesis_ms / prepared.audio_ms,
                         str(cached).lower(),
                         len(self._prepared_audio),
+                        decision_backlog_ms,
+                        displayed_multiplier,
+                        effective_speed,
                     )
                     continue
 
@@ -1191,7 +1257,8 @@ class SharedHLSTTSPublisher:
                     round((self._clock() - prepared.prepared_at) * 1000),
                 )
                 logger.info(
-                    "shared HLS TTS audio published source_order=%d revision=%d cache_hit=%s synthesis_ms=%d preparation_age_ms=%d audio_ms=%d pending=%d pending_audio_ms=%d",
+                    "shared HLS TTS audio published epoch=%s source_order=%d revision=%d cache_hit=%s synthesis_ms=%d preparation_age_ms=%d audio_ms=%d pending=%d pending_audio_ms=%d backlog_ms=%d multiplier=%.1f effective_speed=%.3f",
+                    self._speech_epoch_id,
                     int(item.source_order),
                     int(item.revision),
                     str(cache_hit).lower(),
@@ -1200,6 +1267,9 @@ class SharedHLSTTSPublisher:
                     int(prepared.audio_ms),
                     self._queue.qsize(),
                     int(getattr(encoder, "pending_audio_ms", 0) or 0),
+                    decision_backlog_ms,
+                    displayed_multiplier,
+                    effective_speed,
                 )
             except asyncio.CancelledError:
                 raise

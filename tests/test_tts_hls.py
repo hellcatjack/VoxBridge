@@ -184,6 +184,7 @@ async def test_speech_epoch_skips_idle_debt_and_survives_first_listener_exit(
         await publisher.touch_listener("chrome-b", "owner-b")
         await publisher.wait_idle()
         assert synth.calls == [("Stable translation 1.", "English")]
+        assert synth.speed_calls == [("Stable translation 1.", "English", 1.05)]
 
         await publisher.remove_listener("iphone-a", "owner-a")
         assert publisher.status.speech_epoch_id == epoch
@@ -195,6 +196,99 @@ async def test_speech_epoch_skips_idle_debt_and_survives_first_listener_exit(
         assert publisher.status.translated_audio_backlog_ms == 0
     finally:
         await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_applies_global_multiplier_as_absolute_kokoro_speed(tmp_path):
+    synth = FakeSynthesizer(make_wav())
+    encoder = FakeEncoder(tmp_path / "stream")
+    encoder.pending_audio_ms = 40_000
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        baseline_tts_speed=1.05,
+        clock=FakeClock(),
+    )
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        await publisher.publish(ready_item(text="Accelerated together."))
+        await publisher.wait_idle()
+
+        assert synth.speed_calls == [
+            ("Accelerated together.", "English", pytest.approx(1.575))
+        ]
+        assert publisher.status.global_speed_multiplier == 1.5
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_release_regenerates_prepared_audio_when_global_speed_changed(tmp_path):
+    synth = FakeSynthesizer(make_wav(duration_ms=250))
+    encoder = FakeEncoder(tmp_path / "stream")
+    encoder.pending_audio_ms = 10_000
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        baseline_tts_speed=1.05,
+        clock=FakeClock(),
+    )
+    item = ready_item(text="Prepared at the old speed.")
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        assert await publisher.prepare(item) is True
+        await wait_until(lambda: publisher.status.prepared_audio_count == 1)
+        assert synth.speed_calls[-1][2] == pytest.approx(1.26)
+
+        encoder.pending_audio_ms = 0
+        assert await publisher.publish(item) is True
+        await publisher.wait_idle()
+
+        assert [call[2] for call in synth.speed_calls] == pytest.approx([1.26, 1.05])
+        assert len(encoder.appended) == 1
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_effective_speed_falls_back_without_stopping_epoch(tmp_path):
+    synth = FakeSynthesizer(make_wav())
+    encoder = FakeEncoder(tmp_path / "stream")
+    encoder.pending_audio_ms = 40_000
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=synth,
+        encoder_factory=lambda root: encoder,
+        root_dir=tmp_path,
+        baseline_tts_speed=1.5,
+        clock=FakeClock(),
+    )
+    try:
+        await publisher.touch_listener("iphone-a", "owner-a")
+        await publisher.publish(ready_item(text="Stay in range."))
+        await publisher.wait_idle()
+
+        assert synth.speed_calls[-1][2] == pytest.approx(1.5)
+        assert publisher.status.global_speed_multiplier == 1.0
+        assert publisher.status.speech_epoch_id.startswith("epoch-")
+    finally:
+        await publisher.close()
+
+
+def test_fast_audio_observation_is_normalized_to_baseline_duration(tmp_path):
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=FakeSynthesizer(make_wav()),
+        encoder_factory=lambda root: FakeEncoder(root),
+        root_dir=tmp_path,
+        sentence_pause_ms=0,
+        clock=FakeClock(),
+    )
+    item = ready_item(text="abcdefghij")
+
+    publisher._observe_item_audio_ms(item, 1_000, displayed_multiplier=1.5)
+
+    assert publisher._estimate_item_audio_ms(item) == 1_650
 
 
 @pytest.mark.asyncio
@@ -332,10 +426,12 @@ async def test_status_counts_item_while_kokoro_synthesis_is_in_flight(tmp_path):
     release = threading.Event()
 
     class BlockingSynthesizer(FakeSynthesizer):
-        def synthesize(self, text: str, target_language: str):
+        def synthesize(
+            self, text: str, target_language: str, *, speed: float | None = None
+        ):
             started.set()
             assert release.wait(timeout=2)
-            return super().synthesize(text, target_language)
+            return super().synthesize(text, target_language, speed=speed)
 
     publisher = SharedHLSTTSPublisher(
         synthesizer=BlockingSynthesizer(make_wav()),
@@ -577,10 +673,12 @@ async def test_stable_release_reuses_preparation_already_in_flight(tmp_path):
     release = threading.Event()
 
     class BlockingSynthesizer(FakeSynthesizer):
-        def synthesize(self, text: str, target_language: str):
+        def synthesize(
+            self, text: str, target_language: str, *, speed: float | None = None
+        ):
             started.set()
             assert release.wait(timeout=2)
-            return super().synthesize(text, target_language)
+            return super().synthesize(text, target_language, speed=speed)
 
     synth = BlockingSynthesizer(make_wav(duration_ms=250))
     encoder = FakeEncoder(tmp_path / "stream")
@@ -614,11 +712,13 @@ async def test_revision_change_during_preparation_discards_stale_audio(tmp_path)
     release = threading.Event()
 
     class FirstCallBlockingSynthesizer(FakeSynthesizer):
-        def synthesize(self, text: str, target_language: str):
+        def synthesize(
+            self, text: str, target_language: str, *, speed: float | None = None
+        ):
             if not self.calls:
                 started.set()
                 assert release.wait(timeout=2)
-            return super().synthesize(text, target_language)
+            return super().synthesize(text, target_language, speed=speed)
 
     synth = FirstCallBlockingSynthesizer(make_wav(duration_ms=250))
     encoder = FakeEncoder(tmp_path / "stream")
@@ -858,8 +958,10 @@ async def test_shared_publisher_queue_is_bounded(tmp_path):
     blocker = asyncio.Event()
 
     class BlockingSynthesizer(FakeSynthesizer):
-        def synthesize(self, text: str, target_language: str):
-            del text, target_language
+        def synthesize(
+            self, text: str, target_language: str, *, speed: float | None = None
+        ):
+            del text, target_language, speed
             raise AssertionError("worker should be suspended in this test")
 
     publisher = SharedHLSTTSPublisher(
