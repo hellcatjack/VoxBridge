@@ -116,6 +116,7 @@ class _FakeHLSEncoder:
         self.appended = []
         self.pending_audio_ms = 1750
         self.next_start_at_ms = 100_000
+        self.next_discardable_gap_before_ms = 0
 
     async def start(self):
         self.started += 1
@@ -130,9 +131,13 @@ class _FakeHLSEncoder:
         data = bytes(pcm)
         self.appended.append(data)
         duration_ms = round(len(data) * 1000 / (24000 * 2))
+        discardable_gap_before_ms = self.next_discardable_gap_before_ms
+        self.next_discardable_gap_before_ms = 0
+        self.next_start_at_ms += discardable_gap_before_ms
         receipt = HLSAppendReceipt(
             start_at_ms=self.next_start_at_ms,
             end_at_ms=self.next_start_at_ms + duration_ms,
+            discardable_gap_before_ms=discardable_gap_before_ms,
         )
         self.next_start_at_ms = receipt.end_at_ms
         return receipt
@@ -2231,12 +2236,19 @@ def test_public_hls_caption_feed_requires_matching_listener_lease(tmp_path):
                 duration_ms=250,
             )
 
+    encoders = []
+
+    def encoder_factory(root):
+        encoder = _FakeHLSEncoder(root)
+        encoders.append(encoder)
+        return encoder
+
     args = _args()
     args.auth_enabled = True
     args.auth_username = "admin"
     args.auth_password_hash = _hash_auth_password("secret")
     args.tts_hls_root_dir = str(tmp_path)
-    args.tts_hls_encoder_factory = lambda root: _FakeHLSEncoder(root)
+    args.tts_hls_encoder_factory = encoder_factory
     app = _create_app(
         args,
         _FakeASR(),
@@ -2250,11 +2262,21 @@ def test_public_hls_caption_feed_requires_matching_listener_lease(tmp_path):
         target_language="English",
         text="The stable translated sentence being spoken.",
     )
+    second_item = TTSReadyItem(
+        sentence_id="caption-source-2",
+        revision=1,
+        source_order=1,
+        target_language="English",
+        text="The next stable translated sentence.",
+    )
 
     with TestClient(app) as client:
         playlist = client.get(f"/api/tts/live/{listener_id}/index.m3u8")
         assert playlist.status_code == 200
         client.portal.call(app.state.tts_hls.publish, item)
+        client.portal.call(app.state.tts_hls.wait_idle)
+        encoders[0].next_discardable_gap_before_ms = 1_000
+        client.portal.call(app.state.tts_hls.publish, second_item)
         client.portal.call(app.state.tts_hls.wait_idle)
 
         captions = client.get(f"/api/tts/live/{listener_id}/captions")
@@ -2265,16 +2287,27 @@ def test_public_hls_caption_feed_requires_matching_listener_lease(tmp_path):
     assert captions.status_code == 200
     assert captions.headers["cache-control"] == "no-store"
     payload = captions.json()
-    assert payload["live_edge_at_ms"] == 100_550
+    assert payload["live_edge_at_ms"] == 102_100
     assert payload["cues"] == [
         {
             "cue_id": payload["cues"][0]["cue_id"],
             "start_at_ms": 100_000,
             "end_at_ms": 100_250,
             "text": "The stable translated sentence being spoken.",
-        }
+            "discardable_gap_before_ms": 0,
+            "resume_at_ms": None,
+        },
+        {
+            "cue_id": payload["cues"][1]["cue_id"],
+            "start_at_ms": 101_550,
+            "end_at_ms": 101_800,
+            "text": "The next stable translated sentence.",
+            "discardable_gap_before_ms": 1_000,
+            "resume_at_ms": 101_250,
+        },
     ]
     assert re.fullmatch(r"[0-9a-f]{16}", payload["cues"][0]["cue_id"])
+    assert re.fullmatch(r"[0-9a-f]{16}", payload["cues"][1]["cue_id"])
     assert unknown.status_code == 404
 
 

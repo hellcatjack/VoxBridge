@@ -5804,6 +5804,14 @@ def _create_app(
                         "start_at_ms": int(cue.start_at_ms),
                         "end_at_ms": int(cue.end_at_ms),
                         "text": cue.text,
+                        "discardable_gap_before_ms": int(
+                            cue.discardable_gap_before_ms
+                        ),
+                        "resume_at_ms": (
+                            int(cue.resume_at_ms)
+                            if cue.resume_at_ms is not None
+                            else None
+                        ),
                     }
                     for cue in snapshot.cues
                 ],
