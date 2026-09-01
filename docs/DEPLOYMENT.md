@@ -429,14 +429,16 @@ edge silence by waveform activity, and excludes the fixed 300ms sentence pause.
 Each cue also reports `discardable_gap_before_ms` for only the wait-generated
 idle carrier and `resume_at_ms` for the point that preserves only the unelapsed
 part of the normal natural gap before the next sentence. If the listener already
-heard at least that natural gap, the target is the next speech start and no extra
-pause is added. The browser first uses the existing buffered fast path when the
-resume point and one second beyond the next speech start share a buffered range.
-If that distant speech has not been prefetched, it seeks once the target and
-`100ms` beyond speech start share a seekable range; native HLS or hls.js then
-loads from that target instead of consuming accumulated idle carrier. It makes
-at most one seek per cue and does not pause, call play, schedule a retry, or
-change the media rate as part of compaction.
+heard at least that natural gap, hls.js targets the next speech start. Native
+Safari preserves at most `250ms` of AAC decoder pre-roll before that point so an
+exact seek cannot clip the first phoneme. The browser first uses the existing
+buffered fast path when the resume point and one second beyond the next speech
+start share a buffered range. If that distant speech has not been prefetched, it
+seeks once the target and `100ms` beyond speech start share a seekable range;
+native HLS or hls.js then loads from that target instead of consuming accumulated
+idle carrier. Every compaction uses precise `currentTime`, never approximate
+`fastSeek()`. It makes at most one seek per cue and does not pause, call play,
+schedule a retry, or change the media rate as part of compaction.
 `/listen` polls the listener-scoped caption snapshot only while the page is
 visible. Safari maps its native media timeline with `getStartDate() +
 currentTime`, so a stale device playlist or local network buffer does not move

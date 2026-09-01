@@ -539,6 +539,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const MIN_DISCARDABLE_GAP_MS = 500;
     const NEXT_SPEECH_BUFFER_GUARD_MS = 1000;
     const NEXT_SPEECH_SEEKABLE_GUARD_MS = 100;
+    const NATIVE_HLS_SPEECH_PREROLL_MS = 250;
 
     let listenerId = "";
     let running = false;
@@ -786,7 +787,17 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       const naturalGapMs = Math.max(0, nextStartAtMs - resumeAtMs);
       const heardGapMs = Math.max(0, playheadAtMs - previousEndAtMs);
       const remainingNaturalMs = Math.max(0, naturalGapMs - heardGapMs);
-      const targetProgramAtMs = nextStartAtMs - remainingNaturalMs;
+      // Native HLS needs a short decoded lead-in around an exact AAC seek.
+      const speechPrerollMs = hlsController === null
+        ? NATIVE_HLS_SPEECH_PREROLL_MS
+        : 0;
+      const targetProgramAtMs = Math.max(
+        previousEndAtMs,
+        Math.min(
+          nextStartAtMs - remainingNaturalMs,
+          nextStartAtMs - speechPrerollMs
+        )
+      );
       const currentTime = Number(playbackElement.currentTime);
       if (!Number.isFinite(currentTime) || targetProgramAtMs <= playheadAtMs) {
         return false;
@@ -812,11 +823,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
       attemptedGapCueKeys.add(nextCueKey);
       try {
-        if (typeof playbackElement.fastSeek === "function") {
-          playbackElement.fastSeek(targetMediaTime);
-        } else {
-          playbackElement.currentTime = targetMediaTime;
-        }
+        playbackElement.currentTime = targetMediaTime;
         return true;
       } catch (error) {}
       return false;

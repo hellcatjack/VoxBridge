@@ -2359,17 +2359,6 @@ def test_listener_page_forces_persistent_audio_to_normal_playback_rate():
     assert "effectivePlaybackRate" not in TTS_LISTENER_HTML
 
 
-def test_listener_page_compacts_buffered_waiting_gap_without_retry_state_machine():
-    assert "function compactBufferedWaitingGap(" in TTS_LISTENER_HTML
-    assert "playbackElement.fastSeek(targetMediaTime)" in TTS_LISTENER_HTML
-    for removed in (
-        "pendingSilenceCompaction",
-        "silenceCompactionRecoveryTimer",
-        "requestPendingSilencePlayback",
-    ):
-        assert removed not in TTS_LISTENER_HTML
-
-
 def test_listener_page_uses_one_native_hls_element_without_sentence_blob_queue():
     assert 'id="ttsPlayback"' in TTS_LISTENER_HTML
     assert "playsinline" in TTS_LISTENER_HTML

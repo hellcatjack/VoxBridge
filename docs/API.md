@@ -211,7 +211,8 @@ translation. It never includes the normal sentence pause or model edge silence.
 `resume_at_ms` is `null` when no such carrier exists; otherwise it is the absolute
 program-time point after the disposable carrier from which only the still-unheard
 part of the natural gap must be preserved. If the actual wait already covered the
-natural gap, the browser targets the next speech start and adds no extra pause.
+natural gap, hls.js targets the next speech start. Native Safari reserves at most
+`250ms` before that start for AAC decoder pre-roll so the first phoneme is not clipped.
 
 On Safari, the listener maps the native media timeline to an absolute playhead
 using `getStartDate() + currentTime` and selects the newest cue whose start is
@@ -222,12 +223,13 @@ when the media element cannot provide a valid start date. The page therefore
 displays what that device is hearing instead of the newest server translation.
 Between cues it keeps the previous sentence visible without clearing, dimming,
 or flashing the text. When both `resume_at_ms` and the next second of speech are
-inside one media buffer range, the page performs an immediately buffered seek.
-Otherwise it seeks as soon as the target and `100ms` beyond the next speech start
-are inside one media `seekable` range, allowing native HLS or hls.js to load the
-target fragment instead of consuming accumulated idle carrier. Each cue is
-attempted at most once. The page never changes the fixed `1.0` media rate and has
-no custom pause/play/retry recovery loop. The response uses `Cache-Control:
+inside one media buffer range, the page performs an immediately buffered, precise
+`currentTime` seek. Otherwise it seeks as soon as the target and `100ms` beyond the
+next speech start are inside one media `seekable` range, allowing native HLS or
+hls.js to load the target fragment instead of consuming accumulated idle carrier.
+The page never uses approximate `fastSeek()` for this speech-boundary operation.
+Each cue is attempted at most once. The page never changes the fixed `1.0` media
+rate and has no custom pause/play/retry recovery loop. The response uses `Cache-Control:
 no-store`. Caption
 polling is advisory and does not gate HLS audio; lock-screen playback continues
 if polling is suspended or temporarily fails.
