@@ -170,8 +170,9 @@ def test_public_docs_describe_optional_kokoro_tts_contract():
     assert "300ms" in deployment
     assert "one FFmpeg" in deployment
     assert "90-second lease" in deployment
-    assert "10-<30s = 1.2x" in deployment
-    assert ">=40s = 1.5x" in deployment
+    assert "6-<15s = 1.2x" in deployment
+    assert "15-<20s = 1.4x" in deployment
+    assert ">=20s = 1.5x" in deployment
     assert "live-edge" in deployment
     assert "caption cue" in deployment.lower()
     assert "getStartDate()" in deployment

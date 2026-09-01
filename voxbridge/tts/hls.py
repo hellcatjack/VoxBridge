@@ -36,11 +36,11 @@ def select_global_tts_multiplier(backlog_ms: int) -> float:
     """Return the shared Auto multiplier for conservative unpublished speech."""
 
     value = max(0, int(backlog_ms))
-    if value >= 40_000:
+    if value >= 20_000:
         return 1.5
-    if value >= 30_000:
+    if value >= 15_000:
         return 1.4
-    if value >= 10_000:
+    if value >= 6_000:
         return 1.2
     return 1.0
 

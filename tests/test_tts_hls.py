@@ -152,12 +152,12 @@ async def wait_until(predicate, *, timeout: float = 1.0) -> None:
     ("backlog_ms", "expected"),
     [
         (0, 1.0),
-        (9_999, 1.0),
-        (10_000, 1.2),
-        (29_999, 1.2),
-        (30_000, 1.4),
-        (39_999, 1.4),
-        (40_000, 1.5),
+        (5_999, 1.0),
+        (6_000, 1.2),
+        (14_999, 1.2),
+        (15_000, 1.4),
+        (19_999, 1.4),
+        (20_000, 1.5),
     ],
 )
 def test_global_tts_multiplier_boundaries(backlog_ms, expected):

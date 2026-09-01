@@ -409,8 +409,8 @@ larger of the language default or recently measured baseline speech time per
 character with a 10% safety margin. It excludes device HLS lag, network delay,
 and already published media.
 
-At sentence synthesis start, global Auto selects `<10s = 1.0x`,
-`10-<30s = 1.2x`, `30-<40s = 1.4x`, or `>=40s = 1.5x` from that conservative
+At sentence synthesis start, global Auto selects `<6s = 1.0x`,
+`6-<15s = 1.2x`, `15-<20s = 1.4x`, or `>=20s = 1.5x` from that conservative
 server backlog. The response exposes `speech_epoch_id`, `global_speed_mode`,
 `global_speed_multiplier`, and `tts_effective_speed`. A phone that is buffering
 cannot change these values. When there are no listeners, the active backlog and
