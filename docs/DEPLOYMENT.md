@@ -600,6 +600,43 @@ opaque job identifiers. Application TTS logs retain only short SHA-256
 fingerprints and queue counts; do not replace this with a proxy access log that
 records unredacted `/api/tts/` paths.
 
+### Diagnose multiple listeners
+
+All listener devices share one Kokoro worker, one FFmpeg encoder, one speech
+epoch, and the same ordered HLS media. Confirm the server-side state first:
+
+```bash
+curl --fail --silent http://127.0.0.1:8024/api/tts/live/status
+```
+
+Use `listener_count` only to confirm active leases. A common non-empty
+`speech_epoch_id`, `encoder_active: true`, `producer_active: true`, and no
+`last_error` confirm that the listeners are attached to the same server
+timeline. `global_speed_multiplier` and `tts_effective_speed` are also shared;
+one device does not own or independently change Auto speed.
+
+Do not interpret `pending_audio_ms` or `translated_audio_backlog_ms` as a
+device's listening delay. Both end when speech is published into HLS and exclude
+media already buffered by a browser. Likewise, consecutive segment downloads
+near the live edge prove that delivery is healthy but do not prove that the
+device's audible playhead is at that edge: native iPhone HLS may prefetch newer
+segments while playing older buffered media.
+
+The server guarantees common content and ordering, not sample-accurate speaker
+synchronization. Native iPhone HLS and desktop hls.js maintain independent
+playheads, buffer policies, background recovery, and safe carrier-gap seeks, so
+small progress differences are expected and do not indicate duplicated TTS or
+listener contention. If one device is materially behind, Stop and Start only
+that listener to rejoin the current live edge; this does not reset the shared
+epoch while another lease remains. Do not restart the backend or add hard
+live-edge jumps solely from the backlog fields, because an unguarded jump can
+clip translated speech.
+
+Exact drift diagnosis requires client playback telemetry such as program time,
+`currentTime`, seekable end, buffered ranges, and the result of the last safe
+gap compaction. Keep bearer listener IDs out of persistent logs when collecting
+that telemetry.
+
 ## 7. Upgrade and rollback
 
 Before an upgrade, stop active browser sessions cleanly. Then:
