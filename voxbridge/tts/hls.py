@@ -115,6 +115,32 @@ class HLSStreamStatus:
     last_error: str
 
 
+@dataclass(frozen=True, slots=True)
+class _HLSMediaSegment:
+    sequence: int
+    name: str
+    start_at_ms: int
+    end_at_ms: int
+    duration_ms: int
+    block_start: int
+
+
+@dataclass(frozen=True, slots=True)
+class _HLSMediaPlaylist:
+    text: str
+    lines: tuple[str, ...]
+    media_sequence_line: int
+    target_duration_ms: int
+    segments: tuple[_HLSMediaSegment, ...]
+
+
+@dataclass(slots=True)
+class _HLSListenerPlayback:
+    last_segment_name: str | None = None
+    last_segment_number: int = -1
+    playlist_floor_sequence: int | None = None
+
+
 class HLSEncoder(Protocol):
     root: Path
 
@@ -254,6 +280,211 @@ def _parse_hls_timeline_bounds_at_ms(
     if first_start_ms is None or last_end_ms is None:
         return None
     return first_start_ms, last_end_ms
+
+
+def _parse_hls_media_playlist(playlist: str) -> _HLSMediaPlaylist | None:
+    """Parse the FFmpeg live-playlist metadata needed for safe prefix removal."""
+
+    text = str(playlist or "")
+    lines = tuple(text.splitlines())
+    target_duration_ms: int | None = None
+    media_sequence: int | None = None
+    media_sequence_line: int | None = None
+    pending_duration_ms: int | None = None
+    pending_program_time: datetime | None = None
+    pending_block_start: int | None = None
+    segments: list[_HLSMediaSegment] = []
+
+    for line_index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line in {"#EXT-X-DISCONTINUITY", "#EXT-X-ENDLIST"} or line.startswith(
+            (
+                "#EXT-X-PLAYLIST-TYPE:",
+                "#EXT-X-KEY:",
+                "#EXT-X-MAP:",
+                "#EXT-X-BYTERANGE:",
+                "#EXT-X-GAP",
+            )
+        ):
+            return None
+        if line.startswith("#EXT-X-TARGETDURATION:"):
+            try:
+                value = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+            if value <= 0:
+                return None
+            target_duration_ms = value * 1000
+            continue
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                value = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+            if value < 0:
+                return None
+            media_sequence = value
+            media_sequence_line = line_index
+            continue
+        if line.startswith("#EXTINF:"):
+            if pending_block_start is None:
+                pending_block_start = line_index
+            try:
+                duration_sec = float(
+                    line.split(":", 1)[1].split(",", 1)[0].strip()
+                )
+            except ValueError:
+                return None
+            if not math.isfinite(duration_sec) or duration_sec <= 0:
+                return None
+            pending_duration_ms = round(duration_sec * 1000.0)
+            continue
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            if pending_block_start is None:
+                pending_block_start = line_index
+            value = line.split(":", 1)[1].strip()
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                return None
+            pending_program_time = parsed
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if (
+            media_sequence is None
+            or pending_duration_ms is None
+            or pending_program_time is None
+            or pending_block_start is None
+        ):
+            return None
+        start_at_ms = round(pending_program_time.timestamp() * 1000.0)
+        segments.append(
+            _HLSMediaSegment(
+                sequence=media_sequence + len(segments),
+                name=Path(line).name,
+                start_at_ms=start_at_ms,
+                end_at_ms=start_at_ms + pending_duration_ms,
+                duration_ms=pending_duration_ms,
+                block_start=pending_block_start,
+            )
+        )
+        pending_duration_ms = None
+        pending_program_time = None
+        pending_block_start = None
+
+    if (
+        target_duration_ms is None
+        or media_sequence is None
+        or media_sequence_line is None
+        or not segments
+    ):
+        return None
+    return _HLSMediaPlaylist(
+        text=text,
+        lines=lines,
+        media_sequence_line=media_sequence_line,
+        target_duration_ms=target_duration_ms,
+        segments=tuple(segments),
+    )
+
+
+def _trim_hls_playlist(
+    playlist: _HLSMediaPlaylist,
+    *,
+    floor_sequence: int,
+) -> str:
+    """Remove a parsed live-playlist prefix while preserving original blocks."""
+
+    retained = next(
+        (
+            segment
+            for segment in playlist.segments
+            if segment.sequence >= int(floor_sequence)
+        ),
+        None,
+    )
+    if retained is None or retained.sequence <= playlist.segments[0].sequence:
+        return playlist.text
+    lines = list(playlist.lines[: playlist.segments[0].block_start])
+    lines[playlist.media_sequence_line] = (
+        f"#EXT-X-MEDIA-SEQUENCE:{retained.sequence}"
+    )
+    lines.extend(playlist.lines[retained.block_start :])
+    suffix = "\n" if playlist.text.endswith(("\n", "\r")) else ""
+    return "\n".join(lines) + suffix
+
+
+def _hls_segment_number(name: str) -> int | None:
+    value = Path(str(name or "")).name
+    prefix = "segment_"
+    suffix = ".ts"
+    if not value.startswith(prefix) or not value.endswith(suffix):
+        return None
+    digits = value[len(prefix) : -len(suffix)]
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _select_hls_gap_floor_sequence(
+    playlist: _HLSMediaPlaylist,
+    *,
+    last_segment_name: str | None,
+    cues: tuple[HLSCaptionCue, ...],
+) -> int | None:
+    """Choose the latest currently legal prefix floor for confirmed carrier."""
+
+    if last_segment_name is None or len(cues) < 2:
+        return None
+    last_index = next(
+        (
+            index
+            for index, segment in enumerate(playlist.segments)
+            if segment.name == last_segment_name
+        ),
+        None,
+    )
+    if last_index is None:
+        return None
+    last_segment = playlist.segments[last_index]
+
+    minimum_window_ms = playlist.target_duration_ms * 3
+    retained_duration_ms = 0
+    latest_window_floor_index: int | None = None
+    for index in range(len(playlist.segments) - 1, -1, -1):
+        retained_duration_ms += playlist.segments[index].duration_ms
+        if retained_duration_ms >= minimum_window_ms:
+            latest_window_floor_index = index
+            break
+    if latest_window_floor_index is None:
+        return None
+
+    for previous, current in zip(cues, cues[1:]):
+        resume_at_ms = current.resume_at_ms
+        if current.discardable_gap_before_ms <= 0 or resume_at_ms is None:
+            continue
+        if last_segment.start_at_ms < previous.end_at_ms:
+            continue
+        if last_segment.end_at_ms > resume_at_ms:
+            continue
+        resume_index = next(
+            (
+                index
+                for index, segment in enumerate(playlist.segments)
+                if segment.end_at_ms > resume_at_ms
+            ),
+            None,
+        )
+        if resume_index is None:
+            continue
+        floor_index = min(resume_index, latest_window_floor_index)
+        if floor_index <= last_index:
+            return None
+        return playlist.segments[floor_index].sequence
+    return None
 
 
 def parse_hls_timeline_origin_at_ms(playlist: str) -> int | None:
@@ -658,6 +889,9 @@ class SharedHLSTTSPublisher:
         self._clock = clock
         self._worker_start_gate = worker_start_gate
         self._leases: dict[str, HLSListenerLease] = {}
+        self._listener_playback: dict[str, _HLSListenerPlayback] = {}
+        self._playlist_cache_text: str | None = None
+        self._playlist_cache: _HLSMediaPlaylist | None = None
         self._queue: asyncio.Queue[TTSReadyItem] = asyncio.Queue(maxsize=int(queue_size))
         self._preparation_cache_size = int(preparation_cache_size)
         self._caption_cues: deque[HLSCaptionCue] = deque(
@@ -917,6 +1151,7 @@ class SharedHLSTTSPublisher:
                 expires_at=self._clock() + self._listener_ttl_sec,
             )
             self._leases[listener] = lease
+            self._listener_playback.setdefault(listener, _HLSListenerPlayback())
             return lease
 
     def _require_lease(self, listener_id: str, owner_key: str) -> HLSListenerLease:
@@ -1014,18 +1249,56 @@ class SharedHLSTTSPublisher:
         await encoder.wait_ready(timeout)
 
     def playlist_text(self, listener_id: str, owner_key: str) -> str:
-        self._require_lease(listener_id, owner_key)
+        lease = self._require_lease(listener_id, owner_key)
         encoder = self._encoder
         if encoder is None:
             raise HLSUnavailable("shared HLS encoder is unavailable")
-        return encoder.playlist_text()
+        playlist = encoder.playlist_text()
+        if playlist != self._playlist_cache_text:
+            self._playlist_cache_text = playlist
+            self._playlist_cache = _parse_hls_media_playlist(playlist)
+        parsed = self._playlist_cache
+        state = self._listener_playback.get(lease.listener_id)
+        if parsed is None or state is None:
+            return playlist
+        candidate = _select_hls_gap_floor_sequence(
+            parsed,
+            last_segment_name=state.last_segment_name,
+            cues=tuple(self._caption_cues),
+        )
+        previous_floor = state.playlist_floor_sequence
+        if candidate is not None and (
+            previous_floor is None or candidate > previous_floor
+        ):
+            state.playlist_floor_sequence = candidate
+            logger.info(
+                "shared HLS listener gap compacted epoch=%s listener=%s last_segment=%s floor_sequence=%d",
+                self._speech_epoch_id,
+                lease.listener_id,
+                state.last_segment_name,
+                candidate,
+            )
+        floor = state.playlist_floor_sequence
+        if floor is None:
+            return playlist
+        return _trim_hls_playlist(parsed, floor_sequence=floor)
 
     def segment_path(self, listener_id: str, owner_key: str, name: str) -> Path:
-        self._require_lease(listener_id, owner_key)
+        lease = self._require_lease(listener_id, owner_key)
         encoder = self._encoder
         if encoder is None:
             raise HLSUnavailable("shared HLS encoder is unavailable")
-        return encoder.segment_path(name)
+        path = encoder.segment_path(name)
+        segment_number = _hls_segment_number(name)
+        state = self._listener_playback.get(lease.listener_id)
+        if (
+            state is not None
+            and segment_number is not None
+            and segment_number > state.last_segment_number
+        ):
+            state.last_segment_name = Path(str(name)).name
+            state.last_segment_number = segment_number
+        return path
 
     def caption_snapshot(
         self,
@@ -1053,6 +1326,7 @@ class SharedHLSTTSPublisher:
             if existing is None or existing.owner_key != owner:
                 return False
             del self._leases[listener]
+            self._listener_playback.pop(listener, None)
             should_stop = not self._leases
         if should_stop:
             await self._stop_stream()
@@ -1066,6 +1340,7 @@ class SharedHLSTTSPublisher:
             for listener_id, lease in list(self._leases.items()):
                 if lease.expires_at <= now:
                     del self._leases[listener_id]
+                    self._listener_playback.pop(listener_id, None)
                     removed += 1
             should_stop = removed > 0 and not self._leases
         if should_stop:
@@ -1357,6 +1632,9 @@ class SharedHLSTTSPublisher:
             self._known_items.clear()
             self._latest_key_by_sentence.clear()
             self._caption_cues.clear()
+            self._listener_playback.clear()
+            self._playlist_cache_text = None
+            self._playlist_cache = None
             self._work_available.clear()
         current = asyncio.current_task()
         for task in (worker, reaper):
@@ -1377,6 +1655,9 @@ class SharedHLSTTSPublisher:
                 return
             self._closed = True
             self._leases.clear()
+            self._listener_playback.clear()
+            self._playlist_cache_text = None
+            self._playlist_cache = None
         await self._stop_stream()
         while True:
             try:

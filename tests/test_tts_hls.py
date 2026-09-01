@@ -140,12 +140,382 @@ def ready_item(
     )
 
 
+FFMPEG_LIVE_PLAYLIST = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:1
+#EXT-X-MEDIA-SEQUENCE:10
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:39.000+00:00
+segment_000000010.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:40.000+00:00
+segment_000000011.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:41.000+00:00
+segment_000000012.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:42.000+00:00
+segment_000000013.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:43.000+00:00
+segment_000000014.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:44.000+00:00
+segment_000000015.ts
+"""
+
+FFMPEG_GAP_PLAYLIST = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:1
+#EXT-X-MEDIA-SEQUENCE:10
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:39.000+00:00
+segment_000000010.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:40.000+00:00
+segment_000000011.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:41.000+00:00
+segment_000000012.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:42.000+00:00
+segment_000000013.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:43.000+00:00
+segment_000000014.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:44.000+00:00
+segment_000000015.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:45.000+00:00
+segment_000000016.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:46.000+00:00
+segment_000000017.ts
+#EXTINF:1.000000,
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:47.000+00:00
+segment_000000018.ts
+"""
+
+
+def test_media_playlist_parser_maps_sequence_and_program_time():
+    parsed = hls_module._parse_hls_media_playlist(FFMPEG_LIVE_PLAYLIST)
+
+    assert parsed is not None
+    assert parsed.target_duration_ms == 1_000
+    assert [segment.sequence for segment in parsed.segments] == [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+    ]
+    assert parsed.segments[0].name == "segment_000000010.ts"
+    assert parsed.segments[0].start_at_ms == 99_000
+    assert parsed.segments[0].end_at_ms == 100_000
+    assert parsed.segments[-1].start_at_ms == 104_000
+    assert parsed.segments[-1].end_at_ms == 105_000
+
+
+def test_trim_hls_playlist_removes_only_prefix_and_updates_media_sequence():
+    parsed = hls_module._parse_hls_media_playlist(FFMPEG_LIVE_PLAYLIST)
+
+    trimmed = hls_module._trim_hls_playlist(parsed, floor_sequence=13)
+
+    assert "#EXT-X-MEDIA-SEQUENCE:13\n" in trimmed
+    assert "#EXT-X-TARGETDURATION:1\n" in trimmed
+    assert "segment_000000010.ts" not in trimmed
+    assert "segment_000000011.ts" not in trimmed
+    assert "segment_000000012.ts" not in trimmed
+    assert "segment_000000013.ts" in trimmed
+    assert "segment_000000014.ts" in trimmed
+    assert "segment_000000015.ts" in trimmed
+    reparsed = hls_module._parse_hls_media_playlist(trimmed)
+    assert reparsed is not None
+    assert sum(segment.duration_ms for segment in reparsed.segments) == 3_000
+
+
+@pytest.mark.parametrize(
+    "playlist",
+    [
+        FFMPEG_LIVE_PLAYLIST.replace("#EXT-X-MEDIA-SEQUENCE:10\n", ""),
+        FFMPEG_LIVE_PLAYLIST.replace("#EXT-X-TARGETDURATION:1\n", ""),
+        FFMPEG_LIVE_PLAYLIST.replace(
+            "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:39.000+00:00\n",
+            "",
+        ),
+        FFMPEG_LIVE_PLAYLIST.replace(
+            "#EXT-X-VERSION:6\n",
+            "#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:EVENT\n",
+        ),
+        FFMPEG_LIVE_PLAYLIST.replace(
+            "#EXTINF:1.000000,\n",
+            "#EXT-X-DISCONTINUITY\n#EXTINF:1.000000,\n",
+            1,
+        ),
+        FFMPEG_LIVE_PLAYLIST.replace(
+            "#EXTINF:1.000000,\n",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1.000000,\n",
+            1,
+        ),
+        FFMPEG_LIVE_PLAYLIST.replace(
+            "#EXTINF:1.000000,\n",
+            "#EXT-X-BYTERANGE:1000@0\n#EXTINF:1.000000,\n",
+            1,
+        ),
+    ],
+)
+def test_media_playlist_parser_rejects_metadata_needed_for_safe_trim(playlist):
+    assert hls_module._parse_hls_media_playlist(playlist) is None
+
+
 async def wait_until(predicate, *, timeout: float = 1.0) -> None:
     async def _wait() -> None:
         while not predicate():
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(_wait(), timeout=timeout)
+
+
+async def publisher_with_confirmed_gap(
+    tmp_path,
+    *listener_ids: str,
+    clock: FakeClock | None = None,
+):
+    encoders: list[FakeEncoder] = []
+
+    def encoder_factory(root):
+        encoder = FakeEncoder(root)
+        encoders.append(encoder)
+        return encoder
+
+    publisher = SharedHLSTTSPublisher(
+        synthesizer=FakeSynthesizer(make_wav(duration_ms=100)),
+        root_dir=tmp_path,
+        encoder_factory=encoder_factory,
+        listener_ttl_sec=60,
+        sentence_pause_ms=0,
+        clock=clock or FakeClock(),
+    )
+    for listener_id in listener_ids:
+        await publisher.touch_listener(listener_id, f"owner-{listener_id}")
+    encoder = encoders[0]
+    await publisher.publish(ready_item(1))
+    await wait_until(
+        lambda: len(
+            publisher.caption_snapshot(
+                listener_ids[0],
+                f"owner-{listener_ids[0]}",
+            ).cues
+        )
+        == 1
+    )
+    encoder.next_discardable_gap_before_ms = 4_000
+    await publisher.publish(ready_item(2))
+    await wait_until(
+        lambda: len(
+            publisher.caption_snapshot(
+                listener_ids[0],
+                f"owner-{listener_ids[0]}",
+            ).cues
+        )
+        == 2
+    )
+    (encoder.root / "index.m3u8").write_text(
+        FFMPEG_GAP_PLAYLIST,
+        encoding="utf-8",
+    )
+    return publisher, encoder
+
+
+@pytest.mark.asyncio
+async def test_listener_playlist_compacts_confirmed_gap_with_hls_window(tmp_path):
+    publisher, _ = await publisher_with_confirmed_gap(tmp_path, "iphone-a")
+    try:
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000012.ts",
+        )
+
+        playlist = publisher.playlist_text("iphone-a", "owner-iphone-a")
+
+        assert "#EXT-X-MEDIA-SEQUENCE:15\n" in playlist
+        assert "segment_000000014.ts" not in playlist
+        assert "segment_000000015.ts" in playlist
+        parsed = hls_module._parse_hls_media_playlist(playlist)
+        assert parsed is not None
+        assert sum(segment.duration_ms for segment in parsed.segments) == 4_000
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_playlist_keeps_three_target_durations_at_live_tail(tmp_path):
+    publisher, encoder = await publisher_with_confirmed_gap(tmp_path, "iphone-a")
+    try:
+        shortened = FFMPEG_GAP_PLAYLIST.split(
+            "#EXTINF:1.000000,\n"
+            "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:01:46.000+00:00\n",
+            1,
+        )[0]
+        (encoder.root / "index.m3u8").write_text(shortened, encoding="utf-8")
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000012.ts",
+        )
+
+        playlist = publisher.playlist_text("iphone-a", "owner-iphone-a")
+
+        assert "#EXT-X-MEDIA-SEQUENCE:14\n" in playlist
+        parsed = hls_module._parse_hls_media_playlist(playlist)
+        assert parsed is not None
+        assert sum(segment.duration_ms for segment in parsed.segments) == 3_000
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_playlist_preserves_speech_until_carrier_is_requested(tmp_path):
+    publisher, _ = await publisher_with_confirmed_gap(tmp_path, "iphone-a")
+    try:
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000011.ts",
+        )
+
+        playlist = publisher.playlist_text("iphone-a", "owner-iphone-a")
+
+        assert "#EXT-X-MEDIA-SEQUENCE:10\n" in playlist
+        assert "segment_000000010.ts" in playlist
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_playlist_isolated_and_progress_is_monotonic(tmp_path):
+    publisher, _ = await publisher_with_confirmed_gap(
+        tmp_path,
+        "iphone-a",
+        "iphone-b",
+    )
+    try:
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000012.ts",
+        )
+        compacted = publisher.playlist_text("iphone-a", "owner-iphone-a")
+        untouched = publisher.playlist_text("iphone-b", "owner-iphone-b")
+
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000011.ts",
+        )
+        after_old_retry = publisher.playlist_text(
+            "iphone-a",
+            "owner-iphone-a",
+        )
+
+        assert "#EXT-X-MEDIA-SEQUENCE:15\n" in compacted
+        assert "#EXT-X-MEDIA-SEQUENCE:10\n" in untouched
+        assert "#EXT-X-MEDIA-SEQUENCE:15\n" in after_old_retry
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_playlists_parse_each_shared_manifest_version_once(
+    tmp_path,
+    monkeypatch,
+):
+    publisher, _ = await publisher_with_confirmed_gap(
+        tmp_path,
+        "iphone-a",
+        "iphone-b",
+    )
+    real_parser = hls_module._parse_hls_media_playlist
+    parse_calls = 0
+
+    def counting_parser(playlist):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parser(playlist)
+
+    monkeypatch.setattr(hls_module, "_parse_hls_media_playlist", counting_parser)
+    try:
+        publisher.playlist_text("iphone-a", "owner-iphone-a")
+        publisher.playlist_text("iphone-b", "owner-iphone-b")
+
+        assert parse_calls == 1
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_playback_state_resets_after_remove_and_rejoin(tmp_path):
+    publisher, _ = await publisher_with_confirmed_gap(
+        tmp_path,
+        "iphone-a",
+        "iphone-b",
+    )
+    try:
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000012.ts",
+        )
+        assert "#EXT-X-MEDIA-SEQUENCE:15\n" in publisher.playlist_text(
+            "iphone-a",
+            "owner-iphone-a",
+        )
+
+        assert await publisher.remove_listener(
+            "iphone-a",
+            "owner-iphone-a",
+        )
+        await publisher.touch_listener("iphone-a", "owner-iphone-a")
+
+        rejoined = publisher.playlist_text("iphone-a", "owner-iphone-a")
+        assert "#EXT-X-MEDIA-SEQUENCE:10\n" in rejoined
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_playback_state_resets_after_expiry_and_rejoin(tmp_path):
+    clock = FakeClock()
+    publisher, _ = await publisher_with_confirmed_gap(
+        tmp_path,
+        "iphone-a",
+        "iphone-b",
+        clock=clock,
+    )
+    try:
+        publisher.segment_path(
+            "iphone-a",
+            "owner-iphone-a",
+            "segment_000000012.ts",
+        )
+        assert "#EXT-X-MEDIA-SEQUENCE:15\n" in publisher.playlist_text(
+            "iphone-a",
+            "owner-iphone-a",
+        )
+
+        clock.value = 150.0
+        await publisher.touch_listener("iphone-b", "owner-iphone-b")
+        clock.value = 161.0
+        assert await publisher.prune_expired() == 1
+        await publisher.touch_listener("iphone-a", "owner-iphone-a")
+
+        rejoined = publisher.playlist_text("iphone-a", "owner-iphone-a")
+        assert "#EXT-X-MEDIA-SEQUENCE:10\n" in rejoined
+    finally:
+        await publisher.close()
 
 
 @pytest.mark.parametrize(
