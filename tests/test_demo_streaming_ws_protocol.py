@@ -94,9 +94,17 @@ class _FakeTranslator:
 class _FakeTTSSynthesizer:
     def __init__(self):
         self.calls = []
+        self.speed_calls = []
 
-    def synthesize(self, text: str, target_language: str):
+    def synthesize(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        speed: float | None = None,
+    ):
         self.calls.append((text, target_language))
+        self.speed_calls.append((text, target_language, speed))
         return SynthesizedAudio(b"RIFF-fake-wav", sample_rate=24000, duration_ms=750)
 
 
@@ -2215,8 +2223,8 @@ def test_shared_hls_playlist_and_segments_are_public_capabilities(tmp_path):
 
 def test_public_hls_caption_feed_requires_matching_listener_lease(tmp_path):
     class ValidHLSSynthesizer:
-        def synthesize(self, text, target_language):
-            del text, target_language
+        def synthesize(self, text, target_language, *, speed=None):
+            del text, target_language, speed
             return SynthesizedAudio(
                 _silent_wav_bytes(250),
                 sample_rate=24000,
@@ -2306,6 +2314,11 @@ def test_removing_one_hls_listener_does_not_stop_shared_encoder(tmp_path):
     args.tts_hls_encoder_factory = encoder_factory
     app = _create_app(args, _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
     with TestClient(app) as client:
+        idle = client.get("/api/tts/live/status").json()
+        assert idle["speech_epoch_id"] == ""
+        assert idle["translated_audio_backlog_ms"] == 0
+        assert idle["translated_audio_backlog_count"] == 0
+
         first = "/api/tts/live/iphone-a-12345678/index.m3u8"
         second = "/api/tts/live/iphone-b-12345678/index.m3u8"
         assert client.get(first).status_code == 200
@@ -2329,8 +2342,27 @@ def test_removing_one_hls_listener_does_not_stop_shared_encoder(tmp_path):
         assert status["translated_audio_backlog_ms"] == 1750
         assert status["translated_audio_backlog_count"] == 0
         assert status["translated_audio_backlog_estimated"] is False
+        assert status["speech_epoch_id"].startswith("epoch-")
+        assert status["global_speed_mode"] == "auto"
+        assert status["global_speed_multiplier"] == 1.0
+        assert status["tts_effective_speed"] == pytest.approx(1.05)
 
     assert encoders[0].closed == 1
+
+
+def test_shared_hls_uses_configured_baseline_and_global_auto_rollback(tmp_path):
+    args = _args()
+    args.tts_hls_root_dir = str(tmp_path)
+    args.tts_speed = 1.1
+    args.disable_tts_global_auto_speed = True
+    args.tts_hls_encoder_factory = lambda root: _FakeHLSEncoder(root)
+
+    app = _create_app(args, _FakeASR(), tts_synthesizer=_FakeTTSSynthesizer())
+
+    status = app.state.tts_hls.status
+    assert status.global_speed_mode == "fixed"
+    assert status.global_speed_multiplier == 1.0
+    assert status.tts_effective_speed == pytest.approx(1.1)
 
 
 def test_broadcast_audio_is_shared_across_authenticated_listeners():

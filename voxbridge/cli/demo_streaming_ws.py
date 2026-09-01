@@ -5402,6 +5402,10 @@ def _create_app(
             0,
             int(getattr(args, "tts_hls_sentence_pause_ms", 300)),
         ),
+        baseline_tts_speed=float(getattr(args, "tts_speed", 1.05)),
+        auto_speed_enabled=not bool(
+            getattr(args, "disable_tts_global_auto_speed", False)
+        ),
     )
     asr_tokenizer = getattr(getattr(asr, "processor", None), "tokenizer", None)
     runtime = SimpleNamespace(active_connections=0)
@@ -5727,6 +5731,10 @@ def _create_app(
                 "translated_audio_backlog_estimated": bool(
                     status.translated_audio_backlog_estimated
                 ),
+                "speech_epoch_id": str(status.speech_epoch_id),
+                "global_speed_mode": str(status.global_speed_mode),
+                "global_speed_multiplier": float(status.global_speed_multiplier),
+                "tts_effective_speed": float(status.tts_effective_speed),
                 "encoder_active": bool(status.encoder_active),
                 "producer_active": bool(app.state.tts_broadcast.producer_active),
                 "last_error": str(status.last_error),
@@ -12869,6 +12877,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tts-en-voice", default="am_michael", help="English Kokoro voice")
     p.add_argument("--tts-zh-voice", default="zf_001", help="Chinese Kokoro voice")
     p.add_argument("--tts-speed", type=float, default=1.05, help="Kokoro speaking speed")
+    p.add_argument(
+        "--disable-tts-global-auto-speed",
+        action="store_true",
+        help="Use the configured fixed Kokoro speed for shared listener audio",
+    )
     p.add_argument(
         "--tts-cpu-threads",
         type=int,
