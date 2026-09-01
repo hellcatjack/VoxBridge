@@ -536,6 +536,8 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     const CAPTION_POLL_INTERVAL_MS = 500;
     const PLAYBACK_INTERRUPTION_STATUS_HOLD_MS = 1500;
     const MIN_CAPTION_FONT_PX = 8;
+    const MIN_DISCARDABLE_GAP_MS = 500;
+    const NEXT_SPEECH_BUFFER_GUARD_MS = 1000;
 
     let listenerId = "";
     let running = false;
@@ -548,6 +550,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let captionSnapshot = null;
     let captionCueId = "";
     let captionResizeFrame = null;
+    const attemptedGapCueKeys = new Set();
     let hlsController = null;
     let serverTranslatedAudioBacklogSec = 0;
     let globalSpeedMode = "Auto";
@@ -710,12 +713,93 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       revealCaption();
     }
 
+    function bufferedRangeContainsBoth(targetMediaTime, guardedMediaTime) {
+      const ranges = playbackElement.buffered;
+      if (!ranges) return false;
+      try {
+        for (let index = 0; index < ranges.length; index += 1) {
+          const start = Number(ranges.start(index));
+          const end = Number(ranges.end(index));
+          if (
+            Number.isFinite(start)
+            && Number.isFinite(end)
+            && targetMediaTime >= start
+            && targetMediaTime <= end
+            && guardedMediaTime >= start
+            && guardedMediaTime <= end
+          ) {
+            return true;
+          }
+        }
+      } catch (error) {}
+      return false;
+    }
+
+    function compactBufferedWaitingGap(playheadAtMs, previousCue, nextCue) {
+      if (!running || !playbackStarted || !previousCue || !nextCue) return false;
+      const previousEndAtMs = Number(previousCue.end_at_ms);
+      const nextStartAtMs = Number(nextCue.start_at_ms);
+      const resumeAtMs = Number(nextCue.resume_at_ms);
+      const discardableGapMs = Number(nextCue.discardable_gap_before_ms);
+      if (
+        !Number.isFinite(playheadAtMs)
+        || !Number.isFinite(previousEndAtMs)
+        || !Number.isFinite(nextStartAtMs)
+        || !Number.isFinite(resumeAtMs)
+        || !Number.isFinite(discardableGapMs)
+        || discardableGapMs < MIN_DISCARDABLE_GAP_MS
+        || resumeAtMs < previousEndAtMs
+        || resumeAtMs > nextStartAtMs
+        || playheadAtMs < previousEndAtMs
+        || playheadAtMs >= nextStartAtMs
+      ) {
+        return false;
+      }
+      const nextCueKey = String(
+        nextCue.cue_id || `${nextStartAtMs}:${resumeAtMs}`
+      );
+      if (attemptedGapCueKeys.has(nextCueKey)) return false;
+
+      const naturalGapMs = Math.max(0, nextStartAtMs - resumeAtMs);
+      const heardGapMs = Math.max(0, playheadAtMs - previousEndAtMs);
+      const remainingNaturalMs = Math.max(0, naturalGapMs - heardGapMs);
+      const targetProgramAtMs = nextStartAtMs - remainingNaturalMs;
+      const currentTime = Number(playbackElement.currentTime);
+      if (!Number.isFinite(currentTime) || targetProgramAtMs <= playheadAtMs) {
+        return false;
+      }
+      const targetMediaTime = currentTime
+        + (targetProgramAtMs - playheadAtMs) / 1000;
+      const guardedMediaTime = currentTime
+        + (nextStartAtMs + NEXT_SPEECH_BUFFER_GUARD_MS - playheadAtMs) / 1000;
+      if (
+        !Number.isFinite(targetMediaTime)
+        || !Number.isFinite(guardedMediaTime)
+        || targetMediaTime <= currentTime
+        || !bufferedRangeContainsBoth(targetMediaTime, guardedMediaTime)
+      ) {
+        return false;
+      }
+
+      attemptedGapCueKeys.add(nextCueKey);
+      try {
+        if (typeof playbackElement.fastSeek === "function") {
+          playbackElement.fastSeek(targetMediaTime);
+        } else {
+          playbackElement.currentTime = targetMediaTime;
+        }
+        return true;
+      } catch (error) {}
+      return false;
+    }
+
     function applyCaptionSnapshot(snapshot, requestListenerId) {
       if (!running || !requestListenerId || requestListenerId !== listenerId) return;
       const playheadAtMs = estimatedPlaybackAtMs(snapshot);
       if (playheadAtMs === null) return;
       const cues = Array.isArray(snapshot && snapshot.cues) ? snapshot.cues : [];
       let selected = null;
+      let next = null;
       for (const cue of cues) {
         const startAtMs = Number(cue && cue.start_at_ms);
         if (!Number.isFinite(startAtMs)) continue;
@@ -724,6 +808,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
           && (selected === null || startAtMs >= Number(selected.start_at_ms))
         ) {
           selected = cue;
+        } else if (
+          startAtMs > playheadAtMs
+          && (next === null || startAtMs < Number(next.start_at_ms))
+        ) {
+          next = cue;
         }
       }
       if (selected === null) {
@@ -738,6 +827,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
           && Number.isFinite(endAtMs)
           && playheadAtMs < endAtMs
       );
+      compactBufferedWaitingGap(playheadAtMs, selected, next);
     }
 
     function refreshCaptionForPlayhead() {
@@ -967,6 +1057,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       serverTranslatedAudioBacklogSec = 0;
       globalSpeedMode = "Auto";
       globalSpeedMultiplier = 1;
+      attemptedGapCueKeys.clear();
       globalSpeedStatus.textContent = "Auto - 1.0x";
       listenerId = createListenerId();
       startButton.disabled = true;
@@ -1042,6 +1133,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       stopCaptionPolling();
       captionSnapshot = null;
       captionCueId = "";
+      attemptedGapCueKeys.clear();
       playbackElement.pause();
       destroyHlsController();
       playbackElement.removeAttribute("src");

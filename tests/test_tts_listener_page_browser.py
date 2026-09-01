@@ -63,6 +63,8 @@ def _install_hls_harness(
         f"""
         window.__ttsEvents = [];
         window.__ttsPlayCalls = [];
+        window.__ttsSeekCalls = [];
+        window.__ttsFastSeekThrows = false;
         window.__ttsSourceAssignments = [];
         window.__ttsPauseCalls = 0;
         window.__ttsFetchCalls = [];
@@ -160,6 +162,13 @@ def _install_hls_harness(
         }};
         HTMLMediaElement.prototype.pause = function() {{
           window.__ttsPauseCalls += 1;
+        }};
+        HTMLMediaElement.prototype.fastSeek = function(value) {{
+          window.__ttsSeekCalls.push(Number(value));
+          if (window.__ttsFastSeekThrows) {{
+            throw new DOMException("seek failed", "InvalidStateError");
+          }}
+          this.currentTime = Number(value);
         }};
         HTMLMediaElement.prototype.load = function() {{}};
         window.fetch = function(url, options = {{}}) {{
@@ -326,12 +335,15 @@ def _start_shared_timeline_gap_harness(
     listener_page,
     *,
     gap_ms=3000,
+    discardable_gap_ms=2500,
     playing_at_ms=104_100,
+    native_hls=False,
+    hls_js_supported=True,
 ):
     _install_hls_harness(
         listener_page,
-        native_hls=False,
-        hls_js_supported=True,
+        native_hls=native_hls,
+        hls_js_supported=hls_js_supported,
         caption_snapshot={
             "live_edge_at_ms": 120_000,
             "cues": [
@@ -346,15 +358,18 @@ def _start_shared_timeline_gap_harness(
                     "start_at_ms": 104_000 + gap_ms,
                     "end_at_ms": 110_000 + gap_ms,
                     "text": "The next translated sentence is already buffered.",
+                    "discardable_gap_before_ms": discardable_gap_ms,
+                    "resume_at_ms": 104_000 + discardable_gap_ms,
                 },
             ],
         },
     )
     _start_hls_harness(listener_page)
     _set_live_lag(listener_page, current_time=50.0, live_edge=80.0)
-    listener_page.evaluate(
-        f"window.__ttsHlsInstances[0].playingDate = new Date({playing_at_ms})"
-    )
+    if hls_js_supported:
+        listener_page.evaluate(
+            f"window.__ttsHlsInstances[0].playingDate = new Date({playing_at_ms})"
+        )
 
 
 @pytest.mark.parametrize(
@@ -830,19 +845,95 @@ def test_desktop_caption_uses_hls_playing_date_when_playlist_edges_desynchronize
     )
 
 
-def test_listener_keeps_shared_playhead_when_future_speech_is_buffered(listener_page):
+def test_listener_compacts_buffered_waiting_gap_without_restarting_playback(
+    listener_page,
+):
     _start_shared_timeline_gap_harness(
         listener_page,
         gap_ms=3000,
+        discardable_gap_ms=2500,
         playing_at_ms=104_100,
+    )
+
+    _set_buffered_range(listener_page, start=0.0, end=54.0)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([52.5])
+    assert listener_page.evaluate("window.__ttsPauseCalls") == 0
+    assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => [node.defaultPlaybackRate, node.playbackRate]"
+    ) == [1, 1]
+
+
+def test_listener_waits_for_guarded_speech_buffer_then_seeks_once(listener_page):
+    _start_shared_timeline_gap_harness(listener_page)
+
+    _set_buffered_range(listener_page, start=0.0, end=53.8)
+    assert listener_page.evaluate("window.__ttsSeekCalls") == []
+
+    _set_buffered_range(listener_page, start=0.0, end=54.0)
+    listener_page.locator("#ttsPlayback").dispatch_event("timeupdate")
+    listener_page.wait_for_timeout(600)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([52.5])
+
+
+@pytest.mark.parametrize("discardable_gap_ms", [0, 499])
+def test_listener_does_not_compact_subthreshold_waiting_gap(
+    listener_page,
+    discardable_gap_ms,
+):
+    _start_shared_timeline_gap_harness(
+        listener_page,
+        gap_ms=500 + discardable_gap_ms,
+        discardable_gap_ms=discardable_gap_ms,
     )
 
     _set_buffered_range(listener_page, start=0.0, end=80.0)
 
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.currentTime"
-    ) == pytest.approx(50.0)
+    assert listener_page.evaluate("window.__ttsSeekCalls") == []
+
+
+def test_listener_seek_exception_never_restarts_or_pauses_playback(listener_page):
+    _start_shared_timeline_gap_harness(listener_page)
+    listener_page.evaluate("window.__ttsFastSeekThrows = true")
+
+    _set_buffered_range(listener_page, start=0.0, end=54.0)
+    listener_page.locator("#ttsPlayback").dispatch_event("timeupdate")
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([52.5])
+    assert listener_page.evaluate("window.__ttsPauseCalls") == 0
+    assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
     assert listener_page.get_attribute("#nowPlaying", "data-playing") == "true"
+
+
+def test_listener_compacts_while_native_media_reports_waiting(listener_page):
+    _start_shared_timeline_gap_harness(listener_page)
+    _set_buffered_range(listener_page, start=0.0, end=53.8)
+    playback = listener_page.locator("#ttsPlayback")
+    playback.dispatch_event("waiting")
+
+    _set_buffered_range(listener_page, start=0.0, end=54.0)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([52.5])
+    assert listener_page.evaluate("window.__ttsPauseCalls") == 0
+    assert len(listener_page.evaluate("window.__ttsPlayCalls")) == 1
+    playback.dispatch_event("playing")
+    assert listener_page.get_attribute("#nowPlaying", "data-playing") == "true"
+
+
+def test_native_safari_and_hls_js_compact_to_same_media_time(listener_page):
+    _start_shared_timeline_gap_harness(
+        listener_page,
+        native_hls=True,
+        hls_js_supported=False,
+    )
+    listener_page.locator("#ttsPlayback").evaluate(
+        "node => { node.getStartDate = () => new Date(54_100); }"
+    )
+    _set_buffered_range(listener_page, start=0.0, end=54.0)
+
+    assert listener_page.evaluate("window.__ttsSeekCalls") == pytest.approx([52.5])
 
 
 def test_listener_retains_caption_between_cues_without_empty_transition(listener_page):
