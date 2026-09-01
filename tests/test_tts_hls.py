@@ -941,7 +941,7 @@ async def test_ffmpeg_encoder_tracks_audio_until_writer_consumes_it(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_encoder_publishes_faster_than_max_listener_rate(
+async def test_ffmpeg_encoder_publishes_with_two_x_listener_headroom(
     tmp_path,
     monkeypatch,
 ):
@@ -979,7 +979,7 @@ async def test_ffmpeg_encoder_publishes_faster_than_max_listener_rate(
         while len(delays) < 2:
             await real_sleep(0)
 
-        assert max(delays[:2]) < 0.1 / 1.5
+        assert max(delays[:2]) <= 0.05
         assert writer.done() is False
     finally:
         writer.cancel()

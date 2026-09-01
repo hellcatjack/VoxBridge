@@ -565,6 +565,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     let captionAbortController = null;
     let catchingUp = false;
     let playbackStarted = false;
+    let waitingForMedia = false;
     let fastRateActive = false;
     let playbackStatusHoldUntilMs = 0;
     let captionSnapshot = null;
@@ -623,6 +624,19 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         }
       } catch (error) {}
       return null;
+    }
+
+    function playableHeadroomSec(lag = liveLagSec()) {
+      const bufferedAhead = forwardBufferedSec();
+      if (lag === null) return bufferedAhead;
+      if (bufferedAhead === null) return lag;
+      return Math.max(lag, bufferedAhead);
+    }
+
+    function expectedMediaWaitStatus() {
+      return serverTranslatedAudioBacklogSec > 0
+        ? "Preparing next translated sentence"
+        : "Waiting for translated speech";
     }
 
     function showPlaybackInterruptionStatus(label) {
@@ -861,16 +875,16 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (playbackRate === "auto") {
         catchingUp = false;
         const targetRate = automaticPlaybackRate(totalBacklog);
-        const bufferedAhead = forwardBufferedSec();
-        if (playbackStarted && targetRate > 1 && bufferedAhead !== null) {
+        const playableHeadroom = playableHeadroomSec(lag);
+        if (playbackStarted && targetRate > 1 && playableHeadroom !== null) {
           if (
             !fastRateActive
-            && bufferedAhead >= AUTO_FAST_RATE_START_BUFFER_SEC
+            && playableHeadroom >= AUTO_FAST_RATE_START_BUFFER_SEC
           ) {
             fastRateActive = true;
           } else if (
             fastRateActive
-            && bufferedAhead <= AUTO_FAST_RATE_STOP_BUFFER_SEC
+            && playableHeadroom <= AUTO_FAST_RATE_STOP_BUFFER_SEC
           ) {
             fastRateActive = false;
           }
@@ -894,6 +908,11 @@ TTS_LISTENER_HTML = r"""<!doctype html>
         fastRateActive = false;
       }
       const effectiveRate = applyPlaybackRate(lag, totalBacklog);
+      if (waitingForMedia) {
+        playbackStatusHoldUntilMs = 0;
+        playbackStatus.textContent = expectedMediaWaitStatus();
+        return;
+      }
       if (performance.now() < playbackStatusHoldUntilMs) return;
       playbackStatusHoldUntilMs = 0;
       if (!playbackStarted) {
@@ -973,6 +992,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function markPlaying() {
       if (!running) return;
+      waitingForMedia = false;
       playbackStarted = true;
       resumeButton.hidden = true;
       connectionStatus.textContent = "Connected";
@@ -986,6 +1006,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
 
     function markPlaybackBlocked(error) {
       if (!running) return;
+      waitingForMedia = false;
       playbackStarted = false;
       fastRateActive = false;
       catchingUp = false;
@@ -1071,6 +1092,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       if (running) return;
       running = true;
       playbackStarted = false;
+      waitingForMedia = false;
       fastRateActive = false;
       catchingUp = false;
       playbackStatusHoldUntilMs = 0;
@@ -1114,6 +1136,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     function resumeListeningFromGesture() {
       if (!running || !playbackElement.src) return;
       playbackStarted = false;
+      waitingForMedia = false;
       fastRateActive = false;
       catchingUp = false;
       playbackStatusHoldUntilMs = 0;
@@ -1143,6 +1166,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       listenerId = "";
       catchingUp = false;
       playbackStarted = false;
+      waitingForMedia = false;
       fastRateActive = false;
       playbackStatusHoldUntilMs = 0;
       applyPlaybackRate();
@@ -1190,6 +1214,7 @@ TTS_LISTENER_HTML = r"""<!doctype html>
       try {
         navigator.mediaSession.setActionHandler("pause", () => {
           playbackElement.pause();
+          waitingForMedia = false;
           nowPlaying.dataset.playing = "false";
           nowPlaying.dataset.speaking = "false";
           playbackStatus.textContent = "Paused / resume from the lock screen";
@@ -1207,16 +1232,15 @@ TTS_LISTENER_HTML = r"""<!doctype html>
     playbackElement.addEventListener("playing", markPlaying);
     playbackElement.addEventListener("waiting", () => {
       if (!running) return;
-      playbackStarted = false;
-      fastRateActive = false;
-      catchingUp = false;
-      applyPlaybackRate();
-      showPlaybackInterruptionStatus("Buffering live audio");
+      waitingForMedia = true;
+      playbackStatusHoldUntilMs = 0;
+      playbackStatus.textContent = expectedMediaWaitStatus();
       nowPlaying.dataset.playing = "false";
       nowPlaying.dataset.speaking = "false";
     });
     playbackElement.addEventListener("stalled", () => {
       if (!running) return;
+      waitingForMedia = false;
       playbackStarted = false;
       fastRateActive = false;
       catchingUp = false;

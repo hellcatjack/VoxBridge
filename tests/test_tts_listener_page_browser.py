@@ -394,7 +394,7 @@ def test_auto_rate_uses_total_translated_audio_backlog(listener_page):
     )
 
 
-def test_auto_rate_waits_for_known_forward_buffer(listener_page):
+def test_auto_rate_uses_native_hls_seekable_headroom(listener_page):
     _install_hls_harness(
         listener_page,
         translated_audio_backlog_ms=61_000,
@@ -406,7 +406,7 @@ def test_auto_rate_waits_for_known_forward_buffer(listener_page):
 
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
-    ) == 1
+    ) == 1.5
 
 
 def test_auto_fast_rate_uses_forward_buffer_hysteresis(listener_page):
@@ -417,23 +417,23 @@ def test_auto_fast_rate_uses_forward_buffer_hysteresis(listener_page):
     )
     _start_hls_harness(listener_page)
 
-    _set_live_lag(listener_page, current_time=98, live_edge=104)
-    _set_buffered_range(listener_page, start=0, end=101.99)
+    _set_live_lag(listener_page, current_time=100, live_edge=100)
+    _set_buffered_range(listener_page, start=0, end=103.99)
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
     ) == 1
 
+    _set_buffered_range(listener_page, start=0, end=104)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+
+    _set_buffered_range(listener_page, start=0, end=102.01)
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
+
     _set_buffered_range(listener_page, start=0, end=102)
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.playbackRate"
-    ) == 1.5
-
-    _set_buffered_range(listener_page, start=0, end=100.01)
-    assert listener_page.eval_on_selector(
-        "#ttsPlayback", "node => node.playbackRate"
-    ) == 1.5
-
-    _set_buffered_range(listener_page, start=0, end=100)
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
     ) == 1
@@ -827,8 +827,12 @@ def test_fast_selection_falls_back_when_live_lag_is_unknown(listener_page):
     ) == 1
 
 
-def test_waiting_resets_fast_selection_to_normal_rate(listener_page):
-    _install_hls_harness(listener_page)
+def test_expected_sentence_gap_preserves_fast_selection(listener_page):
+    _install_hls_harness(
+        listener_page,
+        translated_audio_backlog_ms=61_000,
+        translated_audio_backlog_estimated=True,
+    )
     listener_page.goto("https://voxbridge.test/listen")
     listener_page.select_option("#playbackRate", "1.2")
     _start_hls_harness(listener_page)
@@ -842,33 +846,37 @@ def test_waiting_resets_fast_selection_to_normal_rate(listener_page):
 
     assert listener_page.eval_on_selector(
         "#ttsPlayback", "node => node.playbackRate"
-    ) == 1
+    ) == 1.2
     assert listener_page.text_content("#playbackStatus") == (
-        "Buffering live audio · 0.4s buffered ahead"
+        "Preparing next translated sentence"
     )
 
 
-def test_waiting_status_remains_visible_after_playback_resumes(listener_page):
-    _install_hls_harness(listener_page)
+def test_sentence_gap_status_clears_as_soon_as_playback_resumes(listener_page):
+    _install_hls_harness(
+        listener_page,
+        translated_audio_backlog_ms=61_000,
+        translated_audio_backlog_estimated=True,
+    )
     _start_hls_harness(listener_page)
     _set_live_lag(listener_page, current_time=94, live_edge=100)
     _set_buffered_range(listener_page, start=0, end=94.4)
 
     playback = listener_page.locator("#ttsPlayback")
     playback.dispatch_event("waiting")
+    assert listener_page.text_content("#playbackStatus") == (
+        "Preparing next translated sentence"
+    )
+
     playback.dispatch_event("playing")
     _set_live_lag(listener_page, current_time=94.1, live_edge=100)
 
-    assert listener_page.text_content("#playbackStatus") == (
-        "Buffering live audio · 0.4s buffered ahead"
+    assert "translated audio waiting" in listener_page.text_content(
+        "#playbackStatus"
     )
-
-    listener_page.wait_for_timeout(1600)
-    _set_live_lag(listener_page, current_time=94.2, live_edge=100)
-
-    assert listener_page.text_content("#playbackStatus") != (
-        "Buffering live audio · 0.4s buffered ahead"
-    )
+    assert listener_page.eval_on_selector(
+        "#ttsPlayback", "node => node.playbackRate"
+    ) == 1.5
 
 
 def test_stalled_resets_fast_selection_to_normal_rate(listener_page):
